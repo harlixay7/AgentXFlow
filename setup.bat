@@ -1,11 +1,11 @@
 @echo off
 setlocal enabledelayedexpansion
-title Viducia - Dependency & Environment Setup
+title AgentXFlow - Dependency & Environment Setup (Viducia)
 cd /d "%~dp0"
 
 echo ===================================================
-echo   Viducia Dependency & Environment Setup
-echo   Developer: harlixay7
+echo   AgentXFlow Dependency & Environment Setup
+echo   Organization: Viducia • Developer: harlixay7
 echo ===================================================
 echo.
 
@@ -98,7 +98,7 @@ if %ERRORLEVEL% NEQ 0 (
 echo.
 echo ===================================================
 echo   All dependencies are verified and up to date!
-echo   You can now launch Viducia with: run.bat
+echo   You can now launch AgentXFlow with: run.bat
 echo ===================================================
 echo.
 pause

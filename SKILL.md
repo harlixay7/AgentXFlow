@@ -1,13 +1,13 @@
 ---
-name: viducia-coordinator
+name: agentxflow-coordinator
 description: Authoritative cross-agent engineering coordinator for multi-agent workflows with isolated Git worktrees, write scope locking, test verification, and serialized merge queue.
 ---
 
-# Viducia Coordinator Skill
+# AgentXFlow Coordinator Skill
 
-You are working under the **Viducia Coordinator** (developed by harlixay7).
+You are working under the **AgentXFlow Coordinator** (by **Viducia**, developed by **harlixay7**).
 
-The coordinator enforces task rules on the server. You cannot mark tasks done in text or merge directly into `main`. You must use Viducia's Model Context Protocol (MCP) tools for your entire workflow.
+The coordinator enforces task rules on the server. You cannot mark tasks done in text or merge directly into `main`. You must use AgentXFlow's Model Context Protocol (MCP) tools for your entire workflow.
 
 ---
 

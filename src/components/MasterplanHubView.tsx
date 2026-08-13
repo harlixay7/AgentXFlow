@@ -157,7 +157,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   };
 
   const handleCopyMcpPrompt = () => {
-    const prompt = `You are an autonomous engineering agent connected to Viducia.
+    const prompt = `You are an autonomous engineering agent connected to AgentXFlow (by Viducia).
 1. Call tool 'masterplan.get' with project_id '${projectId}'.
 2. Read the masterplan text and decompose it into exactly ${targetStepCount} structured, non-overlapping sequential steps without missing any requirements.
 3. Call 'masterplan.decompose' with your normalized steps array.

@@ -66,11 +66,11 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
       {/* Top Command Header */}
       <header className="top-command-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div className="brand-section" title="Viducia: Cross-Agent Engineering Coordinator by harlixay7" style={{ gap: 8 }}>
+          <div className="brand-section" title="AgentXFlow by Viducia — Cross-Agent Engineering Coordinator by harlixay7" style={{ gap: 8 }}>
             <Terminal size={14} style={{ color: 'var(--accent-blue)' }} />
             <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.15 }}>
-              <span style={{ fontWeight: 700, letterSpacing: '0.04em', fontSize: 12, color: 'var(--text-primary)' }}>VIDUCIA</span>
-              <span style={{ fontSize: 9, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>by harlixay7</span>
+              <span style={{ fontWeight: 700, letterSpacing: '0.04em', fontSize: 12, color: 'var(--text-primary)' }}>AGENTXFLOW</span>
+              <span style={{ fontSize: 9, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>by Viducia</span>
             </div>
           </div>
 

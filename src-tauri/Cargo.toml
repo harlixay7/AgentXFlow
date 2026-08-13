@@ -1,7 +1,7 @@
 [package]
 name = "agent-x-flow"
 version = "0.1.0"
-description = "Viducia: Cross-Agent Engineering Coordinator"
+description = "AgentXFlow: Cross-Agent Engineering Coordinator by Viducia"
 authors = ["harlixay7"]
 edition = "2021"
 

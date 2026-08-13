@@ -1,17 +1,17 @@
-# Viducia
+# AgentXFlow
 
-Viducia is a local desktop application and coordination daemon that lets multiple AI coding agents work on the same Git repository simultaneously without merge conflicts, file overwrites, or broken builds.
+**AgentXFlow** is an authoritative local desktop application and coordination daemon that lets multiple AI coding agents work on the same Git repository simultaneously without merge conflicts, file overwrites, or broken builds.
 
-Developer: **harlixay7**
+Developed by **[harlixay7](https://github.com/harlixay7)** • **Viducia**
 
 ---
 
 ## Quick Setup with an AI Agent
 
-You can give this repository URL directly to your AI coding assistant (Claude Code, Cursor, Antigravity, or Codex CLI) and say:
+You can give this repository URL directly to your AI coding assistant (Claude Code, Cursor, Antigravity, or Codex CLI) and prompt:
 
 ```
-Clone https://github.com/harlixay7/Viducia.git, read AGENT_SETUP.md, run setup.bat, and start the app with run.bat.
+Clone https://github.com/harlixay7/AgentXFlow.git, read AGENT_SETUP.md, run setup.bat, and start the app with run.bat.
 ```
 
 The AI agent will read [`AGENT_SETUP.md`](AGENT_SETUP.md), verify the toolchain, install dependencies, validate the test suites, and boot the coordinator.
@@ -28,15 +28,15 @@ When multiple AI agents (like Claude Code, Cursor, Antigravity, or Codex CLI) wo
 
 ---
 
-## How Viducia Solves This
+## How AgentXFlow Solves This
 
-Viducia acts as an authoritative coordinator running on your machine:
+AgentXFlow acts as an authoritative coordinator running on your machine:
 
-- **Isolated Git Worktrees**: When an agent claims a task, Viducia creates a private Git worktree on disk at `.agentxflow/worktrees/task-<id>`. Agents never touch your active checkout or the `main` branch directly.
+- **Isolated Git Worktrees**: When an agent claims a task, AgentXFlow creates a private Git worktree on disk at `.agentxflow/worktrees/task-<id>`. Agents never touch your active checkout or the `main` branch directly.
 - **Write Scope Locks**: Agents must declare which files they plan to edit using glob patterns (e.g. `src/auth/**`). If two agents request overlapping files, the collision is detected and blocked.
-- **Mutation Auditing**: On task submission, Viducia runs `git diff --name-only <base_sha>` inside the worktree. Any unreserved file edits trigger a scope violation and reject the task.
-- **Authoritative Verification**: Viducia runs the test suite itself inside the worktree. An agent cannot mark a task done by claiming it in chat; it must pass the coordinator's automated checks.
-- **Serialized Merge Queue**: Verified tasks enter a FIFO merge queue. Viducia simulates a 3-way merge and runs tests inside a hidden integration worktree before committing to `main`.
+- **Mutation Auditing**: On task submission, AgentXFlow runs `git diff --name-only <base_sha>` inside the worktree. Any unreserved file edits trigger a scope violation and reject the task.
+- **Authoritative Verification**: AgentXFlow runs the test suite itself inside the worktree. An agent cannot mark a task done by claiming it in chat; it must pass the coordinator's automated checks.
+- **Serialized Merge Queue**: Verified tasks enter a FIFO merge queue. AgentXFlow simulates a 3-way merge and runs tests inside a hidden integration worktree before committing to `main`.
 - **Masterplan Execution Hub**: Drop in an unformatted master plan of any length. The first connected agent normalizes the specification into structured steps (from `UNSORTED` to `RESORTED`). Subsequent agents claim progressive chunks (with anti-hoarding limits) and execute in sequence.
 
 ---
@@ -52,7 +52,7 @@ Viducia acts as an authoritative coordinator running on your machine:
                                 | (HTTP JSON-RPC / MCP)
                                 v
 +---------------------------------------------------------------+
-|                      Viducia Coordinator                      |
+|                     AgentXFlow Coordinator                    |
 |   - Masterplan Hub (Unsorted -> Resorted decomposition engine)|
 |   - SQLite Database (Tasks, Agents, Leases, Proof Bundles)    |
 |   - Scope Engine (Glob lease manager & git diff auditor)      |
@@ -104,7 +104,7 @@ cargo clean
 
 ## Running Tests
 
-Viducia includes full unit and integration test suites:
+AgentXFlow includes full unit and integration test suites:
 
 ```bash
 # Run all backend unit tests
@@ -127,14 +127,14 @@ npm run build
 
 ## Connecting Coding Agents
 
-Viducia runs a local Model Context Protocol (MCP) server on `http://127.0.0.1:7890/mcp`.
+AgentXFlow runs a local Model Context Protocol (MCP) server on `http://127.0.0.1:7890/mcp`.
 
 ### OpenCode (`.mcp.json`)
 Add this to your project repository:
 ```json
 {
   "mcpServers": {
-    "viducia": {
+    "agentxflow": {
       "url": "http://127.0.0.1:7890/mcp",
       "transport": "http",
       "headers": {
@@ -151,7 +151,7 @@ Connect via HTTP streamable transport:
 - Header: `Authorization: Bearer axf_sec_v2_live_token_7890`
 
 ### Antigravity
-Antigravity automatically loads the skill from `SKILL.md` or `.agents/skills/agentxflow-coordinator/SKILL.md`.
+The coordinator skill specification is located at `SKILL.md`.
 
 ---
 
@@ -161,6 +161,10 @@ Antigravity automatically loads the skill from `SKILL.md` or `.agents/skills/age
 |---|---|---|
 | `agent.register` | `name`, `agent_type` | Register an agent session and declare its tool capabilities. |
 | `agent.heartbeat` | `agent_id` | Keep session lease and file locks active. |
+| `masterplan.get` | `project_id` | Inspect masterplan state, raw text, and decomposition instructions. |
+| `masterplan.status` | `project_id` | Query plan progress stats and step states. |
+| `masterplan.decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured execution steps. |
+| `masterplan.claim_chunk`| `project_id`, `agent_id`, `count` | Claim next batch of steps (capped by limit) and cut a Git worktree. |
 | `task.list` | `project_id`, `state` | List tasks in the backlog or ready queue. |
 | `task.get` | `task_id` | Get task prompt, acceptance criteria, and worktree path. |
 | `task.claim` | `task_id`, `agent_id` | Claim a task and create an isolated Git worktree on disk. |
@@ -186,10 +190,10 @@ Antigravity automatically loads the skill from `SKILL.md` or `.agents/skills/age
 
 ---
 
-## Author
+## Author & Organization
 
-Created and developed by **[harlixay7](https://github.com/harlixay7)**.
+Created and developed by **[harlixay7](https://github.com/harlixay7)** • **Viducia**.
 
 ## License
 
-Apache-2.0
+MIT ([`LICENSE`](LICENSE))

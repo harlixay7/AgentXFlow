@@ -1,8 +1,8 @@
-# AI Agent Setup Guide
+# AI Agent Setup Guide — AgentXFlow
 
-This document contains step-by-step instructions for AI agents (Claude Code, Antigravity, Cursor, Codex, OpenCode) tasked with setting up, building, and running **Viducia**.
+This document contains step-by-step instructions for AI agents (Claude Code, Antigravity, Cursor, Codex, OpenCode) tasked with setting up, building, and running **AgentXFlow** (by **Viducia**).
 
-Developer: **harlixay7**
+Developer: **[harlixay7](https://github.com/harlixay7)**
 
 ---
 
@@ -25,8 +25,8 @@ If any tool is missing, stop and inform the user before attempting to build.
 
 ```bash
 # Clone the repository
-git clone https://github.com/harlixay7/Viducia.git
-cd Viducia
+git clone https://github.com/harlixay7/AgentXFlow.git
+cd AgentXFlow
 
 # On Windows: you can run the automated setup script
 setup.bat
@@ -70,6 +70,8 @@ All tests should pass with zero failures.
 
 To run the desktop application and start the local MCP coordination server on `127.0.0.1:7890`:
 
+- On Windows: double click `run.bat`
+- Or via terminal:
 ```bash
 npm run tauri dev
 ```
@@ -84,7 +86,7 @@ npm run dev
 
 ## 5. Connecting Yourself to the Coordinator
 
-Viducia runs an HTTP Model Context Protocol (MCP) server at `http://127.0.0.1:7890/mcp`.
+AgentXFlow runs an HTTP Model Context Protocol (MCP) server at `http://127.0.0.1:7890/mcp`.
 
 ### If you are OpenCode
 Create `.mcp.json` in the root of the project you want to work on:
@@ -92,7 +94,7 @@ Create `.mcp.json` in the root of the project you want to work on:
 ```json
 {
   "mcpServers": {
-    "viducia": {
+    "agentxflow": {
       "url": "http://127.0.0.1:7890/mcp",
       "transport": "http",
       "headers": {

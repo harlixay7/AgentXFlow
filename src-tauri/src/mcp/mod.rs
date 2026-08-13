@@ -101,7 +101,7 @@ async fn handle_health() -> impl IntoResponse {
         [("Content-Type", "application/json")],
         Json(serde_json::json!({
             "status": "ok",
-            "service": "Viducia Authoritative MCP Gateway",
+            "service": "AgentXFlow Authoritative MCP Gateway (Viducia)",
             "protocol_version": "2026-07-28",
             "transport": "Streamable HTTP"
         })),

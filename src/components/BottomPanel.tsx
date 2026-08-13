@@ -43,7 +43,7 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({ events }) => {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-            Viducia • Developed by harlixay7
+            AgentXFlow by Viducia • Developed by harlixay7
           </div>
           <button
             onClick={() => setIsCollapsed(!isCollapsed)}

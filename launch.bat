@@ -1,4 +1,10 @@
 @echo off
-title Viducia - Cross-Agent Engineering Coordinator
+title AgentXFlow UI Preview (Viducia)
 cd /d "%~dp0"
-call "%~dp0run.bat"
+echo ===================================================
+echo   Starting AgentXFlow Frontend Server...
+echo   Organization: Viducia • Developer: harlixay7
+echo ===================================================
+echo.
+npm run dev
+pause
