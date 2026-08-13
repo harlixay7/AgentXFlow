@@ -6,6 +6,18 @@ Developer: **harlixay7**
 
 ---
 
+## Quick Setup with an AI Agent
+
+You can give this repository URL directly to your AI coding assistant (Claude Code, Cursor, Antigravity, or Codex CLI) and say:
+
+```
+Clone https://github.com/harlixay7/Viducia.git, read AGENT_SETUP.md, run setup.bat, and start the app with run.bat.
+```
+
+The AI agent will read [`AGENT_SETUP.md`](AGENT_SETUP.md), verify the toolchain, install dependencies, validate the test suites, and boot the coordinator.
+
+---
+
 ## The Problem
 
 When multiple AI agents (like Claude Code, Cursor, Antigravity, or Codex CLI) work on the same codebase at the same time:
