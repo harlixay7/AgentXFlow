@@ -1,0 +1,1529 @@
+# AgentXFlow V2 — Master Implementation Plan
+
+You are upgrading the existing **AgentXFlow** application into a production-grade multi-agent software engineering control plane.
+
+This is an **upgrade, not a rewrite**.
+
+Before modifying anything:
+
+1. Inspect the entire repository.
+2. Map all existing Rust modules, React components, database migrations, IPC commands, MCP endpoints, tests and configuration.
+3. Preserve working functionality unless this specification explicitly replaces it.
+4. Reuse the existing Tauri 2 + Rust + React 19/TypeScript architecture.
+5. Do not create parallel duplicate systems.
+6. Every new subsystem must connect to the existing Coordinator rather than bypass it.
+7. No mock implementations, fake providers, placeholder buttons, dead UI, TODO workflows or visually complete but functionally disconnected components.
+
+The finished product should feel like a **professional engineering operations IDE for autonomous coding agents**, not an AI dashboard.
+
+---
+
+# 1. Product Definition
+
+AgentXFlow is the authoritative execution and governance layer for running multiple AI coding agents against real repositories.
+
+Its responsibility is not merely task management.
+
+It must control:
+
+* task decomposition
+* agent assignment
+* isolated execution
+* permissions
+* file ownership
+* collisions
+* dependencies
+* verification
+* evidence
+* reviews
+* Git integration
+* merge ordering
+* recovery
+* auditability
+
+Agents remain replaceable workers.
+
+**AgentXFlow remains the source of truth.**
+
+---
+
+# 2. Preserve the Strong Existing Foundation
+
+Keep and evolve:
+
+* Tauri 2
+* Rust/Tokio backend
+* React 19 + TypeScript
+* SQLite
+* worktree-per-task isolation
+* CoordinatorEngine
+* project rules
+* task acceptance criteria
+* scope leases
+* audit events
+* merge engine
+* MCP integration
+* native repository picker
+* existing Rust/frontend tests
+
+Do not throw away proven code merely to make the directory structure look newer.
+
+---
+
+# 3. Replace the Current Architecture With Six Clear Domains
+
+```text
+UI WORKBENCH
+     │
+APPLICATION / COMMAND LAYER
+     │
+COORDINATOR CORE
+ ┌───┼────────┬──────────┬────────────┐
+ │   │        │          │            │
+Task Agent  Workspace Verification Integration
+Graph Runtime Engine     Engine       Engine
+ │   │        │          │            │
+ └───┴────────┴──────────┴────────────┘
+              │
+        EVENT + DATA LAYER
+              │
+   SQLite / Git / Artifacts / Logs
+              │
+        PROTOCOL GATEWAY
+       MCP / ACP / Native
+```
+
+No UI component may contain orchestration rules.
+
+No protocol adapter may mutate task state directly.
+
+All state transitions go through the Coordinator.
+
+---
+
+# 4. Modern Protocol Gateway
+
+## MCP
+
+Replace the custom legacy MCP/SSE implementation with a protocol-version-aware MCP gateway.
+
+Primary support:
+
+* MCP `2026-07-28`
+* modern Streamable HTTP
+* required routing/version headers
+* stateless request handling
+* modern Tasks extension where appropriate
+* `subscriptions/listen` where applicable
+* strict Origin validation
+* localhost binding by default
+* authenticated requests
+
+Keep a clearly isolated compatibility adapter for older MCP clients.
+
+Do **not** make legacy SSE the primary implementation. The current MCP specification has moved to a stateless core and deprecated legacy HTTP+SSE.
+
+## ACP
+
+Add an **ACP Client Runtime**.
+
+ACP is for controlling coding agents; MCP remains the tool/governance interface exposed to them.
+
+ACP Runtime responsibilities:
+
+* discover installed agents
+* launch agent subprocesses
+* negotiate capabilities
+* create/resume sessions
+* stream messages/events
+* receive permission requests
+* cancel/interrupt
+* track native session IDs
+* collect usage metadata when exposed
+* preserve agent-specific configuration/authentication
+
+Use the official ACP Registry as a discovery source rather than manually hardcoding every future coding agent. ACP supports concurrent sessions and bidirectional permission requests over its client/agent model.
+
+Initial targets:
+
+* Codex
+* OpenCode
+* Claude Agent / Claude Code-compatible ACP integration
+* Cline
+* Cursor where ACP support is available
+* Gemini-compatible agent integrations
+* GitHub Copilot-compatible ACP integrations
+
+Keep provider-native adapters only when they provide capabilities ACP cannot expose.
+
+---
+
+# 5. Agent Runtime
+
+Introduce:
+
+```text
+AgentDescriptor
+AgentCapabilitySet
+AgentInstance
+AgentSession
+AgentRun
+AgentHeartbeat
+AgentUsage
+AgentPermissionRequest
+```
+
+Every agent reports normalized capabilities:
+
+```text
+read_files
+write_files
+terminal
+streaming
+steering
+interrupt
+resume
+fork
+subagents
+permissions
+usage
+mcp
+```
+
+Never display controls an agent cannot perform.
+
+Add **Agent Profiles**:
+
+* Planner
+* Implementer
+* Reviewer
+* Tester
+* Security Reviewer
+* Merge Resolver
+
+Profiles define role, required capabilities, preferred agent/provider, permission policy and verification expectations.
+
+---
+
+# 6. Upgrade Tasks Into a Real Dependency Graph
+
+Do not force the user to model an engineering project as one flat Kanban list.
+
+Add:
+
+```text
+Epic
+  └─ Task
+      ├─ Subtask
+      ├─ Dependency
+      └─ Verification Run
+```
+
+Tasks can declare:
+
+* blocked_by
+* blocks
+* related_to
+* parent
+* children
+* priority
+* risk
+* estimated scope
+* required capabilities
+
+The scheduler may run independent tasks simultaneously.
+
+A task whose dependencies are unfinished cannot become executable.
+
+### Simplify visible states
+
+Do not expose nine internal states as nine separate UX concepts.
+
+Use primary states:
+
+```text
+BACKLOG
+READY
+RUNNING
+BLOCKED
+REVIEW
+MERGE_READY
+DONE
+FAILED
+CANCELLED
+```
+
+Use internal substates for:
+
+```text
+CLAIMING
+ANALYZING
+ACQUIRING_SCOPE
+IMPLEMENTING
+VERIFYING
+WAITING_FOR_INPUT
+```
+
+This retains strict invariants without making the interface bureaucratic.
+
+---
+
+# 7. Worktree Execution Engine
+
+Keep task-specific Git worktrees, but make them substantially stronger.
+
+Each run receives:
+
+```text
+repository
+base SHA
+target branch
+worktree
+task branch
+agent
+run ID
+execution profile
+```
+
+Add:
+
+* stale-base detection
+* resumable worktrees after restart
+* orphan worktree recovery
+* worktree health checks
+* branch collision prevention
+* cleanup policies
+* dirty-state detection
+* optional ignored-file copying rules
+* exact base SHA recording
+
+Never perform normal task work in the user's root checkout.
+
+---
+
+# 8. Never Merge Through the User's Working Copy
+
+This is important.
+
+Create a dedicated hidden integration worktree:
+
+```text
+.agentxflow/integration/<project-id>
+```
+
+The MergeEngine operates there.
+
+Never blindly checkout `main` in the user's active repository directory.
+
+Before integration:
+
+1. fetch/refresh target state when configured
+2. record latest target SHA
+3. detect whether task verification is stale
+4. simulate merge
+5. rebuild combined tree
+6. rerun required post-merge verification
+7. merge only after all applicable policy gates pass
+
+Support:
+
+* squash
+* merge commit
+* rebase
+* PR-only
+
+Default to **squash** for autonomous task branches unless the project config says otherwise.
+
+Never silently resolve conflicts.
+
+Conflict → `BLOCKED/CONFLICT`.
+
+Allow:
+
+* human resolution
+* designated Merge Resolver agent
+* abort/retry
+
+---
+
+# 9. Build a Real Merge Queue
+
+A project can have several individually valid tasks whose combined result is invalid.
+
+Therefore introduce:
+
+```text
+MergeQueue
+MergeCandidate
+IntegrationAttempt
+MergeConflict
+CombinedVerification
+```
+
+Queue operations are serialized per target branch.
+
+When Task A merges:
+
+* Task B's base becomes stale.
+* Re-evaluate B.
+* Recompute integration diff.
+* Re-run required affected checks.
+
+For GitHub repositories, optionally create a PR and respect repository branch protection rather than bypassing it. GitHub supports required reviews, required status checks, linear-history rules and merge queues; AgentXFlow should integrate with these controls rather than pretending they do not exist.
+
+---
+
+# 10. Replace Self-Reported Verification With Coordinator Proof
+
+Agent evidence is **supplementary**, never authoritative.
+
+Current-style evidence:
+
+```text
+"cargo test -> 4 passed"
+```
+
+is not proof.
+
+Create `VerificationProfile` per project.
+
+Example:
+
+```text
+Format
+Lint
+Typecheck
+Unit Tests
+Integration Tests
+Build
+Changed-file policy
+Security scan
+Custom checks
+```
+
+AgentXFlow itself executes configured verification commands inside the task worktree.
+
+Store an immutable result:
+
+```text
+VerificationRun
+check_id
+task_id
+run_id
+commit_sha
+command
+cwd
+started_at
+finished_at
+exit_code
+stdout_artifact
+stderr_artifact
+duration
+result
+tool_version
+```
+
+If the task branch changes after verification:
+
+**invalidate verification automatically.**
+
+Parse useful formats when available:
+
+* JUnit XML
+* compiler diagnostics
+* test counts
+* coverage results
+* lint diagnostics
+
+The final review screen must differentiate:
+
+**Agent Claims**
+
+from
+
+**Coordinator Verified**
+
+---
+
+# 11. Proof-of-Completion Bundle
+
+Every submitted task produces a deterministic review bundle:
+
+```text
+Task
+Agent
+Prompt
+Base SHA
+Head SHA
+Worktree
+Files changed
+Diff
+Commands executed
+Verification results
+Test results
+Diagnostics
+Scope violations
+Dependencies
+Acceptance criteria
+Agent evidence
+Review decisions
+Timing
+Usage metadata
+```
+
+Hash important artifacts.
+
+This gives the user an actual engineering record instead of “the agent said it worked.”
+
+---
+
+# 12. Scope Engine V2
+
+Keep exclusive leases but stop treating globs as perfect truth.
+
+Implement three layers.
+
+### Layer 1 — Declared scope
+
+Agent proposes expected write paths after analysis.
+
+### Layer 2 — Collision analysis
+
+Detect overlap with other active tasks.
+
+### Layer 3 — Actual mutation audit
+
+Compare real filesystem/Git changes against granted scope.
+
+An agent modifying:
+
+```text
+src/auth/**
+```
+
+while owning only:
+
+```text
+src/payments/**
+```
+
+must create a real violation automatically.
+
+The agent should not have to report itself.
+
+Support:
+
+* read scope
+* exclusive write scope
+* shared/generated scope
+* lease expansion requests
+* lease TTL
+* lease renewals
+* manual overrides
+
+Add a **collision risk score**.
+
+Consider not only identical paths but:
+
+* imported modules
+* shared config
+* package manifests
+* database migrations
+* generated files
+* schemas
+* lockfiles
+
+Semantic risk should normally warn rather than hard-block.
+
+---
+
+# 13. Parallel Scheduling
+
+Create a scheduler that asks:
+
+```text
+Are dependencies satisfied?
+Is an appropriate agent available?
+Is the target worktree healthy?
+Does required scope conflict?
+Does the task exceed configured concurrency?
+Does the project have enough execution capacity?
+```
+
+Then run safe tasks in parallel automatically when enabled.
+
+Provide project concurrency settings:
+
+```text
+Max active agents
+Max verification jobs
+Max merge operations = 1 per target branch
+```
+
+---
+
+# 14. Workflow Recipes
+
+Add reusable orchestration recipes.
+
+Examples:
+
+### Standard
+
+```text
+Plan → Implement → Verify → Review → Merge
+```
+
+### High Risk
+
+```text
+Plan
+ → Implement
+ → Test Agent
+ → Independent Reviewer
+ → Coordinator Verification
+ → Human Approval
+ → Merge
+```
+
+### Fast
+
+```text
+Implement → Verify → Merge
+```
+
+### Investigation
+
+```text
+Parallel Analysis x3
+ → Consolidate Findings
+ → Implementation
+```
+
+Allow project defaults and task overrides.
+
+Do not turn this into a generic drag-and-drop automation builder.
+
+Keep it engineering-specific.
+
+---
+
+# 15. Subagents
+
+Model parent/child agent executions explicitly.
+
+Show:
+
+```text
+Task
+ └─ Codex
+     ├─ Research subagent
+     ├─ Test subagent
+     └─ Review subagent
+```
+
+Modern coding environments increasingly expose subagent execution and isolated contexts. VS Code, for example, now exposes subagent invocation, custom subagent roles and nested subagent policies.
+
+Track their:
+
+* role
+* prompt
+* tools
+* runtime
+* output
+* changed files
+* usage
+* parent agent
+
+Do not flatten them into audit log noise.
+
+---
+
+# 16. Lifecycle Hooks and Policy Engine
+
+Add deterministic hooks similar in spirit to modern agent IDE hooks:
+
+```text
+BeforeTask
+AfterAnalysis
+BeforeTool
+AfterTool
+BeforeMutation
+AfterMutation
+BeforeVerify
+AfterVerify
+BeforeMerge
+AfterMerge
+OnFailure
+```
+
+VS Code currently uses lifecycle hooks for security enforcement, formatting, validation, audit logging and approval policies; AgentXFlow should provide the same category of deterministic control at the coordinator level.
+
+Rules must be code-enforced rather than prompt-enforced.
+
+Examples:
+
+```text
+git push             REQUIRE_APPROVAL
+git reset --hard     DENY
+npm test             ALLOW
+cargo test           ALLOW
+deleting >20 files   REQUIRE_APPROVAL
+write outside scope  DENY
+network access       PROFILE_DEPENDENT
+```
+
+---
+
+# 17. Project Contract & Context Engine
+
+Replace one giant master specification string with a versioned **Project Contract**.
+
+Store:
+
+```text
+Project overview
+Architecture
+Rules
+Commands
+Testing
+Repository map
+Conventions
+Security constraints
+Important dependencies
+Known pitfalls
+Accepted decisions
+```
+
+Recognize existing repository instructions where present rather than overwriting them.
+
+Build context packs from only relevant data:
+
+```text
+Task
+Acceptance criteria
+Dependencies
+Relevant project contract sections
+Worktree
+Scope
+Related files
+Recent relevant decisions
+Required verification
+```
+
+Version and hash every context pack so the audit trail knows what the agent actually received.
+
+---
+
+# 18. Project Memory
+
+Add curated engineering memory.
+
+Examples:
+
+```text
+"Authentication is centralized in src/auth/session.ts"
+"Integration tests require Docker"
+"Never edit generated Prisma client files"
+"API schema changes require npm run generate"
+```
+
+Memory can come from:
+
+* user decisions
+* accepted task outcomes
+* repository instructions
+* explicitly promoted agent findings
+
+Do not automatically convert arbitrary AI statements into permanent truth.
+
+---
+
+# 19. Event Architecture
+
+Remove the frontend's four-second primary polling loop.
+
+Use:
+
+```text
+Initial snapshot
+        ↓
+Ordered event stream
+        ↓
+Frontend projection
+        ↓
+Periodic reconciliation only as safety net
+```
+
+Every event receives:
+
+```text
+sequence
+event_id
+project_id
+task_id?
+run_id?
+agent_id?
+type
+timestamp
+payload
+```
+
+Frontend reconnect:
+
+```text
+last_sequence=18272
+```
+
+Backend replays missing events.
+
+This makes the interface truly live without wasteful repeated full refreshes.
+
+---
+
+# 20. Database Improvements
+
+Keep SQLite.
+
+Do not introduce PostgreSQL or another service for a local desktop application.
+
+Add WAL mode and separate the asynchronous application runtime from blocking DB work cleanly.
+
+Do not keep one global synchronous SQLite connection locked behind a mutex across the asynchronous Coordinator.
+
+Either use:
+
+* a dedicated DB actor + read pool
+
+or
+
+* an appropriate async SQLite pool
+
+Choose after inspecting the current code and minimizing migration risk.
+
+New core entities should include:
+
+```text
+projects
+project_contracts
+project_rules
+tasks
+task_dependencies
+task_steps
+task_attempts
+agents
+agent_profiles
+agent_sessions
+agent_runs
+scope_leases
+scope_violations
+worktrees
+verification_profiles
+verification_runs
+verification_checks
+artifacts
+reviews
+merge_queue
+integration_attempts
+events
+policies
+settings
+```
+
+All schema evolution must use migrations.
+
+---
+
+# 21. Repository Import V2
+
+When importing a repository, inspect it automatically.
+
+Detect:
+
+* Git status
+* active branch
+* remote
+* languages
+* monorepo layout
+* package managers
+* build scripts
+* test scripts
+* lint scripts
+* formatters
+* CI configuration
+* repository instruction files
+* CODEOWNERS
+* ignored/generated directories
+
+Then show a review step:
+
+```text
+Detected
+
+Node + Rust project
+pnpm workspace
+cargo test
+pnpm test
+pnpm lint
+target branch: main
+GitHub remote
+```
+
+Let the user confirm/edit before creating the project.
+
+### Important safety change
+
+Do **not** silently `git init` and create commits in arbitrary imported folders.
+
+If the folder is not a Git repository, explicitly tell the user that AgentXFlow requires Git-backed isolation and offer:
+
+**Initialize Repository**
+
+Only execute after user confirmation.
+
+---
+
+# 22. GitHub Integration
+
+Add optional GitHub awareness.
+
+Do not make GitHub mandatory.
+
+Support:
+
+* issues
+* PR links
+* target PR
+* checks
+* branch protection awareness
+* commit status
+* merge readiness
+* CODEOWNERS information
+
+A Task may originate from a GitHub issue.
+
+A completed Task may:
+
+* merge locally
+* create/update a PR
+* attach its proof bundle
+
+For serious repositories, external CI remains authoritative.
+
+Build/test artifacts may optionally integrate with GitHub's provenance/attestation systems where appropriate.
+
+---
+
+# 23. Crash Recovery
+
+Assume AgentXFlow, Git, the agent or Windows may terminate unexpectedly.
+
+On startup run reconciliation.
+
+Detect:
+
+```text
+RUNNING task + dead agent
+existing worktree + missing DB run
+DB task + missing worktree
+expired scope leases
+half-finished verification
+half-finished merge
+orphan process
+target branch changed
+```
+
+Never blindly delete anything during recovery.
+
+Offer deterministic actions:
+
+```text
+Resume
+Recover
+Mark failed
+Inspect
+Clean up
+```
+
+A crash must not corrupt the repository or lose task history.
+
+---
+
+# 24. UI REDESIGN — Precision Engineering Workbench
+
+Delete the current “Spatial Glass” visual philosophy.
+
+Remove:
+
+* glassmorphism
+* large blur layers
+* decorative radial glows
+* hover-lifting cards
+* breathing rings
+* unnecessary animation
+* excessive rounded containers
+* giant dashboard cards
+* marketing-style typography
+* decorative gradients
+
+The interface should feel closer to a **serious IDE/debugger/control room**.
+
+Use:
+
+* Inter or platform-quality neutral UI typography
+* JetBrains Mono for technical values
+* compact spacing
+* thin neutral borders
+* mostly flat surfaces
+* one restrained accent color
+* color only when it communicates state
+* 4–6px control radii
+* consistent 28/32/36px control heights
+* subtle hover background changes
+* 120–180ms functional transitions only
+
+Animations should communicate state changes—not decorate the screen.
+
+---
+
+# 25. New Application Layout
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│ Project / Branch       Search / Command Palette      Agents 3/5 │
+├──────┬────────────────────────────────────────┬──────────────────┤
+│ NAV  │                                        │                  │
+│      │              PRIMARY VIEW              │    INSPECTOR     │
+│      │                                        │                  │
+├──────┴────────────────────────────────────────┴──────────────────┤
+│ Problems | Output | Agent Logs | Verification | Git             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Primary navigation
+
+```text
+Overview
+Work
+Agents
+Review
+Merge Queue
+Activity
+Integrations
+```
+
+Settings remains secondary.
+
+Do not make the Kanban board the entire product.
+
+---
+
+# 26. Overview — Mission Control
+
+Default screen.
+
+Dense operational sections:
+
+### Needs Attention
+
+```text
+AUTH-12   Verification failed
+API-31    Scope collision
+UI-8      Agent requesting permission
+```
+
+### Running
+
+```text
+Task      Agent        Phase          Runtime   Files
+AUTH-15   Codex        Implementing   06:14     4
+UI-22     Claude       Verifying      03:02     7
+```
+
+### Waiting
+
+Dependencies, reviews, approvals.
+
+### Merge Queue
+
+Current integration and next candidates.
+
+### System Health
+
+Only small indicators:
+
+```text
+Coordinator Healthy
+4 agents connected
+2 verification workers
+Git healthy
+MCP healthy
+```
+
+Avoid card soup.
+
+Modern IDEs are increasingly introducing centralized agent-session views for exactly this parallel-agent workflow.
+
+---
+
+# 27. Work View
+
+Offer:
+
+**List | Board | Dependency**
+
+Default: List.
+
+Board exists for users who want Kanban.
+
+Dependency view shows task DAG relationships, but do not use a decorative node graph when a normal dependency tree communicates the information better.
+
+Rows include:
+
+```text
+ID
+Task
+State
+Agent
+Progress
+Scope
+Verification
+Branch
+Updated
+```
+
+Everything sortable/filterable.
+
+---
+
+# 28. Task Workspace
+
+Opening a task should feel like opening a debugging workspace.
+
+Header:
+
+```text
+AUTH-12 — Refresh Token Rotation
+
+RUNNING · Codex · 08:31
+agentxflow/AUTH-12
+main@f291cc8
+```
+
+Tabs:
+
+```text
+Overview
+Plan
+Changes
+Verification
+Agent
+Timeline
+```
+
+Right inspector:
+
+```text
+Dependencies
+Scope
+Worktree
+Acceptance
+Metadata
+```
+
+Bottom panel:
+
+```text
+Agent Output
+Commands
+Verification
+Problems
+Git
+```
+
+Live controls:
+
+```text
+Steer
+Pause
+Stop
+Reassign
+Open Worktree
+Open in IDE
+```
+
+Only show supported actions.
+
+---
+
+# 29. Review Center
+
+Create a professional review experience.
+
+Display:
+
+```text
+7 files changed
++314 -108
+
+Verification
+✓ build
+✓ lint
+✓ unit tests
+✕ integration test
+
+Scope
+✓ no violations
+
+Dependencies
+✓ satisfied
+```
+
+Diff viewer:
+
+* file tree
+* unified/side-by-side
+* syntax highlighting
+* word-level modifications
+* previous/next change
+* file comments
+* accept/reject where technically safe
+* open in external IDE
+
+Keep the agent conversation separate from code review.
+
+---
+
+# 30. Merge Queue UI
+
+Show:
+
+```text
+1  AUTH-12   READY        verified 1m ago
+2  API-09    STALE        target changed
+3  DB-16     BLOCKED      conflicts with AUTH-12
+```
+
+Selecting an item displays:
+
+* base SHA
+* head SHA
+* merge simulation
+* affected tasks
+* required checks
+* conflicts
+* integration result
+
+The user must understand **why** something cannot merge.
+
+---
+
+# 31. Global Command Palette
+
+Add a proper command system.
+
+Shortcut:
+
+```text
+Ctrl/Cmd + K
+```
+
+Commands:
+
+```text
+Create Task
+Switch Project
+Open Task
+Assign Agent
+Run Verification
+Open Worktree
+Open Diff
+Pause Agent
+Stop Agent
+Retry Task
+Merge Task
+Open Merge Queue
+Show Approvals
+Connect Agent
+```
+
+Commands should share the same action implementations as buttons.
+
+Never duplicate behavior.
+
+---
+
+# 32. Keyboard & Accessibility
+
+Full keyboard navigation.
+
+Include:
+
+```text
+Ctrl/Cmd+K        Command palette
+Ctrl/Cmd+P        Quick task/project switch
+Ctrl/Cmd+Shift+A  Agents
+Ctrl/Cmd+Shift+M  Merge Queue
+Ctrl/Cmd+Enter    Primary task action
+Esc               Close transient surface
+```
+
+Use semantic HTML, correct focus behavior and screen-reader labels.
+
+Do not fake buttons using `<div>`.
+
+---
+
+# 33. Notifications & Attention
+
+AgentXFlow should notify only when human action matters:
+
+* approval required
+* clarification required
+* verification failure
+* merge conflict
+* task ready for review
+* critical agent failure
+
+Do not notify for every tool call.
+
+---
+
+# 34. Optional AIConnect Bridge
+
+AgentXFlow and AIConnect should remain separate products with separate responsibilities.
+
+But create an optional local integration.
+
+**AIConnect**
+
+```text
+Universal conversation / agent operations interface
+```
+
+**AgentXFlow**
+
+```text
+Authoritative task / execution / verification / integration engine
+```
+
+Allow:
+
+```text
+AIConnect conversation
+        ↓
+Promote to AgentXFlow Task
+```
+
+and:
+
+```text
+AgentXFlow AgentRun
+        ↓
+Open linked conversation in AIConnect
+```
+
+Share IDs through a tiny documented local bridge.
+
+Do not create a hard dependency between the applications.
+
+---
+
+# 35. Security Rules
+
+Non-negotiable:
+
+* bind management interfaces to localhost by default
+* validate MCP Origin headers
+* authenticate protocol requests
+* use cryptographically random tokens
+* canonicalize workspace paths
+* defend against symlink escape
+* prevent path traversal
+* never execute provider text as commands
+* commands and display text must use separate types
+* redact obvious secrets from logs
+* enforce execution timeout/output limits
+* terminate full child process trees
+* audit destructive operations
+* permission policies must be deterministic
+
+Do not expose unrestricted CORS on a localhost agent-control server.
+
+---
+
+# 36. Performance
+
+Targets:
+
+* app shell usable quickly after launch
+* task/event views virtualized where necessary
+* token/event streams batched
+* no full-state polling every few seconds
+* DB writes batched when safe
+* long Git/test operations never block UI
+* repository scans incremental
+* diff calculation lazy
+* verification logs streamed
+* large stdout stored as artifacts, not giant DB rows
+
+---
+
+# 37. Testing Upgrade
+
+The existing four backend tests are not enough for an authoritative coordinator.
+
+Add coverage for:
+
+### State
+
+* every legal transition
+* every illegal transition
+* restart midway through each state
+
+### Scope
+
+* nested globs
+* generated files
+* lease expiration
+* renewal
+* concurrent acquisition
+* real out-of-scope mutation
+
+### Git
+
+* dirty root checkout
+* stale base
+* conflicting tasks
+* parallel worktrees
+* deleted worktree
+* target advancing
+* failed merge
+* successful queue
+* recovery after interrupted merge
+
+### Verification
+
+* failed command
+* timeout
+* stale commit
+* malformed report
+* agent lying about passed tests
+* post-merge regression
+
+### Protocols
+
+* current MCP
+* compatibility MCP
+* authentication failure
+* malformed JSON-RPC
+* ACP agent disconnect
+* unsupported capability
+* interrupt/resume
+
+### UI
+
+* command palette
+* project switching
+* task execution
+* live events
+* reconnect
+* review flow
+* failed verification
+* merge conflict
+* recovery
+
+Use temporary real Git repositories in integration tests rather than mocking Git behavior that needs correctness.
+
+---
+
+# 38. Implementation Order
+
+Implement in this order to avoid destabilizing the product.
+
+### Phase 1 — Correctness
+
+1. repository safety fixes
+2. integration worktree
+3. authoritative verification
+4. immutable evidence
+5. crash reconciliation
+6. event sequence architecture
+
+### Phase 2 — Protocols
+
+7. MCP 2026 gateway
+8. legacy compatibility
+9. ACP runtime
+10. dynamic agent capabilities
+11. agent registry/discovery
+
+### Phase 3 — Coordination
+
+12. task dependency graph
+13. Agent Profiles
+14. scope engine V2
+15. collision intelligence
+16. parallel scheduler
+17. workflow recipes
+18. subagent tracking
+
+### Phase 4 — Integration
+
+19. merge queue
+20. GitHub awareness
+21. project context/memory
+22. optional AIConnect bridge
+
+### Phase 5 — UX
+
+23. remove Spatial Glass UI
+24. build Precision Workbench shell
+25. Mission Control
+26. Work views
+27. Task Workspace
+28. Review Center
+29. Merge Queue UI
+30. command palette
+31. bottom panels
+32. accessibility and shortcuts
+
+### Phase 6 — Production Hardening
+
+33. security audit
+34. protocol conformance
+35. crash/chaos tests
+36. performance profiling
+37. packaging/updater validation
+38. complete regression suite
+
+---
+
+# 39. Definition of Done
+
+Do not call AgentXFlow V2 finished until all of the following are true:
+
+* multiple real agents can operate simultaneously
+* each task executes in isolation
+* dependencies prevent incorrect scheduling
+* write collisions are detected
+* actual mutations are audited
+* agents cannot fake verification
+* changing code invalidates old verification
+* user root checkout never needs to be switched for autonomous merges
+* merge queue handles target-branch movement
+* conflicts are never silently resolved
+* crashed runs are recoverable
+* MCP current spec works
+* ACP agents can be launched and managed
+* unsupported agent features disappear from the UI
+* UI updates live without four-second full-state polling
+* every task has reproducible proof
+* every important action appears in the audit timeline
+* the UI works efficiently by keyboard
+* the interface contains no decorative glass/gradient/dashboard aesthetic
+* no unfinished control is presented as functional
+* existing stable functionality still works
+* Rust tests, frontend tests and desktop build all pass
+
+The finished product should look and behave like software created by an experienced developer-tools team: **dense, deterministic, restrained, extremely reliable and designed around real engineering workflows.**
