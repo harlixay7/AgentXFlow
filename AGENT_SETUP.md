@@ -109,7 +109,7 @@ Connect via HTTP:
 - Header: `Authorization: Bearer axf_sec_v2_live_token_7890`
 
 ### If you are Antigravity
-The skill is located at `SKILL.md` or `.agents/skills/viducia-coordinator/SKILL.md`.
+The coordinator skill specification is located at `SKILL.md`.
 
 ---
 
