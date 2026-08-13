@@ -31,3 +31,8 @@ dist-ssr
 *.db-shm
 target_test/
 target_release/
+
+# Internal masterplans and scratch specs
+MASTERPLAN.txt
+masterplan.txt
+*.scratch.txt
