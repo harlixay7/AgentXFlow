@@ -1,5 +1,31 @@
+# Dependencies
+node_modules/
+
+# Production & Build Outputs
+dist/
+dist-ssr/
+target/
+target_test/
+target_release/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Environment & Local Configuration
+*.local
+.env
+.env.*.local
+
+# Runtime Data, SQLite Databases & Lockfiles
+.agentxflow/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,32 +33,19 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
+# Editor & OS Metadata
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
 .DS_Store
+Thumbs.db
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
 
-# AgentXFlow & Viducia Runtime Directories
-.agentxflow/
-*.sqlite
-*.db
-*.db-wal
-*.db-shm
-target_test/
-target_release/
-
-# Internal masterplans and scratch specs
-MASTERPLAN.txt
-masterplan.txt
-*.scratch.txt
+# Local Scratch & Development Files
+*.scratch.*
+scratch/
+[Mm]aster[Pp]lan*.txt
