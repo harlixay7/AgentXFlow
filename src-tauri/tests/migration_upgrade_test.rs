@@ -117,3 +117,79 @@ fn test_legacy_database_migration_upgrade() {
     drop(conn);
     std::fs::remove_file(temp_db_path).ok();
 }
+
+#[test]
+fn test_migration_0005_with_partially_existing_tables() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_partial_0005_{}.sqlite", uuid::Uuid::new_v4()));
+    let mut conn = Connection::open(&temp_db_path).expect("Failed to open SQLite db");
+
+    // Simulate an existing database where task_attempts was previously created without attempt_number
+    conn.execute_batch(
+        "
+        CREATE TABLE _schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+        INSERT INTO _schema_migrations (version, name, applied_at) VALUES (1, 'core_entities', '2026-01-01');
+        INSERT INTO _schema_migrations (version, name, applied_at) VALUES (2, 'agent_sessions_and_token_rotation', '2026-01-01');
+        INSERT INTO _schema_migrations (version, name, applied_at) VALUES (3, 'evidence_proofs_and_revisions', '2026-01-01');
+        INSERT INTO _schema_migrations (version, name, applied_at) VALUES (4, 'claim_and_merge_metadata', '2026-01-01');
+
+        CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE, master_spec TEXT NOT NULL, target_branch TEXT NOT NULL DEFAULT 'main', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'BACKLOG', substate TEXT NOT NULL DEFAULT 'NONE', priority TEXT NOT NULL DEFAULT 'MEDIUM', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, agent_type TEXT NOT NULL, profile TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'IDLE', last_heartbeat TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE scope_violations (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, file_path TEXT NOT NULL, detected_at TEXT NOT NULL);
+        CREATE TABLE proof_bundles (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, project_id TEXT NOT NULL, proof_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+
+        -- Existing older task_attempts table without attempt_number
+        CREATE TABLE task_attempts (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL
+        );
+        "
+    ).unwrap();
+
+    // Run migrations - must succeed and add attempt_number column and create index
+    run_migrations(&mut conn).expect("Migration 0005 must handle existing task_attempts table without panicking");
+
+    // Verify attempt_number column exists and can be queried
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_attempts",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(count, 0);
+
+    // Insert into upgraded task_attempts with attempt_number
+    conn.execute(
+        "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, base_sha, status, started_at)
+         VALUES ('att-1', 't-1', 'ag-1', 1, 'base_sha', 'ACTIVE', '2026-08-14T00:00:00Z')",
+        [],
+    ).unwrap();
+
+    let att_num: i64 = conn.query_row(
+        "SELECT attempt_number FROM task_attempts WHERE id = 'att-1'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(att_num, 1);
+
+    drop(conn);
+    std::fs::remove_file(temp_db_path).ok();
+}
+
+#[test]
+fn test_real_disk_database_initialization_if_present() {
+    if let Some(data_dir) = dirs_next::data_dir() {
+        let db_path = data_dir.join("AgentXFlow").join("agentxflow_v2.db");
+        if db_path.exists() {
+            println!("Testing connection and migration against existing disk db: {:?}", db_path);
+            let pool_res = agent_x_flow_lib::db::DbPool::new(&db_path);
+            assert!(pool_res.is_ok(), "Opening existing user on-disk DB must succeed: {:?}", pool_res.err());
+        }
+    }
+}

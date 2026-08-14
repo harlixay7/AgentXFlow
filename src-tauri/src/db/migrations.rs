@@ -558,86 +558,212 @@ fn migration_0004_claim_and_merge_metadata(tx: &Transaction) -> Result<()> {
 }
 
 fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Result<()> {
-    tx.execute_batch(
-        "
-        -- Task Attempts Table
-        CREATE TABLE IF NOT EXISTS task_attempts (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            attempt_number INTEGER NOT NULL,
-            base_sha TEXT NOT NULL,
-            head_sha TEXT,
-            status TEXT NOT NULL, -- ACTIVE, VERIFYING, VERIFIED, FAILED, ABORTED, SUPERSEDED
-            rejection_reasons TEXT, -- JSON array of rejection strings
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
-        );
+    // 1. Ensure task_attempts table exists with all required columns
+    let mut check_ta_stmt = tx.prepare("PRAGMA table_info(task_attempts)")?;
+    let ta_cols = check_ta_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_ta_stmt);
 
-        -- Machine Evaluator Results Table (Derived machine criteria satisfaction)
-        CREATE TABLE IF NOT EXISTS evaluator_results (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL,
-            criterion_id TEXT,
-            evaluator_name TEXT NOT NULL,
-            evaluator_type TEXT NOT NULL, -- COMMAND, SCOPE_AUDIT, TEST, LINT, BUILD, ACCEPTANCE
-            evaluator_version TEXT NOT NULL DEFAULT '1.0.0',
-            commit_sha TEXT NOT NULL,
-            exit_code INTEGER NOT NULL,
-            stdout_output TEXT NOT NULL,
-            stderr_output TEXT NOT NULL,
-            output_sha256 TEXT NOT NULL,
-            duration_ms INTEGER NOT NULL,
-            passed BOOLEAN NOT NULL,
-            evaluated_at TEXT NOT NULL,
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-            FOREIGN KEY(attempt_id) REFERENCES task_attempts(id) ON DELETE CASCADE
-        );
+    if ta_cols.is_empty() {
+        tx.execute_batch(
+            "CREATE TABLE task_attempts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                base_sha TEXT NOT NULL,
+                head_sha TEXT,
+                status TEXT NOT NULL,
+                rejection_reasons TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+            );"
+        )?;
+    } else {
+        if !ta_cols.contains(&"attempt_number".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;")?;
+        }
+        if !ta_cols.contains(&"agent_id".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN agent_id TEXT;")?;
+        }
+        if !ta_cols.contains(&"base_sha".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !ta_cols.contains(&"head_sha".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN head_sha TEXT;")?;
+        }
+        if !ta_cols.contains(&"status".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';")?;
+        }
+        if !ta_cols.contains(&"rejection_reasons".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN rejection_reasons TEXT;")?;
+        }
+        if !ta_cols.contains(&"started_at".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN started_at TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !ta_cols.contains(&"finished_at".to_string()) {
+            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN finished_at TEXT;")?;
+        }
+    }
 
-        -- Verification Profiles per Project / Task
-        CREATE TABLE IF NOT EXISTS verification_profiles (
-            id TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL,
-            task_id TEXT,
-            check_type TEXT NOT NULL, -- FORMAT, TYPECHECK, UNIT_TESTS, INTEGRATION_TESTS, BUILD, SCOPE_AUDIT, ACCEPTANCE
-            command TEXT NOT NULL,
-            args_json TEXT NOT NULL DEFAULT '[]',
-            timeout_secs INTEGER NOT NULL DEFAULT 60,
-            required BOOLEAN NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
-        );
+    // 2. Ensure evaluator_results table exists with all required columns
+    let mut check_er_stmt = tx.prepare("PRAGMA table_info(evaluator_results)")?;
+    let er_cols = check_er_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_er_stmt);
 
-        CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, attempt_number);
-        CREATE INDEX IF NOT EXISTS idx_evaluator_results_attempt ON evaluator_results(attempt_id, passed);
-        CREATE INDEX IF NOT EXISTS idx_evaluator_results_task ON evaluator_results(task_id, criterion_id);
-        "
-    )?;
+    if er_cols.is_empty() {
+        tx.execute_batch(
+            "CREATE TABLE evaluator_results (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                criterion_id TEXT,
+                evaluator_name TEXT NOT NULL,
+                evaluator_type TEXT NOT NULL,
+                evaluator_version TEXT NOT NULL DEFAULT '1.0.0',
+                commit_sha TEXT NOT NULL,
+                exit_code INTEGER NOT NULL,
+                stdout_output TEXT NOT NULL,
+                stderr_output TEXT NOT NULL,
+                output_sha256 TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                passed BOOLEAN NOT NULL,
+                evaluated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+                FOREIGN KEY(attempt_id) REFERENCES task_attempts(id) ON DELETE CASCADE
+            );"
+        )?;
+    } else {
+        if !er_cols.contains(&"attempt_id".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN attempt_id TEXT;")?;
+        }
+        if !er_cols.contains(&"criterion_id".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN criterion_id TEXT;")?;
+        }
+        if !er_cols.contains(&"evaluator_name".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluator_name TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !er_cols.contains(&"evaluator_type".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluator_type TEXT NOT NULL DEFAULT 'COMMAND';")?;
+        }
+        if !er_cols.contains(&"evaluator_version".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluator_version TEXT NOT NULL DEFAULT '1.0.0';")?;
+        }
+        if !er_cols.contains(&"commit_sha".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN commit_sha TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !er_cols.contains(&"exit_code".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN exit_code INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        if !er_cols.contains(&"stdout_output".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN stdout_output TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !er_cols.contains(&"stderr_output".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN stderr_output TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !er_cols.contains(&"output_sha256".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN output_sha256 TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !er_cols.contains(&"duration_ms".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        if !er_cols.contains(&"passed".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN passed BOOLEAN NOT NULL DEFAULT 0;")?;
+        }
+        if !er_cols.contains(&"evaluated_at".to_string()) {
+            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluated_at TEXT NOT NULL DEFAULT '';")?;
+        }
+    }
 
-    // Ensure scope_violations table has attempt_id
+    // 3. Ensure verification_profiles table exists with all required columns
+    let mut check_vp_stmt = tx.prepare("PRAGMA table_info(verification_profiles)")?;
+    let vp_cols = check_vp_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_vp_stmt);
+
+    if vp_cols.is_empty() {
+        tx.execute_batch(
+            "CREATE TABLE verification_profiles (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT,
+                check_type TEXT NOT NULL,
+                command TEXT NOT NULL,
+                args_json TEXT NOT NULL DEFAULT '[]',
+                timeout_secs INTEGER NOT NULL DEFAULT 60,
+                required BOOLEAN NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );"
+        )?;
+    } else {
+        if !vp_cols.contains(&"project_id".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN project_id TEXT;")?;
+        }
+        if !vp_cols.contains(&"task_id".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN task_id TEXT;")?;
+        }
+        if !vp_cols.contains(&"check_type".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN check_type TEXT NOT NULL DEFAULT 'UNIT_TESTS';")?;
+        }
+        if !vp_cols.contains(&"command".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN command TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !vp_cols.contains(&"args_json".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN args_json TEXT NOT NULL DEFAULT '[]';")?;
+        }
+        if !vp_cols.contains(&"timeout_secs".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 60;")?;
+        }
+        if !vp_cols.contains(&"required".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN required BOOLEAN NOT NULL DEFAULT 1;")?;
+        }
+        if !vp_cols.contains(&"created_at".to_string()) {
+            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN created_at TEXT NOT NULL DEFAULT '';")?;
+        }
+    }
+
+    // 4. Ensure scope_violations table has attempt_id
     let mut check_sv_stmt = tx.prepare("PRAGMA table_info(scope_violations)")?;
     let sv_cols = check_sv_stmt
         .query_map([], |r| r.get::<_, String>(1))
         .map(|rows| rows.flatten().collect::<Vec<String>>())
         .unwrap_or_default();
+    drop(check_sv_stmt);
 
     if !sv_cols.contains(&"attempt_id".to_string()) {
         tx.execute_batch("ALTER TABLE scope_violations ADD COLUMN attempt_id TEXT;")?;
     }
 
-    // Ensure proof_bundles table has attempt_id
+    // 5. Ensure proof_bundles table has attempt_id
     let mut check_pb_stmt = tx.prepare("PRAGMA table_info(proof_bundles)")?;
     let pb_cols = check_pb_stmt
         .query_map([], |r| r.get::<_, String>(1))
         .map(|rows| rows.flatten().collect::<Vec<String>>())
         .unwrap_or_default();
+    drop(check_pb_stmt);
 
     if !pb_cols.contains(&"attempt_id".to_string()) {
         tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN attempt_id TEXT;")?;
     }
+
+    // 6. Safe index creation
+    tx.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, attempt_number);
+        CREATE INDEX IF NOT EXISTS idx_evaluator_results_attempt ON evaluator_results(attempt_id, passed);
+        CREATE INDEX IF NOT EXISTS idx_evaluator_results_task ON evaluator_results(task_id, criterion_id);
+        "
+    )?;
 
     Ok(())
 }
