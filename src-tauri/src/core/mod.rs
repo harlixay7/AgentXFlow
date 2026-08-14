@@ -3,7 +3,7 @@ use rusqlite::params;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::acp::AcpRuntime;
@@ -878,9 +878,18 @@ impl CoordinatorEngine {
                 |r| r.get(0),
             ).unwrap_or(1);
             conn.execute(
-                "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, run_number, base_sha, status, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ACTIVE', ?7)",
-                rusqlite::params![new_id, task_id, agent_id, new_num, new_num, task.base_sha.as_deref().unwrap_or(""), now],
+                "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, run_number, base_sha, worktree_path, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8)",
+                rusqlite::params![
+                    new_id,
+                    task_id,
+                    agent_id,
+                    new_num,
+                    new_num,
+                    task.base_sha.as_deref().unwrap_or(""),
+                    worktree_dir.to_string_lossy().as_ref(),
+                    now,
+                ],
             ).map_err(|e| format!("Failed to create task attempt: {}", e))?;
             (new_id, new_num)
         };
@@ -1000,7 +1009,14 @@ impl CoordinatorEngine {
             return Err(format!("No valid proof bundle found for task '{}' at commit HEAD {}. Verification is required.", task_id, head_sha));
         }
 
-        let base_sha = task.base_sha.unwrap_or_else(|| self.git.get_ref_sha(repo_path, &proj.target_branch).unwrap_or_default());
+        // The queue base is the target branch state observed when this item is
+        // enqueued, not the task's original claim base. Earlier queued merges
+        // are serialized ahead of this item and may have advanced the target
+        // branch in the meantime.
+        let base_sha = self
+            .git
+            .get_ref_sha(repo_path, &proj.target_branch)
+            .or_else(|_| Ok::<String, String>(task.base_sha.unwrap_or_default()))?;
 
         let item = self.merge.enqueue_task(
             project_id,
@@ -1955,6 +1971,9 @@ impl CoordinatorEngine {
         let next_ready = queue.into_iter().find(|item| item.status == "READY");
         if let Some(item) = next_ready {
             let attempt = self.merge.process_merge_by_id(&item.id, Path::new(&proj.path))?;
+            if let Err(error) = self.scope.release_scope(&item.task_id) {
+                warn!(task_id = %item.task_id, %error, "Merged task scopes could not be released automatically");
+            }
             Ok(Some(attempt))
         } else {
             Ok(None)
@@ -1963,7 +1982,7 @@ impl CoordinatorEngine {
 
     /// Reconciles task status, attempt, proof bundle, and merge queue health
     pub fn reconcile_task(&self, task_id: &str) -> Result<serde_json::Value, String> {
-        let task = self.get_task(task_id)?;
+        let mut task = self.get_task(task_id)?;
         let conn = self.db.lock();
         let attempt: Option<(String, String)> = conn.query_row(
             "SELECT id, status FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
@@ -1975,12 +1994,45 @@ impl CoordinatorEngine {
             [task_id],
             |r| r.get(0),
         ).unwrap_or(false);
-        let queue_status: Option<String> = conn.query_row(
-            "SELECT status FROM merge_queue WHERE task_id = ?1 AND processed_at IS NULL",
+        let queue_item: Option<(String, String, String)> = conn.query_row(
+            "SELECT id, status, target_branch FROM merge_queue WHERE task_id = ?1 AND processed_at IS NULL",
             [task_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).ok();
         drop(conn);
+
+        let mut queue_status = queue_item.as_ref().map(|(_, status, _)| status.clone());
+
+        // A verified task can become stale while an earlier FIFO candidate is
+        // merged. Rebase the queue expectation to the current target and let
+        // the normal merge simulation detect real conflicts.
+        if task.state == TaskState::Blocked
+            && queue_status.as_deref() == Some("STALE")
+            && attempt.as_ref().map(|(_, status)| status.as_str()) == Some("VERIFIED")
+            && has_proof
+        {
+            if let Some((queue_id, _, target_branch)) = queue_item.as_ref() {
+                let project = self
+                    .list_projects()?
+                    .into_iter()
+                    .find(|project| project.id == task.project_id)
+                    .ok_or("Project not found")?;
+                let target_sha = self.git.get_ref_sha(Path::new(&project.path), target_branch)?;
+                let now = Utc::now().to_rfc3339();
+                let conn = self.db.lock();
+                conn.execute(
+                    "UPDATE merge_queue SET base_sha = ?1, status = 'READY' WHERE id = ?2 AND status = 'STALE'",
+                    params![target_sha, queue_id],
+                ).map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', updated_at = ?1 WHERE id = ?2",
+                    params![now, task_id],
+                ).map_err(|e| e.to_string())?;
+                drop(conn);
+                task.state = TaskState::MergeReady;
+                queue_status = Some("READY".to_string());
+            }
+        }
 
         // Auto-heal if MERGE_READY but not enqueued
         if task.state == TaskState::MergeReady && queue_status.is_none() {
@@ -2183,5 +2235,3 @@ impl CoordinatorEngine {
 
 #[cfg(test)]
 mod tests;
-
-
