@@ -129,9 +129,10 @@ fn claim_task(
 fn complete_step(
     state: State<'_, Arc<AppState>>,
     step_id: String,
+    agent_id: Option<String>,
     evidence_json: Option<String>,
 ) -> Result<TaskStep, String> {
-    state.coordinator.complete_step(&step_id, evidence_json.as_deref())
+    state.coordinator.complete_step(&step_id, agent_id.as_deref(), evidence_json.as_deref())
 }
 
 #[tauri::command]
@@ -311,6 +312,17 @@ fn reset_masterplan(
 }
 
 #[tauri::command]
+fn prepare_masterplan(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    raw_text: String,
+    target_step_count: i32,
+    max_steps_per_agent: i32,
+) -> Result<crate::models::PreparedMasterplanSnapshot, String> {
+    state.coordinator.prepare_masterplan(&project_id, &raw_text, target_step_count, max_steps_per_agent)
+}
+
+#[tauri::command]
 fn list_all_masterplans(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::models::MasterplanSummary>, String> {
@@ -320,8 +332,10 @@ fn list_all_masterplans(
 #[tauri::command]
 fn get_current_context(
     state: State<'_, Arc<AppState>>,
+    agent_id: Option<String>,
+    project_id: Option<String>,
 ) -> Result<crate::models::CurrentContext, String> {
-    state.coordinator.get_current_context()
+    state.coordinator.get_current_context(agent_id.as_deref(), project_id.as_deref())
 }
 
 pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
@@ -407,6 +421,7 @@ pub fn run() {
             unregister_agent,
             list_agents,
             create_or_update_masterplan,
+            prepare_masterplan,
             get_masterplan,
             list_masterplan_steps,
             decompose_masterplan,

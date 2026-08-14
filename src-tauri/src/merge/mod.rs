@@ -29,6 +29,39 @@ impl MergeEngine {
         head_sha: &str,
     ) -> Result<MergeQueueItem, String> {
         let conn = self.db.lock();
+        let existing = conn.query_row(
+            "SELECT id, project_id, task_id, branch_name, target_branch, position, status, base_sha, head_sha, queued_at, processed_at FROM merge_queue WHERE project_id = ?1 AND task_id = ?2 AND processed_at IS NULL",
+            [project_id, task_id],
+            |r| {
+                Ok(MergeQueueItem {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    task_id: r.get(2)?,
+                    branch_name: r.get(3)?,
+                    target_branch: r.get(4)?,
+                    position: r.get(5)?,
+                    status: r.get(6)?,
+                    base_sha: r.get(7)?,
+                    head_sha: r.get(8)?,
+                    queued_at: r.get(9)?,
+                    processed_at: r.get(10)?,
+                })
+            },
+        ).ok();
+
+        if let Some(mut item) = existing {
+            conn.execute(
+                "UPDATE merge_queue SET branch_name = ?1, target_branch = ?2, base_sha = ?3, head_sha = ?4, status = 'READY' WHERE id = ?5",
+                rusqlite::params![branch_name, target_branch, base_sha, head_sha, item.id],
+            ).map_err(|e| e.to_string())?;
+            item.branch_name = branch_name.to_string();
+            item.target_branch = target_branch.to_string();
+            item.base_sha = base_sha.to_string();
+            item.head_sha = head_sha.to_string();
+            item.status = "READY".to_string();
+            return Ok(item);
+        }
+
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 

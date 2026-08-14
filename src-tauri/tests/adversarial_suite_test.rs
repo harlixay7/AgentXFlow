@@ -138,7 +138,7 @@ async fn test_adversarial_security_and_mcp_suite() {
         .unwrap();
 
     let crit_json: serde_json::Value = crit_res.json().await.unwrap();
-    assert!(crit_json["error"]["message"].as_str().unwrap().contains("human reviewer authority"));
+    assert!(crit_json["error"]["message"].as_str().unwrap().contains("Autonomous agents cannot self-satisfy criteria"));
     println!("   ✔ Test 8 PASS: Autonomous agent restricted from self-satisfying criteria");
 
     std::fs::remove_dir_all(temp_repo).ok();

@@ -93,7 +93,8 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
   const handleCompleteStep = async (stepId: string) => {
     setLoading(true);
     try {
-      await coordinatorApi.completeStep(stepId, JSON.stringify({ stdout: stepEvidenceInput, exit_code: 0 }));
+      const agentId = currentTask.assigned_agent_id || activeAgentId || undefined;
+      await coordinatorApi.completeStep(stepId, JSON.stringify({ stdout: stepEvidenceInput, exit_code: 0 }), agentId);
       setCompletingStepId(null);
       await fetchDetails();
       onRefresh();
@@ -382,10 +383,10 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
         {activeTab === 'verification' && (
           <div>
             <div className="section-label" title="Independently verify code changes before review and merge">
-              Authoritative Verification Gate
+              Authoritative Machine Verification
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, lineHeight: 1.5 }}>
-              The coordinator runs configured test suites and checks directly inside the isolated worktree.
+              The coordinator executes verification profiles and machine evaluators directly in the isolated worktree. Criteria satisfaction is strictly derived from passing evaluator results.
             </p>
 
             <button
@@ -393,20 +394,50 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
               style={{ width: '100%', marginBottom: 12, height: 32 }}
               onClick={handleSubmit}
               disabled={!currentTask.assigned_agent_id || loading}
-              title="Run authoritative coordinator checks and submit task for human review"
+              title="Run authoritative coordinator verification profile and machine evaluators"
             >
-              <Send size={13} /> Run Verification & Submit For Review
+              <Send size={13} /> Run Verification Profile & Submit
             </button>
+
+            {taskDetails?.active_attempt && (
+              <div style={{ padding: 10, marginBottom: 12, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 11 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span style={{ fontWeight: 600 }}>Attempt #{taskDetails.active_attempt.attempt_number}</span>
+                  <span className={`badge badge-${taskDetails.active_attempt.status}`}>{taskDetails.active_attempt.status}</span>
+                </div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-muted)' }}>
+                  Base: {taskDetails.active_attempt.base_sha?.slice(0, 8) || 'N/A'} | Head: {taskDetails.active_attempt.head_sha?.slice(0, 8) || 'Uncommitted'}
+                </div>
+              </div>
+            )}
 
             {verificationResult && (
               <div style={{ padding: 12, marginBottom: 12, backgroundColor: verificationResult.is_valid ? 'rgba(63, 185, 80, 0.1)' : 'rgba(248, 81, 73, 0.1)', border: `1px solid ${verificationResult.is_valid ? 'var(--accent-green)' : 'var(--accent-red)'}`, borderRadius: 'var(--radius-sm)' }}>
                 <div style={{ fontWeight: 600, fontSize: 11, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
                   {verificationResult.is_valid ? <CheckCircle size={14} style={{ color: 'var(--accent-green)' }} /> : <AlertTriangle size={14} style={{ color: 'var(--accent-red)' }} />}
-                  {verificationResult.is_valid ? 'Verification Passed & Sealed' : 'Verification Checks Failed'}
+                  {verificationResult.is_valid ? 'Automated Verification Passed — Ready for Merge' : 'Verification Checks Failed'}
                 </div>
                 {verificationResult.rejection_reasons.map((r, i) => (
                   <div key={i} style={{ fontSize: 10, color: 'var(--text-secondary)', marginTop: 2 }}>• {r}</div>
                 ))}
+              </div>
+            )}
+
+            {/* Evaluator Results */}
+            {taskDetails?.evaluator_results && taskDetails.evaluator_results.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div className="section-label">Machine Evaluator Checks ({taskDetails.evaluator_results.length})</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {taskDetails.evaluator_results.map((ev) => (
+                    <div key={ev.id} style={{ padding: 8, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 10, fontFamily: 'var(--font-mono)' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                        <span style={{ fontWeight: 600, color: ev.passed ? 'var(--accent-green)' : 'var(--accent-red)' }}>{ev.evaluator_name} ({ev.evaluator_type})</span>
+                        <span>Exit {ev.exit_code} ({ev.duration_ms}ms)</span>
+                      </div>
+                      <div style={{ color: 'var(--text-muted)' }}>SHA256: {ev.output_sha256.slice(0, 12)}... | {ev.commit_sha.slice(0, 8)}</div>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 

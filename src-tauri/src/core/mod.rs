@@ -13,9 +13,10 @@ use crate::git::GitService;
 use crate::merge::MergeEngine;
 use crate::models::{
     AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, CurrentContext, DecomposedStepInput,
-    EventItem, EvidenceRecord, Masterplan, MasterplanStep, MasterplanSummary, MergeQueueItem,
-    ProofBundle, Project, ScopeLease, ScopeViolation, Task, TaskDependency, TaskDetails, TaskState,
-    TaskStep, TaskSubstate, VerificationResult, VerificationRun,
+    EvaluatorResult, EventItem, EvidenceRecord, Masterplan, MasterplanStep, MasterplanSummary,
+    MergeQueueItem, PreparedMasterplanSnapshot, Project, ProofBundle, ScopeLease, ScopeViolation,
+    Task, TaskAttempt, TaskDependency, TaskDetails, TaskState, TaskStep, TaskSubstate,
+    VerificationResult, VerificationRun,
 };
 use crate::policies::PolicyEngine;
 use crate::scheduler::{SchedulerConfig, SchedulerEngine};
@@ -512,6 +513,46 @@ impl CoordinatorEngine {
             None
         };
 
+        let active_attempt = conn.query_row(
+            "SELECT id, task_id, agent_id, attempt_number, base_sha, head_sha, status, rejection_reasons, started_at, finished_at FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
+            [task_id],
+            |r| {
+                Ok(TaskAttempt {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    attempt_number: r.get(3)?,
+                    base_sha: r.get(4)?,
+                    head_sha: r.get(5)?,
+                    status: r.get(6)?,
+                    rejection_reasons: r.get(7)?,
+                    started_at: r.get(8)?,
+                    finished_at: r.get(9)?,
+                })
+            },
+        ).ok();
+
+        let mut stmt_eval = conn.prepare("SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 ORDER BY evaluated_at DESC").map_err(|e| e.to_string())?;
+        let evaluator_results: Vec<EvaluatorResult> = stmt_eval.query_map([task_id], |r| {
+            Ok(EvaluatorResult {
+                id: r.get(0)?,
+                task_id: r.get(1)?,
+                attempt_id: r.get(2)?,
+                criterion_id: r.get(3)?,
+                evaluator_name: r.get(4)?,
+                evaluator_type: r.get(5)?,
+                evaluator_version: r.get(6)?,
+                commit_sha: r.get(7)?,
+                exit_code: r.get(8)?,
+                stdout_output: r.get(9)?,
+                stderr_output: r.get(10)?,
+                output_sha256: r.get(11)?,
+                duration_ms: r.get(12)?,
+                passed: r.get(13)?,
+                evaluated_at: r.get(14)?,
+            })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
         Ok(TaskDetails {
             task,
             steps,
@@ -523,6 +564,8 @@ impl CoordinatorEngine {
             evidence_records,
             proof_bundle,
             assigned_agent,
+            active_attempt,
+            evaluator_results,
         })
     }
 
@@ -614,9 +657,29 @@ impl CoordinatorEngine {
         self.get_task(task_id)
     }
 
-    pub fn complete_step(&self, step_id: &str, evidence_json: Option<&str>) -> Result<TaskStep, String> {
+    pub fn complete_step(&self, step_id: &str, agent_id: Option<&str>, evidence_json: Option<&str>) -> Result<TaskStep, String> {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
+
+        // Verify step and caller task ownership
+        let (task_id, assigned_agent): (String, Option<String>) = conn
+            .query_row(
+                "SELECT t.id, t.assigned_agent_id FROM task_steps s JOIN tasks t ON s.task_id = t.id WHERE s.id = ?1",
+                [step_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("Step '{}' not found: {}", step_id, e))?;
+
+        if let Some(caller) = agent_id {
+            if let Some(ref assigned) = assigned_agent {
+                if assigned != caller {
+                    return Err(format!(
+                        "Step ownership violation: Step belongs to task '{}' assigned to agent '{}', caller is '{}'",
+                        task_id, assigned, caller
+                    ));
+                }
+            }
+        }
 
         conn.execute(
             "UPDATE task_steps SET status = 'COMPLETED', completed_at = ?1 WHERE id = ?2",
@@ -650,11 +713,11 @@ impl CoordinatorEngine {
         }
 
         drop(conn);
-        self.emit_event(None, Some(&step.task_id), None, "STEP_COMPLETED", json!({ "step_id": step_id, "title": step.title }));
+        self.emit_event(None, Some(&step.task_id), agent_id, "STEP_COMPLETED", json!({ "step_id": step_id, "title": step.title }));
         Ok(step)
     }
 
-    /// Complete Authoritative Task Submission & Verification Gate
+    /// Complete Authoritative Task Submission & Automated Machine Verification Gate
     pub fn submit_task(&self, task_id: &str, agent_id: &str) -> Result<VerificationResult, String> {
         let task = self.get_task(task_id)?;
 
@@ -665,9 +728,7 @@ impl CoordinatorEngine {
             }
         }
 
-        let proj = self.list_projects()?.into_iter().find(|p| p.id == task.project_id).ok_or("Project not found")?;
-        let _repo_path = Path::new(&proj.path);
-
+        let _proj = self.list_projects()?.into_iter().find(|p| p.id == task.project_id).ok_or("Project not found")?;
         let worktree_dir = match task.worktree_path.as_deref() {
             Some(path) => Path::new(path),
             None => return Err("Task has no worktree path allocated".to_string()),
@@ -689,58 +750,80 @@ impl CoordinatorEngine {
             });
         }
 
+        // Transition state to VERIFYING
+        let now = Utc::now().to_rfc3339();
+        let conn = self.db.lock();
+        conn.execute("UPDATE tasks SET state = 'VERIFYING', substate = 'VERIFYING', updated_at = ?1 WHERE id = ?2", [&now, task_id]).ok();
+
+        // Retrieve or create active task attempt
+        let attempt_opt: Option<(String, i32)> = conn
+            .query_row(
+                "SELECT id, attempt_number FROM task_attempts WHERE task_id = ?1 AND status = 'ACTIVE' ORDER BY attempt_number DESC LIMIT 1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        let (attempt_id, _attempt_num) = if let Some(att) = attempt_opt {
+            att
+        } else {
+            let new_id = Uuid::new_v4().to_string();
+            let new_num: i32 = conn.query_row(
+                "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?1",
+                [task_id],
+                |r| r.get(0),
+            ).unwrap_or(1);
+            conn.execute(
+                "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, base_sha, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'ACTIVE', ?6)",
+                rusqlite::params![new_id, task_id, agent_id, new_num, task.base_sha.as_deref().unwrap_or(""), now],
+            ).ok();
+            (new_id, new_num)
+        };
+        drop(conn);
+
         // 3. Exact worktree HEAD SHA is authoritative
         let head_sha = self.git.get_worktree_head_sha(worktree_dir)?;
 
         // 4. Invalidate stale verifications from previous commit SHAs
         self.verify.invalidate_stale_verifications(task_id, &head_sha).ok();
 
-        // 5. Automatically resolve and execute required coordinator checks inside worktree
-        if worktree_dir.join("Cargo.toml").exists() {
-            let _ = self.verify.execute_check(
-                task_id,
-                "check-cargo-test",
-                "Cargo Unit & Integration Tests",
-                worktree_dir,
-                &head_sha,
-                "cargo test",
-            );
-        } else if worktree_dir.join("package.json").exists() {
-            let _ = self.verify.execute_check(
-                task_id,
-                "check-npm-test",
-                "NPM Automated Test Suite",
-                worktree_dir,
-                &head_sha,
-                "npm test",
-            );
-        }
+        // 5. Automatically execute comprehensive verification profile and machine evaluators
+        self.verify.execute_profile_for_attempt(
+            task_id,
+            &attempt_id,
+            &task.project_id,
+            worktree_dir,
+            &head_sha,
+        ).ok();
 
-        // 6. Perform actual Git mutation audit against held scope leases
-        if let Some(ref base) = task.base_sha {
-            if let Ok(mutations) = self.git.get_worktree_mutations(worktree_dir, base) {
-                self.scope.audit_actual_mutations(task_id, agent_id, &mutations).ok();
-            }
-        }
+        // 6. Perform actual Git mutation audit against held scope leases for this attempt
+        let changed_files = if let Some(ref base) = task.base_sha {
+            self.git.get_worktree_mutations(worktree_dir, base).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.scope.audit_attempt_mutations(task_id, Some(&attempt_id), agent_id, &changed_files).ok();
 
         // 7. Verification checks gate evaluation
         let verify_res = self.verify.verify_task_submission(task_id, &head_sha)?;
 
+        let now_finished = Utc::now().to_rfc3339();
+        let conn = self.db.lock();
+
         if verify_res.is_valid {
-            let now = Utc::now().to_rfc3339();
-            let conn = self.db.lock();
             conn.execute(
-                "UPDATE tasks SET state = 'REVIEW', substate = 'NONE', head_sha = ?1, updated_at = ?2 WHERE id = ?3",
-                params![head_sha, now, task_id],
+                "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', head_sha = ?1, updated_at = ?2 WHERE id = ?3",
+                params![head_sha, now_finished, task_id],
             ).map_err(|e| e.to_string())?;
 
+            conn.execute(
+                "UPDATE task_attempts SET status = 'VERIFIED', head_sha = ?1, finished_at = ?2 WHERE id = ?3",
+                params![head_sha, now_finished, attempt_id],
+            ).ok();
             drop(conn);
 
             // Generate deterministic Proof-of-Completion bundle
-            let changed_files = task.base_sha.as_deref().and_then(|base| {
-                self.git.get_worktree_mutations(worktree_dir, base).ok()
-            }).unwrap_or_default();
-
             self.verify.generate_proof_bundle(
                 task_id,
                 &task.project_id,
@@ -749,10 +832,27 @@ impl CoordinatorEngine {
                 task.base_sha.as_deref().unwrap_or(""),
                 &head_sha,
                 &changed_files,
-                "Authoritative Coordinator Verification Passed",
+                "Authoritative Coordinator Automated Verification Passed",
             ).ok();
 
-            self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_SUBMITTED_FOR_REVIEW", json!({ "head_sha": head_sha }));
+            // Auto-enqueue for serialized merge queue
+            let _ = self.enqueue_task_by_id(&task.project_id, task_id);
+
+            self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_VERIFIED", json!({ "head_sha": head_sha }));
+        } else {
+            let reasons_json = serde_json::to_string(&verify_res.rejection_reasons).unwrap_or_else(|_| "[]".to_string());
+            conn.execute(
+                "UPDATE tasks SET state = 'FAILED', substate = 'NONE', updated_at = ?1 WHERE id = ?2",
+                params![now_finished, task_id],
+            ).ok();
+
+            conn.execute(
+                "UPDATE task_attempts SET status = 'FAILED', rejection_reasons = ?1, finished_at = ?2 WHERE id = ?3",
+                params![reasons_json, now_finished, attempt_id],
+            ).ok();
+            drop(conn);
+
+            self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_VERIFICATION_FAILED", json!({ "reasons": verify_res.rejection_reasons }));
         }
 
         Ok(verify_res)
@@ -1593,11 +1693,192 @@ impl CoordinatorEngine {
         Ok(summaries)
     }
 
-    pub fn get_current_context(&self) -> Result<CurrentContext, String> {
+    /// Automatically parses raw masterplan specification into structured execution steps
+    pub fn parse_masterplan_text_to_steps(&self, raw_text: &str, _target_step_count: i32) -> Result<Vec<DecomposedStepInput>, String> {
+        let mut steps = Vec::new();
+        let lines: Vec<&str> = raw_text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let mut current_title: Option<String> = None;
+        let mut current_desc: Vec<String> = Vec::new();
+        let mut step_index = 1;
+
+        for line in lines {
+            let is_header = line.starts_with("# ")
+                || line.starts_with("## ")
+                || line.starts_with("### ")
+                || line.starts_with("Step ")
+                || line.starts_with("Phase ")
+                || (line.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && (line.contains(". ") || line.contains(": ")))
+                || line.starts_with("- [ ] ")
+                || line.starts_with("- [x] ");
+
+            if is_header {
+                if let Some(title) = current_title.take() {
+                    let desc = if current_desc.is_empty() {
+                        title.clone()
+                    } else {
+                        current_desc.join("\n")
+                    };
+                    steps.push(DecomposedStepInput {
+                        step_index,
+                        title,
+                        description: desc,
+                        suggested_scope: Some("src/**".to_string()),
+                        acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
+                    });
+                    step_index += 1;
+                    current_desc.clear();
+                }
+
+                let clean_title = line
+                    .trim_start_matches('#')
+                    .trim_start_matches('-')
+                    .trim_start_matches('[')
+                    .trim_start_matches(']')
+                    .trim_start_matches('x')
+                    .trim_start_matches(' ')
+                    .trim();
+
+                current_title = Some(clean_title.to_string());
+            } else if current_title.is_some() {
+                current_desc.push(line.to_string());
+            } else {
+                current_title = Some(line.to_string());
+            }
+        }
+
+        if let Some(title) = current_title {
+            let desc = if current_desc.is_empty() {
+                title.clone()
+            } else {
+                current_desc.join("\n")
+            };
+            steps.push(DecomposedStepInput {
+                step_index,
+                title,
+                description: desc,
+                suggested_scope: Some("src/**".to_string()),
+                acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
+            });
+        }
+
+        if steps.is_empty() {
+            steps.push(DecomposedStepInput {
+                step_index: 1,
+                title: "Execute Masterplan Specification".to_string(),
+                description: raw_text.to_string(),
+                suggested_scope: Some("src/**".to_string()),
+                acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
+            });
+        }
+
+        Ok(steps)
+    }
+
+    /// Single atomic backend operation: Saves revision, parses steps, normalizes scopes, decomposes, and emits event
+    pub fn prepare_masterplan(
+        &self,
+        project_id: &str,
+        raw_text: &str,
+        target_step_count: i32,
+        max_steps_per_agent: i32,
+    ) -> Result<PreparedMasterplanSnapshot, String> {
+        let plan = self.create_or_update_masterplan(project_id, raw_text, target_step_count, max_steps_per_agent)?;
+        let parsed_steps = self.parse_masterplan_text_to_steps(raw_text, target_step_count)?;
+        let steps = self.decompose_masterplan(project_id, parsed_steps)?;
+
+        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
+        let handoff_prompt = format!(
+            "Claim next available chunk for project '{}' (ID: {}) located at '{}' using tool 'masterplan_claim_chunk'.",
+            proj.name, proj.id, proj.path
+        );
+
+        self.emit_event(Some(project_id), None, None, "MASTERPLAN_PREPARED", json!({ "plan_id": plan.id, "step_count": steps.len() }));
+
+        Ok(PreparedMasterplanSnapshot {
+            masterplan: plan,
+            total_steps: steps.len(),
+            steps,
+            target_step_count,
+            max_steps_per_agent,
+            handoff_prompt,
+            next_action: "masterplan_claim_chunk".to_string(),
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn get_current_context(&self, caller_agent_id: Option<&str>, project_id_filter: Option<&str>) -> Result<CurrentContext, String> {
         let summaries = self.list_all_masterplans()?;
         let agents = self.list_agents()?;
-        
-        if let Some(target) = summaries.first() {
+        let conn = self.db.lock();
+
+        // 1. If caller has an active running task, prioritize caller task context
+        if let Some(agent_id) = caller_agent_id {
+            let active_task_opt: Option<(String, String, String, String, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT t.id, t.project_id, t.title, t.state, t.worktree_path, p.name FROM tasks t
+                     JOIN projects p ON t.project_id = p.id
+                     WHERE t.assigned_agent_id = ?1 AND t.state IN ('RUNNING', 'CLAIMING', 'VERIFYING')
+                     ORDER BY t.updated_at DESC LIMIT 1",
+                    [agent_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .ok();
+
+            if let Some((task_id, project_id, task_title, task_state, worktree_path, project_name)) = active_task_opt {
+                let mut stmt_scopes = conn.prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
+                let rows = stmt_scopes.query_map([&task_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                let mut active_scopes: Vec<String> = Vec::new();
+                for pattern in rows.flatten() {
+                    active_scopes.push(pattern);
+                }
+                drop(stmt_scopes);
+
+                let active_attempt_id: Option<String> = conn
+                    .query_row(
+                        "SELECT id FROM task_attempts WHERE task_id = ?1 AND status = 'ACTIVE' ORDER BY attempt_number DESC LIMIT 1",
+                        [&task_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+
+                let now_str = Utc::now().to_rfc3339();
+                drop(conn);
+
+                let wt = worktree_path.unwrap_or_else(|| "N/A".to_string());
+                return Ok(CurrentContext {
+                    active_project_id: Some(project_id.clone()),
+                    project_name,
+                    repository_path: Some(wt.clone()),
+                    masterplan_id: None,
+                    masterplan_status: Some("EXECUTING".to_string()),
+                    masterplan_revision: None,
+                    caller_agent_id: Some(agent_id.to_string()),
+                    active_task_id: Some(task_id.clone()),
+                    active_attempt_id,
+                    active_scopes,
+                    current_state: Some(task_state),
+                    last_updated: Some(now_str),
+                    next_recommended_action: "task_submit".to_string(),
+                    handoff_prompt: format!(
+                        "Continue active task '{}' (ID: {}) in worktree '{}'. Implement required steps and submit with 'task_submit(task_id=\"{}\", agent_id=\"{}\")'.",
+                        task_title, task_id, wt, task_id, agent_id
+                    ),
+                    active_agents_count: agents.len(),
+                    pending_tasks_count: 0,
+                    instructions: format!("Work strictly inside worktree '{}'. Verify code and submit via task_submit.", wt),
+                });
+            }
+        }
+        drop(conn);
+
+        // 2. Otherwise return targeted or primary project masterplan context
+        let target = if let Some(pid) = project_id_filter {
+            summaries.iter().find(|s| s.project_id == pid).cloned()
+        } else {
+            summaries.first().cloned()
+        };
+
+        if let Some(target) = target {
             let instructions = if target.status == "UNSORTED" {
                 format!(
                     "1. Call 'project_context(project_id=\"{}\")' to fetch rules.\n2. Call 'masterplan_get(project_id=\"{}\")' to read specification.\n3. Call 'masterplan_decompose(project_id=\"{}\", steps=[...])' to structure the plan.",
@@ -1618,6 +1899,12 @@ impl CoordinatorEngine {
                 repository_path: Some(target.repository_path.clone()),
                 masterplan_id: Some(target.masterplan_id.clone()),
                 masterplan_status: Some(target.status.clone()),
+                masterplan_revision: None,
+                caller_agent_id: caller_agent_id.map(|s| s.to_string()),
+                active_task_id: None,
+                active_attempt_id: None,
+                active_scopes: Vec::new(),
+                current_state: None,
                 last_updated: Some(target.last_updated.clone()),
                 next_recommended_action: target.next_action.clone(),
                 handoff_prompt: target.handoff_prompt.clone(),
@@ -1634,6 +1921,12 @@ impl CoordinatorEngine {
                     repository_path: Some(proj.path.clone()),
                     masterplan_id: None,
                     masterplan_status: None,
+                    masterplan_revision: None,
+                    caller_agent_id: caller_agent_id.map(|s| s.to_string()),
+                    active_task_id: None,
+                    active_attempt_id: None,
+                    active_scopes: Vec::new(),
+                    current_state: None,
                     last_updated: Some(proj.created_at.clone()),
                     next_recommended_action: "create_masterplan".to_string(),
                     handoff_prompt: format!("Create masterplan for project '{}' ({}) in the AgentXFlow UI.", proj.name, proj.id),
@@ -1648,6 +1941,12 @@ impl CoordinatorEngine {
                     repository_path: None,
                     masterplan_id: None,
                     masterplan_status: None,
+                    masterplan_revision: None,
+                    caller_agent_id: caller_agent_id.map(|s| s.to_string()),
+                    active_task_id: None,
+                    active_attempt_id: None,
+                    active_scopes: Vec::new(),
+                    current_state: None,
                     last_updated: None,
                     next_recommended_action: "create_project".to_string(),
                     handoff_prompt: "No projects created yet. Create a project in AgentXFlow.".to_string(),

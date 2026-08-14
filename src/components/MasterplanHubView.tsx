@@ -124,18 +124,19 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
     if (!rawText.trim()) return;
     setIsSaving(true);
     try {
-      const updated = await invoke<Masterplan>('create_or_update_masterplan', {
+      const snap = await coordinatorApi.prepareMasterplan(
         projectId,
-        rawText: rawText.trim(),
-        targetStepCount: Number(targetStepCount),
-        maxStepsPerAgent: Number(maxStepsPerAgent),
-      });
-      setMasterplan(updated);
+        rawText.trim(),
+        Number(targetStepCount),
+        Number(maxStepsPerAgent)
+      );
+      setMasterplan(snap.masterplan);
+      setSteps(snap.steps);
       setIsEditing(false);
       await fetchPlan();
       onRefreshTasks();
     } catch (err) {
-      alert(`Error saving masterplan: ${err}`);
+      alert(`Error preparing masterplan: ${err}`);
     } finally {
       setIsSaving(false);
     }

@@ -75,6 +75,11 @@ fn get_all_migrations() -> Vec<Migration> {
             name: "crash_safe_claim_and_merge_metadata",
             run: migration_0004_claim_and_merge_metadata,
         },
+        Migration {
+            version: 5,
+            name: "task_attempts_and_machine_evaluators",
+            run: migration_0005_task_attempts_and_machine_evaluators,
+        },
     ]
 }
 
@@ -551,3 +556,89 @@ fn migration_0004_claim_and_merge_metadata(tx: &Transaction) -> Result<()> {
 
     Ok(())
 }
+
+fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "
+        -- Task Attempts Table
+        CREATE TABLE IF NOT EXISTS task_attempts (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL,
+            base_sha TEXT NOT NULL,
+            head_sha TEXT,
+            status TEXT NOT NULL, -- ACTIVE, VERIFYING, VERIFIED, FAILED, ABORTED, SUPERSEDED
+            rejection_reasons TEXT, -- JSON array of rejection strings
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+        );
+
+        -- Machine Evaluator Results Table (Derived machine criteria satisfaction)
+        CREATE TABLE IF NOT EXISTS evaluator_results (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            criterion_id TEXT,
+            evaluator_name TEXT NOT NULL,
+            evaluator_type TEXT NOT NULL, -- COMMAND, SCOPE_AUDIT, TEST, LINT, BUILD, ACCEPTANCE
+            evaluator_version TEXT NOT NULL DEFAULT '1.0.0',
+            commit_sha TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            stdout_output TEXT NOT NULL,
+            stderr_output TEXT NOT NULL,
+            output_sha256 TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            passed BOOLEAN NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(attempt_id) REFERENCES task_attempts(id) ON DELETE CASCADE
+        );
+
+        -- Verification Profiles per Project / Task
+        CREATE TABLE IF NOT EXISTS verification_profiles (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            task_id TEXT,
+            check_type TEXT NOT NULL, -- FORMAT, TYPECHECK, UNIT_TESTS, INTEGRATION_TESTS, BUILD, SCOPE_AUDIT, ACCEPTANCE
+            command TEXT NOT NULL,
+            args_json TEXT NOT NULL DEFAULT '[]',
+            timeout_secs INTEGER NOT NULL DEFAULT 60,
+            required BOOLEAN NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, attempt_number);
+        CREATE INDEX IF NOT EXISTS idx_evaluator_results_attempt ON evaluator_results(attempt_id, passed);
+        CREATE INDEX IF NOT EXISTS idx_evaluator_results_task ON evaluator_results(task_id, criterion_id);
+        "
+    )?;
+
+    // Ensure scope_violations table has attempt_id
+    let mut check_sv_stmt = tx.prepare("PRAGMA table_info(scope_violations)")?;
+    let sv_cols = check_sv_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+
+    if !sv_cols.contains(&"attempt_id".to_string()) {
+        tx.execute_batch("ALTER TABLE scope_violations ADD COLUMN attempt_id TEXT;")?;
+    }
+
+    // Ensure proof_bundles table has attempt_id
+    let mut check_pb_stmt = tx.prepare("PRAGMA table_info(proof_bundles)")?;
+    let pb_cols = check_pb_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+
+    if !pb_cols.contains(&"attempt_id".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN attempt_id TEXT;")?;
+    }
+
+    Ok(())
+}
+

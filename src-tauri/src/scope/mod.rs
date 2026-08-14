@@ -1,5 +1,6 @@
 use chrono::{Duration, Utc};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::db::DbPool;
@@ -15,23 +16,6 @@ impl ScopeManager {
         Self { db }
     }
 
-    /// Normalizes pattern path and ensures no traversal outside repository root
-    pub fn normalize_pattern(raw: &str) -> Result<String, String> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err("Empty scope pattern is not allowed".to_string());
-        }
-
-        let normalized = trimmed.replace('\\', "/");
-        let without_leading = normalized.trim_start_matches("./").trim_start_matches('/');
-
-        if without_leading.contains("..") {
-            return Err(format!("Path traversal ('..') is not permitted in scope pattern: {}", raw));
-        }
-
-        Ok(without_leading.to_string())
-    }
-
     /// Layer 1: Atomically checks for collisions and acquires exclusive or shared scope leases
     pub fn acquire_scope(
         &self,
@@ -44,11 +28,15 @@ impl ScopeManager {
             return Ok(Vec::new());
         }
 
-        // Normalize all requested patterns
+        // Normalize and expand all requested patterns (splitting multi-glob strings)
         let mut normalized_patterns = Vec::new();
         for p in &patterns {
-            let norm = Self::normalize_pattern(p)?;
-            normalized_patterns.push(norm);
+            let norms = Self::normalize_patterns(p)?;
+            normalized_patterns.extend(norms);
+        }
+
+        if normalized_patterns.is_empty() {
+            return Ok(Vec::new());
         }
 
         let mut conn = self.db.lock();
@@ -123,8 +111,43 @@ impl ScopeManager {
             });
         }
 
-        tx.commit().map_err(|e| format!("Failed to commit scope transaction: {}", e))?;
+        tx.commit().map_err(|e| format!("Failed to commit scope reservation: {}", e))?;
+        info!("Successfully acquired {} scope leases for task '{}'", granted.len(), task_id);
         Ok(granted)
+    }
+
+    /// Splits and normalizes pattern strings (handling commas, semicolons, whitespace)
+    pub fn normalize_patterns(raw: &str) -> Result<Vec<String>, String> {
+        let mut result = Vec::new();
+        for piece in raw.split([',', ';', '\n']) {
+            let trimmed = piece.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = trimmed.replace('\\', "/");
+            let clean = normalized.trim_start_matches("./").trim_start_matches('/');
+            if clean.is_empty() {
+                continue;
+            }
+            if Glob::new(clean).is_err() {
+                return Err(format!("Invalid glob pattern: '{}'", clean));
+            }
+            result.push(clean.to_string());
+        }
+        if result.is_empty() && !raw.trim().is_empty() {
+            let clean = raw.trim().replace('\\', "/");
+            let norm = clean.trim_start_matches("./").trim_start_matches('/').to_string();
+            if Glob::new(&norm).is_err() {
+                return Err(format!("Invalid glob pattern: '{}'", norm));
+            }
+            result.push(norm);
+        }
+        Ok(result)
+    }
+
+    pub fn normalize_pattern(raw: &str) -> Result<String, String> {
+        let list = Self::normalize_patterns(raw)?;
+        list.into_iter().next().ok_or_else(|| "Empty pattern".to_string())
     }
 
     /// Layer 2: Real-time collision analysis against concurrent active tasks
@@ -175,47 +198,72 @@ impl ScopeManager {
         agent_id: &str,
         changed_files: &[String],
     ) -> Result<Vec<ScopeViolation>, String> {
+        self.audit_attempt_mutations(task_id, None, agent_id, changed_files)
+    }
+
+    /// Attempt-aware mutation audit that records attempt_id and auto-resolves previously covered files
+    pub fn audit_attempt_mutations(
+        &self,
+        task_id: &str,
+        attempt_id: Option<&str>,
+        agent_id: &str,
+        changed_files: &[String],
+    ) -> Result<Vec<ScopeViolation>, String> {
         let conn = self.db.lock();
+        let now_str = Utc::now().to_rfc3339();
 
         let mut stmt = conn
-            .prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1")
+            .prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1 AND expires_at > ?2")
             .map_err(|e| e.to_string())?;
 
         let patterns_iter = stmt
-            .query_map([task_id], |row| row.get::<_, String>(0))
+            .query_map(rusqlite::params![task_id, now_str], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
 
         let mut builder = GlobSetBuilder::new();
+        let mut has_patterns = false;
         for p in patterns_iter.flatten() {
             if let Ok(glob) = Glob::new(&p) {
                 builder.add(glob);
+                has_patterns = true;
             }
         }
 
-        let globset = builder.build().unwrap_or_else(|_| GlobSet::empty());
+        let globset = if has_patterns {
+            builder.build().unwrap_or_else(|_| GlobSet::empty())
+        } else {
+            GlobSet::empty()
+        };
+
         let mut violations = Vec::new();
-        let now = Utc::now().to_rfc3339();
 
         for file in changed_files {
             let normalized = file.replace('\\', "/");
-            let clean = normalized.trim_start_matches("./").trim_start_matches('/');
-            if !globset.is_match(clean) {
+            let clean = normalized.trim_start_matches("./").trim_start_matches('/').to_string();
+
+            if !globset.is_match(&clean) {
                 let v_id = Uuid::new_v4().to_string();
                 conn.execute(
-                    "INSERT INTO scope_violations (id, task_id, agent_id, file_path, violation_type, detected_at, resolved)
-                     VALUES (?1, ?2, ?3, ?4, 'UNRESERVED_WRITE', ?5, 0)",
-                    rusqlite::params![v_id, task_id, agent_id, clean, now],
+                    "INSERT INTO scope_violations (id, task_id, agent_id, file_path, violation_type, detected_at, resolved, attempt_id)
+                     VALUES (?1, ?2, ?3, ?4, 'UNRESERVED_WRITE', ?5, 0, ?6)",
+                    rusqlite::params![v_id, task_id, agent_id, clean, now_str, attempt_id],
                 ).ok();
 
                 violations.push(ScopeViolation {
                     id: v_id,
                     task_id: task_id.to_string(),
                     agent_id: agent_id.to_string(),
-                    file_path: clean.to_string(),
+                    file_path: clean,
                     violation_type: "UNRESERVED_WRITE".to_string(),
-                    detected_at: now.clone(),
+                    detected_at: now_str.clone(),
                     resolved: false,
                 });
+            } else {
+                // If the file is now covered by active scope leases, mark previous violations resolved
+                conn.execute(
+                    "UPDATE scope_violations SET resolved = 1 WHERE task_id = ?1 AND file_path = ?2",
+                    rusqlite::params![task_id, clean],
+                ).ok();
             }
         }
 

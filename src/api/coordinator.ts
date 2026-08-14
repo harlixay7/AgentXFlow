@@ -80,8 +80,8 @@ export const coordinatorApi = {
     return await invoke('claim_task', { taskId, agentId });
   },
 
-  async completeStep(stepId: string, evidenceJson?: string): Promise<TaskStep> {
-    return await invoke('complete_step', { stepId, evidenceJson });
+  async completeStep(stepId: string, evidenceJson?: string, agentId?: string): Promise<TaskStep> {
+    return await invoke('complete_step', { stepId, agentId, evidenceJson });
   },
 
   async submitTask(taskId: string, agentId: string): Promise<VerificationResult> {
@@ -156,11 +156,29 @@ export const coordinatorApi = {
     return await invoke('list_all_masterplans');
   },
 
-  async getCurrentContext(): Promise<import('../types').CurrentContext> {
+  async prepareMasterplan(
+    projectId: string,
+    rawText: string,
+    targetStepCount: number = 20,
+    maxStepsPerAgent: number = 4
+  ): Promise<import('../types').PreparedMasterplanSnapshot> {
     if (!isTauri) {
       throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
     }
-    return await invoke('get_current_context');
+    return await invoke('prepare_masterplan', {
+      projectId,
+      rawText,
+      targetStepCount,
+      maxStepsPerAgent,
+    });
+  },
+
+  async getCurrentContext(agentId?: string, projectId?: string): Promise<import('../types').CurrentContext> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('get_current_context', { agentId, projectId });
   },
 };
+
 

@@ -295,8 +295,8 @@ async fn test_entire_pipeline_from_a_to_z() {
         }))
         .send().await.unwrap();
     let agent_crit_json: serde_json::Value = agent_crit.json().await.unwrap();
-    assert!(agent_crit_json["error"]["message"].as_str().unwrap().contains("human reviewer authority"));
-    println!(" [Step 15] Autonomous Criteria Satisfaction Blocked (Reviewer Gate Protected)");
+    assert!(agent_crit_json["error"]["message"].as_str().unwrap().contains("Autonomous agents cannot self-satisfy criteria"));
+    println!(" [Step 15] Autonomous Criteria Satisfaction Blocked (Coordinator Evaluator Protected)");
 
     // Human/Reviewer satisfies criteria
     for crit in &details_a.criteria {
@@ -334,7 +334,7 @@ async fn test_entire_pipeline_from_a_to_z() {
     println!(" [Step 18] Task A Submitted & Validated -> Transitioned to REVIEW");
 
     let final_a = coordinator.get_task_details(&task_a_id).unwrap();
-    assert_eq!(final_a.task.state, TaskState::Review);
+    assert_eq!(final_a.task.state, TaskState::MergeReady);
     let proof_a = final_a.proof_bundle.expect("Sealed proof bundle required");
     println!(" [Step 19] Cryptographic Proof Bundle Generated: SHA-256 = [{}...{}]", &proof_a.proof_hash[..8], &proof_a.proof_hash[proof_a.proof_hash.len()-8..]);
 
@@ -353,7 +353,7 @@ async fn test_entire_pipeline_from_a_to_z() {
 
     let details_b = coordinator.get_task_details(&task_b_id).unwrap();
     for step in &details_b.steps {
-        coordinator.complete_step(&step.id, Some("DB tests passed")).unwrap();
+        coordinator.complete_step(&step.id, None, Some("DB tests passed")).unwrap();
     }
     for crit in &details_b.criteria {
         coordinator.satisfy_acceptance_criterion(&task_b_id, &crit.id, Some("Reviewer sign-off")).unwrap();

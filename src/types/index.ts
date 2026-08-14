@@ -319,6 +319,59 @@ export interface EvidenceRecord {
   recorded_at: string;
 }
 
+export interface TaskAttempt {
+  id: string;
+  task_id: string;
+  agent_id: string;
+  attempt_number: number;
+  base_sha: string;
+  head_sha: string | null;
+  status: 'ACTIVE' | 'VERIFYING' | 'VERIFIED' | 'FAILED' | 'ABORTED' | 'SUPERSEDED';
+  rejection_reasons: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface EvaluatorResult {
+  id: string;
+  task_id: string;
+  attempt_id: string;
+  criterion_id: string | null;
+  evaluator_name: string;
+  evaluator_type: string;
+  evaluator_version: string;
+  commit_sha: string;
+  exit_code: number;
+  stdout_output: string;
+  stderr_output: string;
+  output_sha256: string;
+  duration_ms: number;
+  passed: boolean;
+  evaluated_at: string;
+}
+
+export interface VerificationProfile {
+  id: string;
+  project_id: string;
+  task_id: string | null;
+  check_type: string;
+  command: string;
+  args_json: string;
+  timeout_secs: number;
+  required: boolean;
+  created_at: string;
+}
+
+export interface PreparedMasterplanSnapshot {
+  masterplan: Masterplan;
+  steps: MasterplanStep[];
+  total_steps: number;
+  target_step_count: number;
+  max_steps_per_agent: number;
+  handoff_prompt: string;
+  next_action: string;
+}
+
 export interface TaskDetails {
   task: Task;
   steps: TaskStep[];
@@ -328,6 +381,8 @@ export interface TaskDetails {
   violations: ScopeViolation[];
   proof_bundle: ProofBundle | null;
   evidence_records: EvidenceRecord[];
+  active_attempt?: TaskAttempt | null;
+  evaluator_results?: EvaluatorResult[];
 }
 
 export interface MasterplanSummary {
@@ -353,6 +408,12 @@ export interface CurrentContext {
   repository_path: string | null;
   masterplan_id: string | null;
   masterplan_status: string | null;
+  masterplan_revision?: number | null;
+  caller_agent_id?: string | null;
+  active_task_id?: string | null;
+  active_attempt_id?: string | null;
+  active_scopes?: string[];
+  current_state?: string | null;
   last_updated: string | null;
   next_recommended_action: string;
   handoff_prompt: string;
@@ -360,4 +421,5 @@ export interface CurrentContext {
   pending_tasks_count: number;
   instructions: string;
 }
+
 
