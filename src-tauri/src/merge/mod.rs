@@ -301,6 +301,14 @@ impl MergeEngine {
 
                 let conn = self.db.lock();
                 conn.execute("UPDATE merge_queue SET status = 'MERGED', processed_at = ?1 WHERE id = ?2", [&now, &item.id]).ok();
+                // Later FIFO candidates were queued against the target before
+                // this merge. Their branches are still valid candidates; the
+                // queue expectation must advance with the serialized target
+                // rather than being misclassified as stale.
+                conn.execute(
+                    "UPDATE merge_queue SET base_sha = ?1 WHERE project_id = ?2 AND target_branch = ?3 AND status = 'READY' AND position > ?4",
+                    rusqlite::params![integration_head, project_id, item.target_branch, item.position],
+                ).ok();
                 conn.execute("UPDATE tasks SET state = 'DONE', substate = 'NONE', updated_at = ?1 WHERE id = ?2", [&now, &item.task_id]).ok();
                 // Complete associated masterplan steps
                 conn.execute("UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2", [&now, &item.task_id]).ok();

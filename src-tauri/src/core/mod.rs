@@ -1009,7 +1009,14 @@ impl CoordinatorEngine {
             return Err(format!("No valid proof bundle found for task '{}' at commit HEAD {}. Verification is required.", task_id, head_sha));
         }
 
-        let base_sha = task.base_sha.unwrap_or_else(|| self.git.get_ref_sha(repo_path, &proj.target_branch).unwrap_or_default());
+        // The queue base is the target branch state observed when this item is
+        // enqueued, not the task's original claim base. Earlier queued merges
+        // are serialized ahead of this item and may have advanced the target
+        // branch in the meantime.
+        let base_sha = self
+            .git
+            .get_ref_sha(repo_path, &proj.target_branch)
+            .or_else(|_| Ok::<String, String>(task.base_sha.unwrap_or_default()))?;
 
         let item = self.merge.enqueue_task(
             project_id,
@@ -1975,7 +1982,7 @@ impl CoordinatorEngine {
 
     /// Reconciles task status, attempt, proof bundle, and merge queue health
     pub fn reconcile_task(&self, task_id: &str) -> Result<serde_json::Value, String> {
-        let task = self.get_task(task_id)?;
+        let mut task = self.get_task(task_id)?;
         let conn = self.db.lock();
         let attempt: Option<(String, String)> = conn.query_row(
             "SELECT id, status FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
@@ -1987,12 +1994,45 @@ impl CoordinatorEngine {
             [task_id],
             |r| r.get(0),
         ).unwrap_or(false);
-        let queue_status: Option<String> = conn.query_row(
-            "SELECT status FROM merge_queue WHERE task_id = ?1 AND processed_at IS NULL",
+        let queue_item: Option<(String, String, String)> = conn.query_row(
+            "SELECT id, status, target_branch FROM merge_queue WHERE task_id = ?1 AND processed_at IS NULL",
             [task_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).ok();
         drop(conn);
+
+        let mut queue_status = queue_item.as_ref().map(|(_, status, _)| status.clone());
+
+        // A verified task can become stale while an earlier FIFO candidate is
+        // merged. Rebase the queue expectation to the current target and let
+        // the normal merge simulation detect real conflicts.
+        if task.state == TaskState::Blocked
+            && queue_status.as_deref() == Some("STALE")
+            && attempt.as_ref().map(|(_, status)| status.as_str()) == Some("VERIFIED")
+            && has_proof
+        {
+            if let Some((queue_id, _, target_branch)) = queue_item.as_ref() {
+                let project = self
+                    .list_projects()?
+                    .into_iter()
+                    .find(|project| project.id == task.project_id)
+                    .ok_or("Project not found")?;
+                let target_sha = self.git.get_ref_sha(Path::new(&project.path), target_branch)?;
+                let now = Utc::now().to_rfc3339();
+                let conn = self.db.lock();
+                conn.execute(
+                    "UPDATE merge_queue SET base_sha = ?1, status = 'READY' WHERE id = ?2 AND status = 'STALE'",
+                    params![target_sha, queue_id],
+                ).map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', updated_at = ?1 WHERE id = ?2",
+                    params![now, task_id],
+                ).map_err(|e| e.to_string())?;
+                drop(conn);
+                task.state = TaskState::MergeReady;
+                queue_status = Some("READY".to_string());
+            }
+        }
 
         // Auto-heal if MERGE_READY but not enqueued
         if task.state == TaskState::MergeReady && queue_status.is_none() {
