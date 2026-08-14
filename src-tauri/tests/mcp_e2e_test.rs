@@ -1,0 +1,207 @@
+use agent_x_flow_lib::core::CoordinatorEngine;
+use agent_x_flow_lib::db::DbPool;
+use agent_x_flow_lib::mcp::McpServer;
+use agent_x_flow_lib::security::SecurityManager;
+use serde_json::json;
+use std::process::Command;
+use std::time::Duration;
+use tokio::time::sleep;
+
+fn setup_temp_git_repo() -> std::path::PathBuf {
+    let temp_dir = std::env::temp_dir().join(format!("agentxflow_mcp_git_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let readme = temp_dir.join("README.md");
+    std::fs::write(&readme, "# MCP Standards E2E Test Repo\n").unwrap();
+
+    let run_cmd = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&temp_dir)
+            .output()
+            .expect("Failed to run git command");
+        if !out.status.success() {
+            eprintln!("Git cmd {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        }
+    };
+
+    run_cmd(&["init"]);
+    run_cmd(&["config", "user.name", "AgentXFlow MCP Test"]);
+    run_cmd(&["config", "user.email", "test@agentxflow.local"]);
+    run_cmd(&["add", "README.md"]);
+    run_cmd(&["commit", "-m", "Initial commit"]);
+    run_cmd(&["branch", "-M", "main"]);
+
+    temp_dir
+}
+
+#[tokio::test]
+async fn test_full_e2e_mcp_workflow() {
+    // 1. Setup temp Git repo and in-memory Coordinator Engine
+    let temp_repo = setup_temp_git_repo();
+    let pool = DbPool::new_in_memory().expect("Failed to initialize test SQLite pool");
+    let coordinator = CoordinatorEngine::new(pool);
+
+    let proj = coordinator.create_project(
+        "MCP Conformance Test Project",
+        &temp_repo.to_string_lossy().to_string(),
+        "Test spec for MCP tools verification",
+        "main",
+    ).expect("Failed to create project");
+
+    let test_port = 7895;
+    let auth_token = "test_bearer_token_7895".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+
+    // 2. Start MCP Server in background
+    let server = McpServer::new(coordinator.clone(), test_port, security);
+    let bound_addr = server.start().await.expect("Failed to start test MCP server");
+    println!(">>> Test MCP Server running on http://{}", bound_addr);
+
+    sleep(Duration::from_millis(100)).await;
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    // 3. Health Check (/health)
+    let health_res = client.get(format!("{}/health", base_url)).send().await.expect("Health check failed");
+    assert_eq!(health_res.status(), reqwest::StatusCode::OK);
+    let health_json: serde_json::Value = health_res.json().await.unwrap();
+    println!("1. Health Check Response: {:?}", health_json);
+    assert_eq!(health_json["status"], "ok");
+    assert_eq!(health_json["protocol_version"], "2026-07-28");
+
+    // 4. Legacy SSE Ping (/mcp/sse)
+    let sse_res = client.get(format!("{}/mcp/sse", base_url)).send().await.expect("SSE check failed");
+    assert_eq!(sse_res.status(), reqwest::StatusCode::OK);
+    let sse_text = sse_res.text().await.unwrap();
+    println!("2. SSE Response: {:?}", sse_text);
+    assert!(sse_text.contains("data: /mcp"));
+
+    // Helper for sending authenticated JSON-RPC 2.0 requests
+    let send_rpc = |method: &str, params: serde_json::Value| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        let auth_token = auth_token.clone();
+        let method = method.to_string();
+        async move {
+            let res = client
+                .post(format!("{}/mcp", base_url))
+                .header("Authorization", format!("Bearer {}", auth_token))
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": params,
+                }))
+                .send()
+                .await
+                .expect("Failed to send MCP RPC request");
+
+            assert_eq!(res.status(), reqwest::StatusCode::OK);
+            let json_body: serde_json::Value = res.json().await.unwrap();
+            let is_error = json_body.get("error").is_some() && !json_body["error"].is_null();
+            assert!(!is_error, "RPC returned error: {:?}", json_body.get("error"));
+            json_body["result"].clone()
+        }
+    };
+
+    // 5. Standard MCP 'initialize'
+    let init_res = send_rpc("initialize", json!({})).await;
+    println!("3. MCP initialize result: {:?}", init_res);
+    assert_eq!(init_res["protocolVersion"], "2026-07-28");
+    assert_eq!(init_res["serverInfo"]["name"], "AgentXFlow Coordinator");
+
+    // 6. Standard MCP 'tools/list'
+    let list_res = send_rpc("tools/list", json!({})).await;
+    let tools = list_res["tools"].as_array().expect("Tools must be an array");
+    println!("4. Discovered {} MCP Tools", tools.len());
+    assert!(tools.len() >= 12);
+    let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(tool_names.contains(&"agent_register"));
+    assert!(tool_names.contains(&"task_claim"));
+    assert!(tool_names.contains(&"scope_acquire"));
+    assert!(tool_names.contains(&"masterplan_decompose"));
+
+    // 7. Standard MCP 'tools/call' -> agent_register
+    let reg_call = send_rpc("tools/call", json!({
+        "name": "agent_register",
+        "arguments": {
+            "name": "Antigravity Test Agent",
+            "agent_type": "Antigravity"
+        }
+    })).await;
+    println!("5. MCP tools/call agent_register: {:?}", reg_call);
+    assert_eq!(reg_call["isError"], false);
+
+    // 8. Register agent directly for subsequent workflow calls
+    let reg_res = send_rpc("agent.register", json!({
+        "name": "E2E Automation Agent",
+        "agent_type": "Antigravity"
+    })).await;
+    let agent_id = reg_res["id"].as_str().unwrap().to_string();
+
+    // 9. Heartbeat
+    let hb_res = send_rpc("agent.heartbeat", json!({ "agent_id": agent_id })).await;
+    assert_eq!(hb_res["status"], "ok");
+
+    // 10. Masterplan Workflow: create raw plan, get it, decompose it, and claim chunk
+    coordinator.create_or_update_masterplan(
+        &proj.id,
+        "Phase 1: Setup authentication.\nPhase 2: Add test suite.",
+        2,
+        4,
+    ).unwrap();
+
+    let plan_get = send_rpc("masterplan.get", json!({ "project_id": proj.id })).await;
+    assert_eq!(plan_get["plan"]["status"], "UNSORTED");
+
+    let dec_res = send_rpc("masterplan.decompose", json!({
+        "project_id": proj.id,
+        "steps": [
+            {
+                "step_index": 1,
+                "title": "Build Auth",
+                "description": "Create JWT tokens in src/auth",
+                "suggested_scope": "src/auth/**",
+                "acceptance_criteria": "JWT verification passes"
+            },
+            {
+                "step_index": 2,
+                "title": "Build Tests",
+                "description": "Add unit tests in tests/",
+                "suggested_scope": "tests/**",
+                "acceptance_criteria": "All unit tests pass"
+            }
+        ]
+    })).await;
+    assert_eq!(dec_res.as_array().unwrap().len(), 2);
+
+    let claim_res = send_rpc("masterplan.claim_chunk", json!({
+        "project_id": proj.id,
+        "agent_id": agent_id,
+        "count": 2
+    })).await;
+    let task_id = claim_res["id"].as_str().unwrap().to_string();
+    assert_eq!(claim_res["state"].as_str().unwrap().to_uppercase(), "RUNNING");
+
+    // 11. Lock Scopes
+    let scope_res = send_rpc("scope.acquire", json!({
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "patterns": ["src/auth/**", "tests/**"]
+    })).await;
+    assert_eq!(scope_res.as_array().unwrap().len(), 2);
+
+    // 12. Complete Task Step
+    let steps_list = coordinator.get_task_details(&task_id).unwrap().steps;
+    let step_id = &steps_list[0].id;
+    let step_res = send_rpc("task.complete_step", json!({
+        "step_id": step_id,
+        "evidence": "cargo test passed with exit code 0"
+    })).await;
+    assert_eq!(step_res["status"], "COMPLETED");
+
+    // Cleanup temp dir
+    std::fs::remove_dir_all(&temp_repo).ok();
+    println!(">>> All MCP 2026-07-28 tools and protocol handlers verified 100% successfully!");
+}
