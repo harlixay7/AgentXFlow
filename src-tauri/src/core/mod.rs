@@ -293,7 +293,7 @@ impl CoordinatorEngine {
     }
 
     // --- Tasks ---
-    // --- Tasks ---
+    #[allow(clippy::too_many_arguments)]
     pub fn create_task_internal(
         &self,
         project_id: &str,
