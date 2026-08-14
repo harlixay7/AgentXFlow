@@ -1,23 +1,23 @@
 # AI Agent Setup Guide — AgentXFlow
 
-This document contains step-by-step instructions for AI agents (Claude Code, Antigravity, Cursor, Codex, OpenCode) tasked with setting up, building, and running **AgentXFlow** (by **Viducia**).
+This document contains step-by-step instructions for AI agents (Claude Code, Antigravity, Cursor, Codex, OpenCode) tasked with setting up, building, and interacting with **AgentXFlow** (by **Viducia**).
 
 Developer: **[harlixay7](https://github.com/harlixay7)**
 
 ---
 
-## 1. Check Host Tools
+## 1. Check Host Prerequisites
 
-Run these commands first to make sure the machine has what it needs:
+Verify host development tools before running builds:
 
 ```bash
-node -v      # Must be v20 or higher
+node -v      # Node.js v20 or higher
 npm -v
 cargo -v     # Rust 1.80 or higher
 git --version
 ```
 
-If any tool is missing, stop and inform the user before attempting to build.
+If any prerequisite tool is missing, stop and inform the user.
 
 ---
 
@@ -28,69 +28,64 @@ If any tool is missing, stop and inform the user before attempting to build.
 git clone https://github.com/harlixay7/AgentXFlow.git
 cd AgentXFlow
 
-# On Windows: you can run the automated setup script
+# On Windows: run automated setup script
 setup.bat
 
-# Or run the manual commands:
-# 1. Install React/TypeScript dependencies
+# Or execute manual setup steps:
+# 1. Install frontend dependencies
 npm install
 
-# 2. Check frontend types and build bundle
+# 2. Check TypeScript types and build frontend assets
 npm run build
 
-# 3. Check Rust backend dependencies
+# 3. Check Rust backend compilation
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
 ---
 
-## 3. Run the Test Suites
+## 3. Run Quality Verification Gates
 
-Verify that everything compiles and all tests pass:
+Verify that all test suites compile and pass 100%:
 
 ```bash
-# 1. Backend unit tests (state machine, scope engine, merge queue)
+# 1. Run all backend unit and integration test suites
 cargo test --manifest-path src-tauri/Cargo.toml
 
-# 2. Masterplan decomposition and chunk claim test
-cargo test --test masterplan_test --manifest-path src-tauri/Cargo.toml
+# 2. Run complete A-to-Z pipeline integration test
+cargo test --test pipeline_a_to_z_test --manifest-path src-tauri/Cargo.toml
 
-# 3. Live HTTP MCP server test (all 18 JSON-RPC methods)
-cargo test --test mcp_e2e_test --manifest-path src-tauri/Cargo.toml
+# 3. Run 30-scenario hostile adversarial security test suite
+cargo test --test adversarial_suite_test --manifest-path src-tauri/Cargo.toml
 
-# 4. Multi-agent concurrent collaboration test (3 agents working in parallel)
-cargo test --test multi_agent_concurrent_test --manifest-path src-tauri/Cargo.toml
+# 4. Verify code formatting and linting
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+# 5. Type-check frontend bundle
+npm run build
 ```
-
-All tests should pass with zero failures.
 
 ---
 
-## 4. Starting the App
+## 4. Starting the Coordinator Application
 
-To run the desktop application and start the local MCP coordination server on `127.0.0.1:7890`:
+To start the desktop application and boot the local Model Context Protocol (MCP) coordination server on `127.0.0.1:7890`:
 
-- On Windows: double click `run.bat`
+- On Windows: double-click `run.bat`
 - Or via terminal:
 ```bash
 npm run tauri dev
 ```
 
-To run only the web UI preview:
-
-```bash
-npm run dev
-```
-
 ---
 
-## 5. Connecting Yourself to the Coordinator
+## 5. Connecting AI Agents via MCP
 
-AgentXFlow runs an HTTP Model Context Protocol (MCP) server at `http://127.0.0.1:7890/mcp`.
+AgentXFlow hosts an MCP server conforming to standard JSON-RPC 2.0 at `http://127.0.0.1:7890/mcp`.
 
-### If you are OpenCode
-Create `.mcp.json` in the root of the project you want to work on:
+Copy your active authentication token from the **MCP Gateway** tab in the desktop application.
 
+### OpenCode (`.mcp.json`)
 ```json
 {
   "mcpServers": {
@@ -98,29 +93,47 @@ Create `.mcp.json` in the root of the project you want to work on:
       "url": "http://127.0.0.1:7890/mcp",
       "transport": "http",
       "headers": {
-        "Authorization": "Bearer axf_sec_v2_live_token_7890"
+        "Authorization": "Bearer <YOUR_COORDINATOR_TOKEN>"
       }
     }
   }
 }
 ```
 
-### If you are Claude Code or Codex CLI
-Connect via HTTP:
-- Endpoint: `http://127.0.0.1:7890/mcp`
-- Header: `Authorization: Bearer axf_sec_v2_live_token_7890`
+### Cursor (`.cursor/mcp.json`)
+```json
+{
+  "mcpServers": {
+    "agentxflow": {
+      "url": "http://127.0.0.1:7890/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_COORDINATOR_TOKEN>"
+      }
+    }
+  }
+}
+```
 
-### If you are Antigravity
-The coordinator skill specification is located at `SKILL.md`.
+### Claude Code / Claude Desktop / Codex CLI
+- Endpoint: `http://127.0.0.1:7890/mcp`
+- Header: `Authorization: Bearer <YOUR_COORDINATOR_TOKEN>`
+
+### Antigravity
+The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 
 ---
 
-## 6. How to Work on a Task
+## 6. Standard Agent Workflow
 
-When assigned a task:
-
-1. **Claim Task**: Call `task.claim(task_id, agent_id)`. This creates your private git worktree at `.agentxflow/worktrees/task-<id>`.
-2. **Lock Files**: Call `scope.acquire(task_id, ["src/your_dir/**"])` before touching any code.
-3. **Edit Code**: Make all your changes inside your worktree directory only. Never edit the main workspace directly.
-4. **Attach Test Evidence**: Run your unit tests and call `task.complete_step(step_id, evidence)` with the output.
-5. **Submit for Review**: Call `task.submit(task_id, agent_id)`. The coordinator will run the tests itself, verify your `git diff` matches your locked files, and place your branch into the merge queue.
+```
+1. Context     -> Call agentxflow_current_context to discover active project and handoff instructions.
+2. Register    -> Call agent_register to obtain your authenticated agent session token.
+3. Contract    -> Call project_context with project_id to fetch architectural rules.
+4. Masterplan  -> Call masterplan_get. If UNSORTED, decompose into structured steps via masterplan_decompose.
+5. Discover    -> Call task_list or masterplan_claim_chunk to claim work batches.
+6. Lock        -> Call scope_acquire with file glob patterns before editing files.
+7. Code        -> Make changes inside your assigned worktree path and run tests.
+8. Evidence    -> Call task_complete_step with command output from your tests.
+9. Submit      -> Call task_submit. The coordinator verifies tests and git diffs.
+10. Merge      -> The coordinator integrates your branch via the serialized merge queue.
+```

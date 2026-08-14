@@ -356,7 +356,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                 Antigravity IDE & Subagents Setup
               </h4>
               <p style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 10 }}>
-                Antigravity connects via the <code>agentxflow-coordinator</code> skill. Each agent instance discovers tasks via <code>task.list</code>, claims its own worktree via <code>task.claim</code>, and locks file patterns via <code>scope.acquire</code>.
+                Antigravity connects via the <code>agentxflow-coordinator</code> skill. Each agent instance discovers context via <code>agentxflow_current_context</code>, claims its own worktree via <code>task_claim</code> or <code>masterplan_claim_chunk</code>, and locks file patterns via <code>scope_acquire</code>.
               </p>
               <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 11, fontFamily: 'var(--font-mono)', userSelect: 'text' }}>
                 Installed Skill: <code>SKILL.md</code> (AgentXFlow Coordinator Skill)
@@ -402,7 +402,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
               <ol style={{ fontSize: 11, color: 'var(--text-secondary)', paddingLeft: 16, lineHeight: 1.8, userSelect: 'text' }}>
                 <li>MCP Gateway URL: <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', userSelect: 'text' }}>{mcpInfo?.url}</code></li>
                 <li>Authorization Header: <code style={{ fontFamily: 'var(--font-mono)', userSelect: 'text' }}>Authorization: Bearer {mcpInfo?.token}</code></li>
-                <li>Agents automatically discover tasks via <code style={{ fontFamily: 'var(--font-mono)' }}>task.list</code> and submit verified changes via <code style={{ fontFamily: 'var(--font-mono)' }}>task.submit</code>.</li>
+                <li>Agents automatically discover tasks via <code style={{ fontFamily: 'var(--font-mono)' }}>agentxflow_current_context</code> / <code style={{ fontFamily: 'var(--font-mono)' }}>task_list</code> and submit verified changes via <code style={{ fontFamily: 'var(--font-mono)' }}>task_submit</code>.</li>
               </ol>
             </div>
           )}
