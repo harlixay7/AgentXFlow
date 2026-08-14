@@ -156,6 +156,23 @@ export const coordinatorApi = {
     return await invoke('list_all_masterplans');
   },
 
+  async saveMasterplan(
+    projectId: string,
+    rawText: string,
+    targetStepCount: number = 20,
+    maxStepsPerAgent: number = 4
+  ): Promise<import('../types').Masterplan> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('create_or_update_masterplan', {
+      projectId,
+      rawText,
+      targetStepCount,
+      maxStepsPerAgent,
+    });
+  },
+
   async prepareMasterplan(
     projectId: string,
     rawText: string,
