@@ -98,6 +98,11 @@ fn get_all_migrations() -> Vec<Migration> {
             name: "normalize_proof_bundles_task_attempts_and_evaluators",
             run: migration_0007_normalize_proof_bundles_task_attempts_and_evaluators,
         },
+        Migration {
+            version: 8,
+            name: "task_attempt_worktree_paths",
+            run: migration_0008_task_attempt_worktree_paths,
+        },
     ]
 }
 
@@ -994,6 +999,22 @@ fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Tran
     Ok(())
 }
 
+/// Keeps task attempts self-contained for verification and recovery across schema generations.
+fn migration_0008_task_attempt_worktree_paths(tx: &Transaction) -> Result<()> {
+    let mut check_ta_stmt = tx.prepare("PRAGMA table_info(task_attempts)")?;
+    let ta_cols = check_ta_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_ta_stmt);
+
+    if !ta_cols.contains(&"worktree_path".to_string()) {
+        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN worktree_path TEXT NOT NULL DEFAULT '';")?;
+    }
+
+    Ok(())
+}
+
 /// Verifies that all required database tables and columns exist before accepting coordinator traffic
 pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
     // 1. Verify proof_bundles
@@ -1010,7 +1031,7 @@ pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
     let mut check_ta = conn.prepare("PRAGMA table_info(task_attempts)").map_err(|e| e.to_string())?;
     let ta_cols: Vec<String> = check_ta.query_map([], |r| r.get(1)).map_err(|e| e.to_string())?.flatten().collect();
     drop(check_ta);
-    for col in &["id", "task_id", "attempt_number", "run_number", "status", "started_at"] {
+    for col in &["id", "task_id", "attempt_number", "run_number", "worktree_path", "status", "started_at"] {
         if !ta_cols.iter().any(|c| c == col) {
             return Err(format!("Schema verification failed: column '{}' missing from task_attempts", col));
         }
@@ -1028,4 +1049,3 @@ pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
 
     Ok(())
 }
-

@@ -3,7 +3,7 @@ use rusqlite::params;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::acp::AcpRuntime;
@@ -878,9 +878,18 @@ impl CoordinatorEngine {
                 |r| r.get(0),
             ).unwrap_or(1);
             conn.execute(
-                "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, run_number, base_sha, status, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ACTIVE', ?7)",
-                rusqlite::params![new_id, task_id, agent_id, new_num, new_num, task.base_sha.as_deref().unwrap_or(""), now],
+                "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, run_number, base_sha, worktree_path, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8)",
+                rusqlite::params![
+                    new_id,
+                    task_id,
+                    agent_id,
+                    new_num,
+                    new_num,
+                    task.base_sha.as_deref().unwrap_or(""),
+                    worktree_dir.to_string_lossy().as_ref(),
+                    now,
+                ],
             ).map_err(|e| format!("Failed to create task attempt: {}", e))?;
             (new_id, new_num)
         };
@@ -1955,6 +1964,9 @@ impl CoordinatorEngine {
         let next_ready = queue.into_iter().find(|item| item.status == "READY");
         if let Some(item) = next_ready {
             let attempt = self.merge.process_merge_by_id(&item.id, Path::new(&proj.path))?;
+            if let Err(error) = self.scope.release_scope(&item.task_id) {
+                warn!(task_id = %item.task_id, %error, "Merged task scopes could not be released automatically");
+            }
             Ok(Some(attempt))
         } else {
             Ok(None)
@@ -2183,5 +2195,3 @@ impl CoordinatorEngine {
 
 #[cfg(test)]
 mod tests;
-
-
