@@ -111,6 +111,20 @@ Authentication tokens are generated dynamically per coordinator instance. Copy y
 ### Antigravity
 The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 
+### Standard Agent Startup Workflow
+```
+1. Context     -> Call agentxflow_current_context to discover active project and handoff instructions.
+2. Register    -> Call agent_register to obtain your authenticated agent session token.
+3. Contract    -> Call project_context with project_id to fetch architectural rules.
+4. Masterplan  -> Call masterplan_get. If UNSORTED, decompose into structured steps via masterplan_decompose.
+5. Discover    -> Call task_list or masterplan_claim_chunk to claim work batches.
+6. Lock        -> Call scope_acquire with file glob patterns before editing files.
+7. Code        -> Make changes inside your assigned worktree path and run tests.
+8. Evidence    -> Call task_complete_step with command output from your tests.
+9. Submit      -> Call task_submit. The coordinator verifies tests and git diffs.
+10. Merge      -> The coordinator integrates your branch via the serialized merge queue.
+```
+
 ---
 
 ## MCP Tools Reference
