@@ -231,6 +231,7 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
 
             {activeTab === 'masterplan' && (
               <MasterplanHubView
+                project={activeProject}
                 projectId={activeProject?.id || ''}
                 agents={agents}
                 onRefreshTasks={onRefresh}

@@ -159,7 +159,17 @@ async fn test_full_e2e_mcp_workflow() {
     let hb_res = send_rpc(&session_token, "agent.heartbeat", json!({ "agent_id": agent_id })).await;
     assert_eq!(hb_res["status"], "ok");
 
-    // 10. Masterplan Workflow: create raw plan, get it, decompose it, and claim chunk
+    // 10. Test Discovery Tools: agentxflow_current_context, project_list, masterplan_list
+    let ctx_res = send_rpc(&auth_token, "agentxflow_current_context", json!({})).await;
+    assert_eq!(ctx_res["active_project_id"], proj.id);
+    assert_eq!(ctx_res["project_name"], proj.name);
+
+    let proj_list_res = send_rpc(&auth_token, "project_list", json!({})).await;
+    let proj_arr = proj_list_res.as_array().unwrap();
+    assert_eq!(proj_arr.len(), 1);
+    assert_eq!(proj_arr[0]["id"], proj.id);
+
+    // 11. Masterplan Workflow: create raw plan, get it, decompose it, and claim chunk
     coordinator.create_or_update_masterplan(
         &proj.id,
         "Phase 1: Setup authentication.\nPhase 2: Add test suite.",
@@ -168,7 +178,14 @@ async fn test_full_e2e_mcp_workflow() {
     ).unwrap();
 
     let plan_get = send_rpc(&auth_token, "masterplan.get", json!({ "project_id": proj.id })).await;
+    assert_eq!(plan_get["project_name"], proj.name);
+    assert_eq!(plan_get["project_id"], proj.id);
+    assert_eq!(plan_get["status"], "UNSORTED");
+    assert_eq!(plan_get["next_action"], "masterplan_decompose");
     assert_eq!(plan_get["plan"]["status"], "UNSORTED");
+
+    let mp_list_res = send_rpc(&auth_token, "masterplan_list", json!({})).await;
+    assert_eq!(mp_list_res.as_array().unwrap().len(), 1);
 
     let dec_res = send_rpc(&auth_token, "masterplan.decompose", json!({
         "project_id": proj.id,
@@ -199,7 +216,11 @@ async fn test_full_e2e_mcp_workflow() {
     let task_id = claim_res["id"].as_str().unwrap().to_string();
     assert_eq!(claim_res["state"].as_str().unwrap().to_uppercase(), "RUNNING");
 
-    // 11. Lock Scopes
+    // 12. Test task_list requires project_id
+    let tasks_res = send_rpc(&session_token, "task_list", json!({ "project_id": proj.id })).await;
+    assert_eq!(tasks_res.as_array().unwrap().len(), 1);
+
+    // 13. Lock Scopes
     let scope_res = send_rpc(&session_token, "scope.acquire", json!({
         "task_id": task_id,
         "agent_id": agent_id,
@@ -207,7 +228,7 @@ async fn test_full_e2e_mcp_workflow() {
     })).await;
     assert_eq!(scope_res.as_array().unwrap().len(), 2);
 
-    // 12. Complete Task Step
+    // 14. Complete Task Step
     let steps_list = coordinator.get_task_details(&task_id).unwrap().steps;
     let step_id = &steps_list[0].id;
     let step_res = send_rpc(&session_token, "task.complete_step", json!({

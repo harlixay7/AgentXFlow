@@ -352,14 +352,38 @@ fn execute_mcp_tool(
 
     match tool_name {
         // Discovery tools
+        "agentxflow_current_context" | "context.current" => {
+            state.coordinator.get_current_context().map(|ctx| serde_json::to_value(ctx).unwrap())
+        }
+
+        "project_list" | "project.list" => {
+            state.coordinator.list_projects().map(|projects| serde_json::to_value(projects).unwrap())
+        }
+
         "project_context" | "project.context" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            state.coordinator.get_context_pack(project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+            if project_id.trim().is_empty() {
+                let ctx = state.coordinator.get_current_context()?;
+                if let Some(pid) = ctx.active_project_id {
+                    state.coordinator.get_context_pack(&pid, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+                } else {
+                    Err("Missing required parameter 'project_id'. Query 'project_list' to obtain valid project IDs.".to_string())
+                }
+            } else {
+                state.coordinator.get_context_pack(project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+            }
+        }
+
+        "masterplan_list" | "masterplan.list" => {
+            state.coordinator.list_all_masterplans().map(|plans| serde_json::to_value(plans).unwrap())
         }
 
         "task_list" | "task.list" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
+            }
             state.coordinator.list_tasks(project_id).map(|tasks| serde_json::to_value(tasks).unwrap())
         }
 
@@ -449,15 +473,32 @@ fn execute_mcp_tool(
         // Masterplan Hub Tools
         "masterplan_get" | "masterplan.get" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
+            }
+            let proj = state.coordinator.list_projects()?.into_iter().find(|p| p.id == project_id)
+                .ok_or_else(|| format!("Project '{}' not found", project_id))?;
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
-                    let instruction = if plan.status == "UNSORTED" {
-                        "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array.".to_string()
+                    let (next_action, instruction) = if plan.status == "UNSORTED" {
+                        (
+                            "masterplan_decompose",
+                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array."
+                        )
                     } else {
-                        "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk.".to_string()
+                        (
+                            "masterplan_claim_chunk",
+                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk."
+                        )
                     };
                     Ok(serde_json::json!({
+                        "project_name": proj.name,
+                        "project_id": proj.id,
+                        "repository_path": proj.path,
+                        "masterplan_id": plan.id,
+                        "status": plan.status,
+                        "next_action": next_action,
                         "plan": plan,
                         "steps": steps,
                         "instruction": instruction,
@@ -470,6 +511,9 @@ fn execute_mcp_tool(
 
         "masterplan_status" | "masterplan.status" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
+            }
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
@@ -519,6 +563,42 @@ fn execute_mcp_tool(
 
 fn get_tool_definitions() -> Vec<serde_json::Value> {
     vec![
+        serde_json::json!({
+            "name": "agentxflow_current_context",
+            "description": "Get the most recently prepared handoff, active project, and recommended next action for newly connected agents.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "project_list",
+            "description": "List all managed projects with their exact project IDs, repository paths, and target branches.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "project_context",
+            "description": "Get architectural rules, contract hashes, and project metadata.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Target project ID" },
+                    "task_id": { "type": "string", "description": "Optional task ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "masterplan_list",
+            "description": "List all masterplans across all projects with status, step counts, and active handoffs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
         serde_json::json!({
             "name": "agent_register",
             "description": "Register an agent session and get a unique agent_id.",
@@ -619,7 +699,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "masterplan_get",
-            "description": "Get masterplan specification, current status, and decomposition instructions.",
+            "description": "Get masterplan specification, current status, project identity, and decomposition instructions.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

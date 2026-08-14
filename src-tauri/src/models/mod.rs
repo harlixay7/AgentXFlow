@@ -556,3 +556,37 @@ pub struct TaskDetails {
     pub assigned_agent: Option<Agent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MasterplanSummary {
+    pub project_id: String,
+    pub project_name: String,
+    pub repository_path: String,
+    pub masterplan_id: String,
+    pub status: String,
+    pub target_step_count: i32,
+    pub max_steps_per_agent: i32,
+    pub total_steps: usize,
+    pub pending_steps: usize,
+    pub claimed_steps: usize,
+    pub completed_steps: usize,
+    pub last_updated: String,
+    pub next_action: String,
+    pub handoff_prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentContext {
+    pub active_project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub repository_path: Option<String>,
+    pub masterplan_id: Option<String>,
+    pub masterplan_status: Option<String>,
+    pub last_updated: Option<String>,
+    pub next_recommended_action: String,
+    pub handoff_prompt: String,
+    pub active_agents_count: usize,
+    pub pending_tasks_count: usize,
+    pub instructions: String,
+}
+
+

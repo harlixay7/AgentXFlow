@@ -117,22 +117,26 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 
 | Tool | Parameters | Description |
 |---|---|---|
-| `agent.register` | `name`, `agent_type` | Register an agent session and receive an authenticated session token. |
-| `agent.heartbeat` | `agent_id` | Refresh session heartbeat and active lease timers. |
-| `masterplan.get` | `project_id` | Inspect masterplan state, raw specification text, and decomposition instructions. |
-| `masterplan.status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
-| `masterplan.decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured, non-overlapping execution steps. |
-| `masterplan.claim_chunk`| `project_id`, `agent_id`, `count` | Claim next batch of steps (capped by limit) and allocate an isolated Git worktree. |
-| `task.list` | `project_id`, `state` | List tasks in the backlog or ready queue. |
-| `task.get` | `task_id` | Get task prompt, acceptance criteria, and worktree path. |
-| `task.claim` | `task_id`, `agent_id` | Claim a task and create an isolated Git worktree on disk. |
-| `project.context` | `project_id`, `task_id` | Fetch contract hash and project architectural rules. |
-| `scope.acquire` | `task_id`, `patterns` | Lock file globs (e.g. `src/auth/**`) for exclusive write access. |
-| `scope.release` | `task_id` | Release held write locks back to the pool. |
-| `task.complete_step` | `step_id`, `evidence` | Mark a required task step complete with test output. |
+| `agentxflow_current_context` | _(none)_ | Get the most recently prepared handoff, active project, and recommended next action. |
+| `project_list` | _(none)_ | List all managed projects with exact IDs, repository paths, and target branches. |
+| `project_context` | `project_id`, `task_id` | Fetch contract hash and project architectural rules. |
+| `masterplan_list` | _(none)_ | List all masterplans across all projects with status, step counts, and active handoffs. |
+| `masterplan_get` | `project_id` | Inspect masterplan state, raw specification text, project identity, and decomposition instructions. |
+| `masterplan_status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
+| `masterplan_decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured, non-overlapping execution steps. |
+| `masterplan_claim_chunk`| `project_id`, `agent_id`, `count` | Claim next batch of steps (capped by limit) and allocate an isolated Git worktree. |
+| `agent_register` | `name`, `agent_type` | Register an agent session and receive an authenticated session token. |
+| `agent_heartbeat` | `agent_id` | Refresh session heartbeat and active lease timers. |
+| `task_list` | `project_id` | List tasks in the backlog or ready queue for a project. |
+| `task_get` | `task_id` | Get task prompt, acceptance criteria, and worktree path. |
+| `task_claim` | `task_id`, `agent_id` | Claim a task and create an isolated Git worktree on disk. |
+| `scope_acquire` | `task_id`, `patterns` | Lock file globs (e.g. `src/auth/**`) for exclusive write access. |
+| `scope_release` | `task_id` | Release held write locks back to the pool. |
+| `task_complete_step` | `step_id`, `evidence` | Mark a required task step complete with test output. |
 | `dag.dependencies` | `task_id` | List blocker tasks that must finish before this task starts. |
-| `task.submit` | `task_id`, `agent_id` | Submit task for coordinator verification and git mutation audit. |
-| `merge.queue_status` | `project_id` | Check queue position for pending branch merges. |
+| `task_submit` | `task_id`, `agent_id` | Submit task for coordinator verification and git mutation audit. |
+| `merge_queue_status` | `project_id` | Check queue position for pending branch merges. |
+
 
 ---
 

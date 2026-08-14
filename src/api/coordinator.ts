@@ -150,4 +150,17 @@ export const coordinatorApi = {
     if (!isTauri) return [];
     return await invoke('list_agents');
   },
+
+  async listAllMasterplans(): Promise<import('../types').MasterplanSummary[]> {
+    if (!isTauri) return [];
+    return await invoke('list_all_masterplans');
+  },
+
+  async getCurrentContext(): Promise<import('../types').CurrentContext> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('get_current_context');
+  },
 };
+

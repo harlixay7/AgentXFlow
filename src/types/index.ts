@@ -329,3 +329,35 @@ export interface TaskDetails {
   proof_bundle: ProofBundle | null;
   evidence_records: EvidenceRecord[];
 }
+
+export interface MasterplanSummary {
+  project_id: string;
+  project_name: string;
+  repository_path: string;
+  masterplan_id: string;
+  status: string;
+  target_step_count: number;
+  max_steps_per_agent: number;
+  total_steps: number;
+  pending_steps: number;
+  claimed_steps: number;
+  completed_steps: number;
+  last_updated: string;
+  next_action: string;
+  handoff_prompt: string;
+}
+
+export interface CurrentContext {
+  active_project_id: string | null;
+  project_name: string | null;
+  repository_path: string | null;
+  masterplan_id: string | null;
+  masterplan_status: string | null;
+  last_updated: string | null;
+  next_recommended_action: string;
+  handoff_prompt: string;
+  active_agents_count: number;
+  pending_tasks_count: number;
+  instructions: string;
+}
+

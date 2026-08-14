@@ -310,6 +310,20 @@ fn reset_masterplan(
     state.coordinator.reset_masterplan(&project_id)
 }
 
+#[tauri::command]
+fn list_all_masterplans(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::models::MasterplanSummary>, String> {
+    state.coordinator.list_all_masterplans()
+}
+
+#[tauri::command]
+fn get_current_context(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::models::CurrentContext, String> {
+    state.coordinator.get_current_context()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = dirs_next::data_dir()
@@ -376,6 +390,8 @@ pub fn run() {
             decompose_masterplan,
             claim_masterplan_chunk,
             reset_masterplan,
+            list_all_masterplans,
+            get_current_context,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Masterplan, MasterplanStep, Agent } from '../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { Masterplan, MasterplanStep, Agent, Project } from '../types';
 import {
   Sparkles,
   Layers,
@@ -14,16 +14,21 @@ import {
   Cpu,
   FolderGit2,
   AlertCircle,
+  Edit3,
+  Bot,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { coordinatorApi } from '../api/coordinator';
 
 interface MasterplanHubViewProps {
+  project: Project | null;
   projectId: string;
   agents: Agent[];
   onRefreshTasks: () => void;
 }
 
 export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
+  project,
   projectId,
   agents,
   onRefreshTasks,
@@ -36,10 +41,14 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   const [maxStepsPerAgent, setMaxStepsPerAgent] = useState(4);
   const [isSaving, setIsSaving] = useState(false);
   const [isClaiming, setIsClaiming] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [copiedId, setCopiedId] = useState(false);
   const [filter, setFilter] = useState<'ALL' | 'PENDING' | 'CLAIMED' | 'COMPLETED'>('ALL');
   const [selectedAgentId, setSelectedAgentId] = useState<string>('');
   const [customChunkSize, setCustomChunkSize] = useState<number>(4);
+
+  const lastSeqRef = useRef<number>(0);
 
   const fetchPlan = async () => {
     if (!projectId) return;
@@ -67,6 +76,44 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
     fetchPlan();
   }, [projectId]);
 
+  // Real-time event polling for automatic updates
+  useEffect(() => {
+    let isMounted = true;
+
+    const pollEvents = async () => {
+      if (!projectId) return;
+      try {
+        const events = await coordinatorApi.getEventsAfter(lastSeqRef.current);
+        if (!isMounted) return;
+        if (events && events.length > 0) {
+          const maxSeq = Math.max(...events.map((e) => e.sequence));
+          if (maxSeq > lastSeqRef.current) {
+            lastSeqRef.current = maxSeq;
+          }
+          const hasRelevantEvent = events.some(
+            (e) =>
+              e.event_type.startsWith('MASTERPLAN_') ||
+              e.event_type.startsWith('TASK_') ||
+              e.event_type.startsWith('STEP_') ||
+              e.event_type.startsWith('AGENT_')
+          );
+          if (hasRelevantEvent) {
+            await fetchPlan();
+            onRefreshTasks();
+          }
+        }
+      } catch (err) {
+        // Polling failure gracefully ignored
+      }
+    };
+
+    const interval = setInterval(pollEvents, 1000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [projectId]);
+
   useEffect(() => {
     if (agents.length > 0 && !selectedAgentId) {
       setSelectedAgentId(agents[0].id);
@@ -84,6 +131,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         maxStepsPerAgent: Number(maxStepsPerAgent),
       });
       setMasterplan(updated);
+      setIsEditing(false);
       await fetchPlan();
       onRefreshTasks();
     } catch (err) {
@@ -99,6 +147,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
     }
     try {
       await invoke('reset_masterplan', { projectId });
+      setIsEditing(true);
       await fetchPlan();
       onRefreshTasks();
     } catch (err) {
@@ -129,7 +178,10 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
 
   const handleParseStructuredSteps = async () => {
     if (!rawText.trim()) return;
-    const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('#'));
+    const lines = rawText
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
     if (lines.length === 0) return;
 
     const generatedSteps = lines.slice(0, targetStepCount).map((line, i) => {
@@ -149,6 +201,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         projectId,
         steps: generatedSteps,
       });
+      setIsEditing(false);
       await fetchPlan();
       onRefreshTasks();
     } catch (err) {
@@ -157,15 +210,24 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   };
 
   const handleCopyMcpPrompt = () => {
-    const prompt = `You are an autonomous engineering agent connected to AgentXFlow (by Viducia).
-1. Call tool 'masterplan.get' with project_id '${projectId}'.
-2. Read the masterplan text and decompose it into exactly ${targetStepCount} structured, non-overlapping sequential steps without missing any requirements.
-3. Call 'masterplan.decompose' with your normalized steps array.
-4. Call 'masterplan.claim_chunk' with your agent_id to claim the first ${maxStepsPerAgent} steps, execute them in your assigned Git worktree, and submit when verified.`;
+    const projName = project?.name || 'Project';
+    const projPath = project?.path || 'repository';
+    const prompt = `Decompose masterplan for project ${projectId} (${projName}) at ${projPath} using MCP tool masterplan_decompose.
+
+Instructions:
+1. Call agentxflow_current_context() or masterplan_get(project_id="${projectId}")
+2. Read the raw specification text
+3. Call masterplan_decompose(project_id="${projectId}", steps=[...]) with ${targetStepCount} structured steps.`;
 
     navigator.clipboard.writeText(prompt);
     setCopiedPrompt(true);
     setTimeout(() => setCopiedPrompt(false), 2500);
+  };
+
+  const handleCopyProjectId = () => {
+    navigator.clipboard.writeText(projectId);
+    setCopiedId(true);
+    setTimeout(() => setCopiedId(false), 2000);
   };
 
   const totalSteps = steps.length;
@@ -184,9 +246,31 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   const getStatusBadge = (status: string) => {
     switch (status) {
       case 'UNSORTED':
-        return <span className="badge" style={{ backgroundColor: 'rgba(210, 153, 34, 0.2)', color: 'var(--accent-yellow)', border: '1px solid rgba(210, 153, 34, 0.4)' }}>UNSORTED</span>;
+        return (
+          <span
+            className="badge"
+            style={{
+              backgroundColor: 'rgba(210, 153, 34, 0.2)',
+              color: 'var(--accent-yellow)',
+              border: '1px solid rgba(210, 153, 34, 0.4)',
+            }}
+          >
+            UNSORTED
+          </span>
+        );
       case 'RESORTED':
-        return <span className="badge" style={{ backgroundColor: 'rgba(56, 139, 253, 0.2)', color: 'var(--accent-blue)', border: '1px solid rgba(56, 139, 253, 0.4)' }}>ORGANIZED & READY</span>;
+        return (
+          <span
+            className="badge"
+            style={{
+              backgroundColor: 'rgba(56, 139, 253, 0.2)',
+              color: 'var(--accent-blue)',
+              border: '1px solid rgba(56, 139, 253, 0.4)',
+            }}
+          >
+            ORGANIZED & READY
+          </span>
+        );
       case 'EXECUTING':
         return <span className="badge badge-RUNNING">EXECUTING</span>;
       case 'COMPLETED':
@@ -221,26 +305,37 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
             <h2 style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--font-mono)', margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Sparkles size={16} style={{ color: 'var(--accent-blue)' }} /> Masterplan Execution Hub
+              <Sparkles size={16} style={{ color: 'var(--accent-blue)' }} /> Masterplan Hub
             </h2>
             {masterplan && getStatusBadge(masterplan.status)}
           </div>
           <p style={{ color: 'var(--text-secondary)', fontSize: 11, margin: 0 }}>
-            Paste any arbitrary master plan. The first AI agent autonomously normalizes requirements into structured steps, followed by sequential chunked execution.
+            Unified masterplan orchestration for multi-agent workflows. Decompose raw specifications into structured step chunks with anti-hoarding limits.
           </p>
         </div>
 
-        {/* Global Hub Action Controls */}
+        {/* Global Action Controls */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button
             className="btn btn-secondary"
             style={{ fontSize: 11, height: 28 }}
             onClick={handleCopyMcpPrompt}
-            title="Copy autonomous prompt instructions to send to Claude Code, Antigravity, or Cursor"
+            title="Copy autonomous prompt instructions for AI coding agents"
           >
             {copiedPrompt ? <Check size={12} style={{ color: 'var(--accent-green)' }} /> : <Copy size={12} />}
-            {copiedPrompt ? 'Copied Prompt' : 'Copy Agent Prompt'}
+            {copiedPrompt ? 'Copied Prompt' : 'Copy Handoff Prompt'}
           </button>
+
+          {masterplan && !isEditing && (
+            <button
+              className="btn btn-secondary"
+              style={{ fontSize: 11, height: 28 }}
+              onClick={() => setIsEditing(true)}
+              title="Edit raw masterplan specification text"
+            >
+              <Edit3 size={12} /> Edit Specification
+            </button>
+          )}
 
           {masterplan && masterplan.status !== 'UNSORTED' && (
             <button
@@ -256,7 +351,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
       </div>
 
       {/* Progress & Stats Bar (when organized) */}
-      {masterplan && masterplan.status !== 'UNSORTED' && totalSteps > 0 && (
+      {masterplan && masterplan.status !== 'UNSORTED' && totalSteps > 0 && !isEditing && (
         <div
           style={{
             backgroundColor: 'var(--bg-surface)',
@@ -299,8 +394,8 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         </div>
       )}
 
-      {/* VIEW MODE 1: UNSORTED / RAW INPUT VIEW */}
-      {(!masterplan || masterplan.status === 'UNSORTED') && (
+      {/* VIEW MODE 1: RAW TEXT EDITOR (When creating or editing) */}
+      {(!masterplan || isEditing) && (
         <div
           style={{
             backgroundColor: 'var(--bg-surface)',
@@ -315,7 +410,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <FileText size={16} style={{ color: 'var(--accent-blue)' }} />
-              <h3 style={{ fontSize: 13, fontWeight: 700, margin: 0 }}>Input Raw Masterplan Specification</h3>
+              <h3 style={{ fontSize: 13, fontWeight: 700, margin: 0 }}>Input Masterplan Specification</h3>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 11 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -380,8 +475,12 @@ Example:
               onChange={(e) => setRawText(e.target.value)}
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, color: 'var(--text-muted)', fontSize: 10 }}>
-              <span>{rawText.length} characters • {rawText.split(/\s+/).filter(Boolean).length} words</span>
-              <span>Status: <b style={{ color: 'var(--accent-yellow)' }}>UNSORTED</b></span>
+              <span>
+                {rawText.length} characters • {rawText.split(/\s+/).filter(Boolean).length} words
+              </span>
+              <span>
+                Status: <b style={{ color: 'var(--accent-yellow)' }}>UNSORTED</b>
+              </span>
             </div>
           </div>
 
@@ -389,18 +488,28 @@ Example:
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid var(--border-subtle)', paddingTop: 14 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--text-muted)' }}>
               <AlertCircle size={13} style={{ color: 'var(--accent-yellow)' }} />
-              Agents will automatically read this text over MCP and organize it into clean steps.
+              After saving, AgentXFlow prepares a structured handoff for connected AI agents.
             </div>
 
             <div style={{ display: 'flex', gap: 8 }}>
+              {masterplan && (
+                <button
+                  className="btn btn-secondary"
+                  style={{ fontSize: 11, height: 30 }}
+                  onClick={() => setIsEditing(false)}
+                >
+                  Cancel
+                </button>
+              )}
+
               <button
                 className="btn btn-secondary"
                 style={{ fontSize: 11, height: 30 }}
                 onClick={handleParseStructuredSteps}
                 disabled={!rawText.trim()}
-                title="Parse masterplan lines into structured steps"
+                title="Parse masterplan lines into structured steps directly in UI"
               >
-                <Sparkles size={12} /> Parse Steps
+                <Sparkles size={12} /> Parse Steps Manually
               </button>
 
               <button
@@ -408,7 +517,7 @@ Example:
                 style={{ fontSize: 11, height: 30 }}
                 onClick={handleSavePlan}
                 disabled={isSaving || !rawText.trim()}
-                title="Save masterplan and mark as ready for agent decomposition"
+                title="Save masterplan and generate agent handoff"
               >
                 {isSaving ? 'Saving...' : 'Save & Prepare for Agents'}
               </button>
@@ -417,8 +526,256 @@ Example:
         </div>
       )}
 
-      {/* VIEW MODE 2: RESORTED & ORGANIZED VISUAL CHECKLIST VIEW */}
-      {masterplan && masterplan.status !== 'UNSORTED' && (
+      {/* VIEW MODE 2: AGENT HANDOFF VIEW (When UNSORTED and saved) */}
+      {masterplan && masterplan.status === 'UNSORTED' && !isEditing && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {/* Handoff Status Card */}
+          <div
+            style={{
+              backgroundColor: 'var(--bg-surface)',
+              border: '1px solid var(--border-medium)',
+              borderRadius: 'var(--radius-lg)',
+              padding: 20,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 16,
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Bot size={18} style={{ color: 'var(--accent-yellow)' }} />
+                  <h3 style={{ fontSize: 14, fontWeight: 700, margin: 0 }}>Agent Handoff Prepared</h3>
+                  <span className="badge" style={{ backgroundColor: 'rgba(210, 153, 34, 0.2)', color: 'var(--accent-yellow)' }}>
+                    UNSORTED
+                  </span>
+                </div>
+                <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4 }}>
+                  The masterplan specification is saved and waiting for an AI agent to perform decomposition into structured steps.
+                </p>
+              </div>
+
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  className="btn btn-secondary"
+                  style={{ fontSize: 11, height: 28 }}
+                  onClick={() => setIsEditing(true)}
+                >
+                  <Edit3 size={11} /> Edit Text
+                </button>
+                <button
+                  className="btn btn-primary"
+                  style={{ fontSize: 11, height: 28 }}
+                  onClick={handleCopyMcpPrompt}
+                >
+                  {copiedPrompt ? <Check size={11} /> : <Copy size={11} />}
+                  {copiedPrompt ? 'Copied Prompt' : 'Copy Handoff Prompt'}
+                </button>
+              </div>
+            </div>
+
+            {/* Project & Handoff Identity Grid */}
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                gap: 12,
+                backgroundColor: 'var(--bg-input)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: 14,
+                fontSize: 11,
+              }}
+            >
+              <div>
+                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Project Name</div>
+                <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{project?.name || 'Active Project'}</div>
+              </div>
+
+              <div>
+                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Repository Path</div>
+                <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', wordBreak: 'break-all' }}>
+                  {project?.path || 'N/A'}
+                </div>
+              </div>
+
+              <div>
+                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Project ID</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-purple)' }}>
+                    {projectId}
+                  </code>
+                  <button
+                    onClick={handleCopyProjectId}
+                    style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0 }}
+                    title="Copy Project ID"
+                  >
+                    {copiedId ? <Check size={11} style={{ color: 'var(--accent-green)' }} /> : <Copy size={11} />}
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Next Required Action</div>
+                <div style={{ fontWeight: 600, color: 'var(--accent-yellow)' }}>
+                  <code>masterplan_decompose</code>
+                </div>
+              </div>
+
+              <div>
+                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Masterplan ID</div>
+                <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
+                  {masterplan.id.substring(0, 12)}...
+                </div>
+              </div>
+
+              <div>
+                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Last Updated</div>
+                <div style={{ color: 'var(--text-secondary)' }}>
+                  {new Date(masterplan.updated_at).toLocaleTimeString()} ({masterplan.target_step_count} Target Steps)
+                </div>
+              </div>
+            </div>
+
+            {/* Copyable Prompt Box */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                MCP Agent Handoff Prompt:
+              </div>
+              <div
+                style={{
+                  backgroundColor: 'var(--bg-app)',
+                  border: '1px solid var(--border-medium)',
+                  borderRadius: 'var(--radius-md)',
+                  padding: 12,
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 11,
+                  color: 'var(--text-primary)',
+                  lineHeight: 1.5,
+                  position: 'relative',
+                  whiteSpace: 'pre-wrap',
+                }}
+              >
+                {`Decompose masterplan for project ${projectId} (${project?.name || 'Project'}) at ${project?.path || 'repository'} using MCP tool masterplan_decompose.
+
+Standard Agent Execution Sequence:
+1. Call agentxflow_current_context()
+2. Call project_context(project_id="${projectId}")
+3. Call masterplan_get(project_id="${projectId}")
+4. Call masterplan_decompose(project_id="${projectId}", steps=[...])`}
+              </div>
+            </div>
+          </div>
+
+          {/* Empty Decomposition Preview & Agent Status Grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
+            {/* Step Decomposition Placeholder Card */}
+            <div
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                border: '1px solid var(--border-medium)',
+                borderRadius: 'var(--radius-md)',
+                padding: 24,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                textAlign: 'center',
+                minHeight: 200,
+                gap: 12,
+              }}
+            >
+              <div
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: '50%',
+                  backgroundColor: 'rgba(210, 153, 34, 0.1)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'var(--accent-yellow)',
+                }}
+              >
+                <Layers size={22} />
+              </div>
+              <div>
+                <h4 style={{ fontSize: 13, fontWeight: 600, margin: 0 }}>Waiting for Agent Decomposition</h4>
+                <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4, maxWidth: 420 }}>
+                  Once an AI agent executes <code>masterplan_decompose</code> over MCP, this view will automatically update in real time with the generated step checklist and chunk claim launchers.
+                </p>
+              </div>
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: 11, height: 26 }}
+                onClick={handleParseStructuredSteps}
+              >
+                <Sparkles size={11} /> Parse Steps Manually Instead
+              </button>
+            </div>
+
+            {/* Agent Fleet Activity Panel */}
+            <div
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                border: '1px solid var(--border-medium)',
+                borderRadius: 'var(--radius-md)',
+                padding: 16,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 12,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 600 }}>
+                  <Cpu size={13} style={{ color: 'var(--accent-blue)' }} /> Connected Agents
+                </div>
+                <span className="badge" style={{ fontSize: 10 }}>{agents.length} Active</span>
+              </div>
+
+              {agents.length === 0 ? (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, padding: '10px 0' }}>
+                  No agents connected yet. Connect Claude Code, Cursor, Codex, or Antigravity to <code>http://127.0.0.1:7890/mcp</code>.
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto', maxHeight: 180 }}>
+                  {agents.map((a) => (
+                    <div
+                      key={a.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '6px 8px',
+                        backgroundColor: 'var(--bg-input)',
+                        borderRadius: 'var(--radius-sm)',
+                        fontSize: 11,
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span
+                          style={{
+                            width: 6,
+                            height: 6,
+                            borderRadius: '50%',
+                            backgroundColor: a.status === 'WORKING' ? 'var(--accent-yellow)' : 'var(--accent-green)',
+                          }}
+                        />
+                        <span style={{ fontWeight: 600 }}>{a.name}</span>
+                        <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>({a.agent_type})</span>
+                      </div>
+                      <code style={{ fontSize: 9, color: 'var(--text-muted)' }}>{a.id.substring(0, 8)}</code>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* VIEW MODE 3: RESORTED & ORGANIZED VISUAL CHECKLIST VIEW */}
+      {masterplan && masterplan.status !== 'UNSORTED' && !isEditing && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           {/* Action & Filter Toolbar */}
           <div
@@ -443,7 +800,13 @@ Example:
                   style={{ height: 26, fontSize: 10, padding: '0 8px' }}
                   onClick={() => setFilter(f)}
                 >
-                  {f === 'ALL' ? `All (${totalSteps})` : f === 'PENDING' ? `Pending (${pendingSteps})` : f === 'CLAIMED' ? `In Progress (${claimedSteps})` : `Completed (${completedSteps})`}
+                  {f === 'ALL'
+                    ? `All (${totalSteps})`
+                    : f === 'PENDING'
+                    ? `Pending (${pendingSteps})`
+                    : f === 'CLAIMED'
+                    ? `In Progress (${claimedSteps})`
+                    : `Completed (${completedSteps})`}
                 </button>
               ))}
             </div>
@@ -510,8 +873,18 @@ Example:
                 <div
                   key={step.id}
                   style={{
-                    backgroundColor: isDone ? 'rgba(35, 134, 54, 0.06)' : isClaimed ? 'rgba(56, 139, 253, 0.05)' : 'var(--bg-surface)',
-                    border: `1px solid ${isDone ? 'rgba(46, 160, 67, 0.4)' : isClaimed ? 'rgba(56, 139, 253, 0.4)' : 'var(--border-medium)'}`,
+                    backgroundColor: isDone
+                      ? 'rgba(35, 134, 54, 0.06)'
+                      : isClaimed
+                      ? 'rgba(56, 139, 253, 0.05)'
+                      : 'var(--bg-surface)',
+                    border: `1px solid ${
+                      isDone
+                        ? 'rgba(46, 160, 67, 0.4)'
+                        : isClaimed
+                        ? 'rgba(56, 139, 253, 0.4)'
+                        : 'var(--border-medium)'
+                    }`,
                     borderRadius: 'var(--radius-md)',
                     padding: '12px 16px',
                     display: 'flex',
@@ -529,7 +902,11 @@ Example:
                           fontWeight: 700,
                           padding: '2px 6px',
                           borderRadius: 'var(--radius-sm)',
-                          backgroundColor: isDone ? 'var(--accent-green)' : isClaimed ? 'var(--accent-blue)' : 'var(--bg-input)',
+                          backgroundColor: isDone
+                            ? 'var(--accent-green)'
+                            : isClaimed
+                            ? 'var(--accent-blue)'
+                            : 'var(--bg-input)',
                           color: isDone || isClaimed ? '#ffffff' : 'var(--text-secondary)',
                         }}
                       >
@@ -558,27 +935,65 @@ Example:
                   </div>
 
                   {/* Description */}
-                  <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5, whiteSpace: 'pre-wrap', paddingLeft: 34 }}>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: 'var(--text-secondary)',
+                      lineHeight: 1.5,
+                      whiteSpace: 'pre-wrap',
+                      paddingLeft: 34,
+                    }}
+                  >
                     {step.description}
                   </div>
 
-                  {/* Metadata Footer: Scope Pill, Criteria, & Assigned Agent */}
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingLeft: 34, paddingTop: 6, borderTop: '1px solid var(--border-subtle)', flexWrap: 'wrap', gap: 8, fontSize: 10 }}>
+                  {/* Metadata Footer */}
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      paddingLeft: 34,
+                      paddingTop: 6,
+                      borderTop: '1px solid var(--border-subtle)',
+                      flexWrap: 'wrap',
+                      gap: 8,
+                      fontSize: 10,
+                    }}
+                  >
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' }} title="Target file glob scope reserved for this step">
-                        <FolderGit2 size={11} style={{ color: 'var(--accent-blue)' }} />
-                        <code>{step.suggested_scope}</code>
-                      </span>
+                      {step.suggested_scope && (
+                        <span
+                          style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' }}
+                          title="Target file glob scope reserved for this step"
+                        >
+                          <FolderGit2 size={11} style={{ color: 'var(--accent-blue)' }} />
+                          <code>{step.suggested_scope}</code>
+                        </span>
+                      )}
 
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' }} title="Acceptance test criteria required to pass verification">
-                        <ShieldCheck size={11} style={{ color: 'var(--accent-green)' }} />
-                        {step.acceptance_criteria}
-                      </span>
+                      {step.acceptance_criteria && (
+                        <span
+                          style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' }}
+                          title="Acceptance test criteria required to pass verification"
+                        >
+                          <ShieldCheck size={11} style={{ color: 'var(--accent-green)' }} />
+                          {step.acceptance_criteria}
+                        </span>
+                      )}
                     </div>
 
                     {isClaimed && (
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--accent-yellow)', fontWeight: 600 }}>
+                        <span
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 4,
+                            color: 'var(--accent-yellow)',
+                            fontWeight: 600,
+                          }}
+                        >
                           <Cpu size={11} /> {assignedAgent?.name || 'Assigned Agent'}
                         </span>
                         {step.claimed_task_id && (

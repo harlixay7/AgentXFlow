@@ -12,10 +12,10 @@ use crate::db::DbPool;
 use crate::git::GitService;
 use crate::merge::MergeEngine;
 use crate::models::{
-    AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, DecomposedStepInput, EventItem,
-    EvidenceRecord, Masterplan, MasterplanStep, MergeQueueItem, ProofBundle, Project, ScopeLease,
-    ScopeViolation, Task, TaskDependency, TaskDetails, TaskState, TaskStep, TaskSubstate,
-    VerificationResult, VerificationRun,
+    AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, CurrentContext, DecomposedStepInput,
+    EventItem, EvidenceRecord, Masterplan, MasterplanStep, MasterplanSummary, MergeQueueItem,
+    ProofBundle, Project, ScopeLease, ScopeViolation, Task, TaskDependency, TaskDetails, TaskState,
+    TaskStep, TaskSubstate, VerificationResult, VerificationRun,
 };
 use crate::policies::PolicyEngine;
 use crate::scheduler::{SchedulerConfig, SchedulerEngine};
@@ -356,12 +356,11 @@ impl CoordinatorEngine {
     }
 
     pub fn list_tasks(&self, project_id: &str) -> Result<Vec<Task>, String> {
+        if project_id.trim().is_empty() {
+            return Err("project_id is required for list_tasks. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
+        }
         let conn = self.db.lock();
-        let query = if project_id.is_empty() {
-            "SELECT id, project_id, parent_id, epic_id, title, description, state, substate, assigned_agent_id, priority, risk_score, estimated_scope, worktree_path, branch_name, base_sha, head_sha, created_at, updated_at FROM tasks ORDER BY created_at DESC"
-        } else {
-            "SELECT id, project_id, parent_id, epic_id, title, description, state, substate, assigned_agent_id, priority, risk_score, estimated_scope, worktree_path, branch_name, base_sha, head_sha, created_at, updated_at FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC"
-        };
+        let query = "SELECT id, project_id, parent_id, epic_id, title, description, state, substate, assigned_agent_id, priority, risk_score, estimated_scope, worktree_path, branch_name, base_sha, head_sha, created_at, updated_at FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC";
 
         let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
 
@@ -388,17 +387,10 @@ impl CoordinatorEngine {
             })
         };
 
+        let rows = stmt.query_map([project_id], map_row).map_err(|e| e.to_string())?;
         let mut res = Vec::new();
-        if project_id.is_empty() {
-            let rows = stmt.query_map([], map_row).map_err(|e| e.to_string())?;
-            for r in rows.flatten() {
-                res.push(r);
-            }
-        } else {
-            let rows = stmt.query_map([project_id], map_row).map_err(|e| e.to_string())?;
-            for r in rows.flatten() {
-                res.push(r);
-            }
+        for r in rows.flatten() {
+            res.push(r);
         }
 
         Ok(res)
@@ -1453,4 +1445,134 @@ impl CoordinatorEngine {
         self.emit_event(Some(project_id), None, None, "MASTERPLAN_RESET", json!({ "project_id": project_id }));
         Ok(())
     }
+
+    pub fn list_all_masterplans(&self) -> Result<Vec<MasterplanSummary>, String> {
+        let projects = self.list_projects()?;
+        let conn = self.db.lock();
+        let mut summaries = Vec::new();
+
+        for proj in projects {
+            let plan_res = conn.query_row(
+                "SELECT id, status, target_step_count, max_steps_per_agent, updated_at FROM masterplans WHERE project_id = ?1",
+                [&proj.id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?, r.get::<_, i32>(3)?, r.get::<_, String>(4)?)),
+            ).ok();
+
+            if let Some((plan_id, status, target_step_count, max_steps_per_agent, updated_at)) = plan_res {
+                let mut stmt = match conn.prepare("SELECT status FROM masterplan_steps WHERE masterplan_id = ?1") {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let step_statuses: Vec<String> = stmt
+                    .query_map([&plan_id], |r| r.get(0))
+                    .map(|iter| iter.flatten().collect())
+                    .unwrap_or_default();
+
+                let total = step_statuses.len();
+                let pending = step_statuses.iter().filter(|s| s.as_str() == "PENDING").count();
+                let claimed = step_statuses.iter().filter(|s| s.as_str() == "CLAIMED" || s.as_str() == "IN_PROGRESS").count();
+                let completed = step_statuses.iter().filter(|s| s.as_str() == "COMPLETED").count();
+
+                let next_action = if status == "UNSORTED" {
+                    "masterplan_decompose".to_string()
+                } else if pending > 0 {
+                    "masterplan_claim_chunk".to_string()
+                } else {
+                    "all_steps_claimed_or_completed".to_string()
+                };
+
+                let handoff_prompt = if status == "UNSORTED" {
+                    format!("Decompose masterplan for project '{}' (ID: {}) located at '{}' using tool 'masterplan_decompose'.", proj.name, proj.id, proj.path)
+                } else {
+                    format!("Claim next available chunk for project '{}' (ID: {}) located at '{}' using tool 'masterplan_claim_chunk'.", proj.name, proj.id, proj.path)
+                };
+
+                summaries.push(MasterplanSummary {
+                    project_id: proj.id,
+                    project_name: proj.name,
+                    repository_path: proj.path,
+                    masterplan_id: plan_id,
+                    status,
+                    target_step_count,
+                    max_steps_per_agent,
+                    total_steps: total,
+                    pending_steps: pending,
+                    claimed_steps: claimed,
+                    completed_steps: completed,
+                    last_updated: updated_at,
+                    next_action,
+                    handoff_prompt,
+                });
+            }
+        }
+
+        Ok(summaries)
+    }
+
+    pub fn get_current_context(&self) -> Result<CurrentContext, String> {
+        let summaries = self.list_all_masterplans()?;
+        let agents = self.list_agents()?;
+        
+        if let Some(target) = summaries.first() {
+            let instructions = if target.status == "UNSORTED" {
+                format!(
+                    "1. Call 'project_context(project_id=\"{}\")' to fetch rules.\n2. Call 'masterplan_get(project_id=\"{}\")' to read specification.\n3. Call 'masterplan_decompose(project_id=\"{}\", steps=[...])' to structure the plan.",
+                    target.project_id, target.project_id, target.project_id
+                )
+            } else {
+                format!(
+                    "1. Call 'agent_register(name=\"...\", agent_type=\"...\")' to get session token.\n2. Call 'masterplan_claim_chunk(project_id=\"{}\", agent_id=your_id, count={})' to allocate worktree.\n3. Acquire scope and implement steps.",
+                    target.project_id, target.max_steps_per_agent
+                )
+            };
+
+            let pending_tasks = target.pending_steps;
+
+            Ok(CurrentContext {
+                active_project_id: Some(target.project_id.clone()),
+                project_name: Some(target.project_name.clone()),
+                repository_path: Some(target.repository_path.clone()),
+                masterplan_id: Some(target.masterplan_id.clone()),
+                masterplan_status: Some(target.status.clone()),
+                last_updated: Some(target.last_updated.clone()),
+                next_recommended_action: target.next_action.clone(),
+                handoff_prompt: target.handoff_prompt.clone(),
+                active_agents_count: agents.len(),
+                pending_tasks_count: pending_tasks,
+                instructions,
+            })
+        } else {
+            let projects = self.list_projects()?;
+            if let Some(proj) = projects.first() {
+                Ok(CurrentContext {
+                    active_project_id: Some(proj.id.clone()),
+                    project_name: Some(proj.name.clone()),
+                    repository_path: Some(proj.path.clone()),
+                    masterplan_id: None,
+                    masterplan_status: None,
+                    last_updated: Some(proj.created_at.clone()),
+                    next_recommended_action: "create_masterplan".to_string(),
+                    handoff_prompt: format!("Create masterplan for project '{}' ({}) in the AgentXFlow UI.", proj.name, proj.id),
+                    active_agents_count: agents.len(),
+                    pending_tasks_count: 0,
+                    instructions: "Create a masterplan in the AgentXFlow Workbench or add tasks.".to_string(),
+                })
+            } else {
+                Ok(CurrentContext {
+                    active_project_id: None,
+                    project_name: None,
+                    repository_path: None,
+                    masterplan_id: None,
+                    masterplan_status: None,
+                    last_updated: None,
+                    next_recommended_action: "create_project".to_string(),
+                    handoff_prompt: "No projects created yet. Create a project in AgentXFlow.".to_string(),
+                    active_agents_count: agents.len(),
+                    pending_tasks_count: 0,
+                    instructions: "Open AgentXFlow and create or import a Git repository.".to_string(),
+                })
+            }
+        }
+    }
 }
+
