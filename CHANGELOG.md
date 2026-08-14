@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] - 2026-08-14
+
+### Added
+- **Authoritative Automated Machine Verification Engine**:
+  - Replaced manual criteria sign-offs with typed, machine-evaluable checks (`execute_profile_for_attempt`).
+  - Automatic detection and execution of project test suites (`Cargo.toml`, `package.json`).
+  - Storing typed evaluator results (`evaluator_results`) containing task ID, attempt ID, commit SHA, evaluator version, exit code, execution duration, and stdout/stderr SHA-256 digests.
+  - State transition sequence: `RUNNING` -> `VERIFYING` -> `VERIFIED` -> `MERGE_READY` -> `MERGED` (with automatic merge queue auto-enqueue on verification pass).
+  - Derived criteria satisfaction strictly from passing machine evaluator results.
+- **Zero Self-Certification Gate**:
+  - Permanently restricted autonomous agents from calling `criteria_satisfy` over MCP.
+- **Task Attempts & Attempt-Scoped Mutation Auditing (Migration 0005)**:
+  - Added `task_attempts`, `evaluator_results`, and `verification_profiles` tables with foreign keys and performance indexes.
+  - Linked `scope_violations` and `proof_bundles` to active `attempt_id`.
+  - Auditing scope mutations per attempt (`audit_attempt_mutations`), allowing agents to acquire missing scope leases and re-run/re-submit with clean violation resolution.
+- **Caller Ownership & Step Authorization**:
+  - Added caller task ownership validation to `complete_step` (`step.task.assigned_agent == caller_agent`). Non-owners are rejected.
+- **Atomic Masterplan Preparation (`prepare_masterplan`)**:
+  - Consolidated masterplan saving, raw text markdown/bullet parsing, decomposition into non-overlapping steps, and snapshot generation into a single atomic backend operation.
+- **Unified Centralized MCP Registry**:
+  - Created `src-tauri/src/mcp/registry.rs` as the single source of truth for all 18+ coordinator tool schemas, descriptions, and parameter definitions.
+- **Personalized Context Discovery**:
+  - Updated `agentxflow_current_context` to accept `caller_agent_id` and return tailored active task, attempt ID, worktree path, and held scope leases.
+
+---
+
 ## [0.1.0] - 2026-08-14
 
 ### Added
