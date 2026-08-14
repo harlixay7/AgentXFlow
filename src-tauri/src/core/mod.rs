@@ -1103,6 +1103,21 @@ impl CoordinatorEngine {
             .ok();
 
         let plan_id = if let Some((id, old_text)) = existing {
+            let active_claims: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status != 'PENDING'",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            if active_claims > 0 && raw_text.trim() != old_text.trim() {
+                return Err(format!(
+                    "Cannot modify masterplan specification: {} step(s) are actively claimed or completed. Active work must finish or the plan must be explicitly reset first.",
+                    active_claims
+                ));
+            }
+
             // Archive existing plan into masterplan_revisions before updating
             let rev_id = Uuid::new_v4().to_string();
             let rev_num: i32 = conn.query_row(
@@ -1221,10 +1236,46 @@ impl CoordinatorEngine {
             .get_masterplan(project_id)?
             .ok_or_else(|| format!("No masterplan found for project '{}'", project_id))?;
 
-        let conn = self.db.lock();
+        let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan.id])
+        let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {}", e))?;
+
+        // Invariant check 1: Reject re-decomposition if any steps are claimed, in-progress, or completed
+        let active_claims: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status != 'PENDING'",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        if active_claims > 0 {
+            return Err(format!(
+                "Cannot re-decompose masterplan: {} step(s) are actively claimed, in-progress, or completed. Decomposition is blocked to preserve active agent work. Claim remaining steps or reset the plan first.",
+                active_claims
+            ));
+        }
+
+        // Invariant check 2: Reject re-decomposition if any masterplan tasks are currently in flight
+        let active_masterplan_tasks: i64 = tx
+            .query_row(
+                "SELECT COUNT(DISTINCT t.id) FROM tasks t
+                 JOIN masterplan_steps ms ON ms.claimed_task_id = t.id
+                 WHERE ms.masterplan_id = ?1 AND t.state IN ('RUNNING', 'REVIEW', 'MERGE_READY')",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        if active_masterplan_tasks > 0 {
+            return Err(format!(
+                "Cannot re-decompose masterplan: {} active masterplan task(s) are currently in flight for project '{}'.",
+                active_masterplan_tasks, project_id
+            ));
+        }
+
+        tx.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan.id])
             .map_err(|e| e.to_string())?;
 
         let mut inserted_steps = Vec::new();
@@ -1234,7 +1285,7 @@ impl CoordinatorEngine {
             let suggested_scope = s.suggested_scope.unwrap_or_else(|| "src/**".to_string());
             let criteria = s.acceptance_criteria.unwrap_or_else(|| "All automated tests pass".to_string());
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'PENDING', ?8, ?8)",
                 params![step_id, plan.id, s.step_index, s.title, s.description, suggested_scope, criteria, now],
@@ -1257,12 +1308,14 @@ impl CoordinatorEngine {
             });
         }
 
-        conn.execute(
+        tx.execute(
             "UPDATE masterplans SET status = 'RESORTED', updated_at = ?1 WHERE id = ?2",
             params![now, plan.id],
         ).map_err(|e| e.to_string())?;
 
+        tx.commit().map_err(|e| format!("Failed to commit masterplan decomposition: {}", e))?;
         drop(conn);
+
         self.emit_event(Some(project_id), None, None, "MASTERPLAN_DECOMPOSED", json!({ "total_steps": inserted_steps.len(), "status": "RESORTED" }));
 
         Ok(inserted_steps)

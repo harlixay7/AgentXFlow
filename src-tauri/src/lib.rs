@@ -324,6 +324,25 @@ fn get_current_context(
     state.coordinator.get_current_context()
 }
 
+pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = dirs_next::data_dir()
+        .map(|p| p.join("AgentXFlow"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    std::fs::create_dir_all(&data_dir).ok();
+    let db_path = data_dir.join("agentxflow_v2.db");
+
+    let db_pool = DbPool::new(&db_path)?;
+    let coordinator = CoordinatorEngine::new(db_pool);
+
+    let security = SecurityManager::init_or_load(&data_dir)?;
+    let mcp_port = 7890;
+
+    let mcp_server = McpServer::new(coordinator, mcp_port, security);
+    mcp_server.start().await?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = dirs_next::data_dir()

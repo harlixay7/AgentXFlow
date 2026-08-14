@@ -272,6 +272,18 @@ impl MergeEngine {
                 // Complete associated masterplan steps
                 conn.execute("UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2", [&now, &item.task_id]).ok();
 
+                let pending_remaining: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM masterplan_steps ms
+                     JOIN masterplans mp ON ms.masterplan_id = mp.id
+                     WHERE mp.project_id = ?1 AND ms.status != 'COMPLETED'",
+                    [&item.project_id],
+                    |r| r.get(0),
+                ).unwrap_or(1);
+
+                if pending_remaining == 0 {
+                    conn.execute("UPDATE masterplans SET status = 'COMPLETED', updated_at = ?1 WHERE project_id = ?2", [&now, &item.project_id]).ok();
+                }
+
                 let attempt = IntegrationAttempt {
                     id: attempt_id,
                     merge_queue_id: item.id.clone(),
