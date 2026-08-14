@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
+pub mod registry;
+
 use crate::core::CoordinatorEngine;
 use crate::security::SecurityManager;
 
@@ -98,7 +100,8 @@ async fn handle_health() -> impl IntoResponse {
         Json(serde_json::json!({
             "status": "ok",
             "service": "AgentXFlow Authoritative MCP Gateway (Viducia)",
-            "protocol_version": "2026-07-28",
+            "protocol_version": "2024-11-05",
+            "supported_versions": ["2024-11-05", "2026-07-28"],
             "transport": "Streamable HTTP"
         })),
     )
@@ -144,7 +147,7 @@ fn validate_security_headers(headers: &HeaderMap) -> Result<(), (StatusCode, Str
     Ok(())
 }
 
-/// Standards-Compliant MCP 2026-07-28 HTTP Handler
+/// Standards-Compliant Model Context Protocol (MCP) HTTP Handler
 async fn handle_mcp_streamable_http(
     State(state): State<Arc<McpServerState>>,
     headers: HeaderMap,
@@ -203,18 +206,30 @@ async fn handle_mcp_streamable_http(
         );
     }
 
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert("MCP-Protocol-Version", HeaderValue::from_static("2026-07-28"));
-
     let method = req.method.as_str();
     let params = req.params.clone().unwrap_or(serde_json::json!({}));
+
+    // Dynamic protocol version negotiation supporting standard 2024-11-05 and 2026-07-28
+    let requested_version = params
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .or_else(|| headers.get("MCP-Protocol-Version").and_then(|h| h.to_str().ok()))
+        .unwrap_or("2024-11-05");
+
+    let negotiated_version = match requested_version {
+        "2026-07-28" => "2026-07-28",
+        _ => "2024-11-05",
+    };
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("MCP-Protocol-Version", HeaderValue::from_str(negotiated_version).unwrap_or(HeaderValue::from_static("2024-11-05")));
 
     // Standard MCP Protocol Routing
     let response_result = match method {
         // --- 1. Standard MCP Protocol Handlers ---
         "initialize" => {
             Ok(serde_json::json!({
-                "protocolVersion": "2026-07-28",
+                "protocolVersion": negotiated_version,
                 "serverInfo": {
                     "name": "AgentXFlow Coordinator",
                     "version": "0.1.0"
@@ -222,9 +237,47 @@ async fn handle_mcp_streamable_http(
                 "capabilities": {
                     "tools": {
                         "listChanged": false
-                    }
+                    },
+                    "prompts": {
+                        "listChanged": false
+                    },
+                    "resources": {
+                        "subscribe": false,
+                        "listChanged": false
+                    },
+                    "logging": {}
                 }
             }))
+        }
+
+        "notifications/initialized" | "notifications/cancelled" => {
+            Ok(serde_json::json!({}))
+        }
+
+        "ping" => {
+            Ok(serde_json::json!({}))
+        }
+
+        "prompts/list" => {
+            Ok(serde_json::json!({
+                "prompts": []
+            }))
+        }
+
+        "resources/list" => {
+            Ok(serde_json::json!({
+                "resources": []
+            }))
+        }
+
+        "resources/templates/list" => {
+            Ok(serde_json::json!({
+                "resourceTemplates": []
+            }))
+        }
+
+        "logging/setLevel" => {
+            Ok(serde_json::json!({}))
         }
 
         "tools/list" => {
@@ -294,47 +347,102 @@ fn execute_mcp_tool(
                 ));
             }
             Ok(agent.id.clone())
+        } else if !req_id.is_empty() {
+            if state.coordinator.is_agent_registered(req_id) {
+                Ok(req_id.to_string())
+            } else {
+                Err(format!(
+                    "Agent '{}' is not registered. Call 'agent_register' with your agent name first.",
+                    req_id
+                ))
+            }
         } else {
-            if req_id.trim().is_empty() {
-                return Err("Agent registration required: The 'agent_id' parameter is missing. Call 'agent_register' first.".to_string());
+            // Check if there is exactly one registered agent on the coordinator
+            let agents = state.coordinator.list_agents().unwrap_or_default();
+            if agents.len() == 1 {
+                Ok(agents[0].id.clone())
+            } else {
+                Err("Missing 'agent_id' parameter. Pass 'agent_id' or call 'agent_register'.".to_string())
             }
-            if !state.coordinator.is_agent_registered(req_id) {
-                return Err(format!("Agent ID '{}' is not registered. Call 'agent_register' first.", req_id));
-            }
-            Ok(req_id.to_string())
         }
     };
 
     match tool_name {
         // Discovery tools
+        "agentxflow_current_context" | "context.current" => {
+            let caller_agent_id = params.get("agent_id").and_then(|v| v.as_str()).or_else(|| caller_agent.map(|a| a.id.as_str()));
+            let project_id = params.get("project_id").and_then(|v| v.as_str());
+            state.coordinator.get_current_context(caller_agent_id, project_id).map(|ctx| serde_json::to_value(ctx).unwrap())
+        }
+
+        "project_list" | "project.list" => {
+            state.coordinator.list_projects().map(|projects| serde_json::to_value(projects).unwrap())
+        }
+
         "project_context" | "project.context" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            state.coordinator.get_context_pack(project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+            if project_id.trim().is_empty() {
+                let ctx = state.coordinator.get_current_context(None, None)?;
+                if let Some(pid) = ctx.active_project_id {
+                    state.coordinator.get_context_pack(&pid, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+                } else {
+                    Err("Missing required parameter 'project_id'. Query 'project_list' to obtain valid project IDs.".to_string())
+                }
+            } else {
+                state.coordinator.get_context_pack(project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+            }
+        }
+
+        "masterplan_list" | "masterplan.list" => {
+            state.coordinator.list_all_masterplans().map(|plans| serde_json::to_value(plans).unwrap())
         }
 
         "task_list" | "task.list" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-            state.coordinator.list_tasks(project_id).map(|tasks| serde_json::to_value(tasks).unwrap())
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
+            }
+            let include_stale = params.get("include_stale").and_then(|v| v.as_bool()).unwrap_or(false);
+            state.coordinator.list_tasks(project_id).map(|tasks| {
+                if include_stale {
+                    serde_json::to_value(tasks).unwrap()
+                } else {
+                    let active_tasks: Vec<_> = tasks.into_iter().filter(|t| !t.is_stale).collect();
+                    serde_json::to_value(active_tasks).unwrap()
+                }
+            })
         }
 
         "task_get" | "task.get" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            if task_id.trim().is_empty() {
+                return Err("Missing required parameter 'task_id'.".to_string());
+            }
             state.coordinator.get_task(task_id).map(|task| serde_json::to_value(task).unwrap())
         }
 
         "task_details" | "task.details" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            if task_id.trim().is_empty() {
+                return Err("Missing required parameter 'task_id'.".to_string());
+            }
             state.coordinator.get_task_details(task_id).map(|td| serde_json::to_value(td).unwrap())
         }
 
-        "dependency_list" | "dag.dependencies" => {
+        "dag_dependencies" | "dependency_list" | "dag.dependencies" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            if task_id.trim().is_empty() {
+                return Err("Missing required parameter 'task_id'.".to_string());
+            }
             state.coordinator.dag.get_dependencies_for_task(task_id).map(|deps| serde_json::to_value(deps).unwrap())
         }
 
         "merge_queue_status" | "merge.queue_status" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'.".to_string());
+            }
             state.coordinator.merge.list_queue(project_id).map(|items| serde_json::to_value(items).unwrap())
         }
 
@@ -361,8 +469,10 @@ fn execute_mcp_tool(
 
         "task_complete_step" | "task.complete_step" => {
             let step_id = params.get("step_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
             let evidence_json = params.get("evidence").map(|v| v.to_string());
-            state.coordinator.complete_step(step_id, evidence_json.as_deref()).map(|step| serde_json::to_value(step).unwrap())
+            state.coordinator.complete_step(step_id, agent_id_opt.as_deref(), evidence_json.as_deref()).map(|step| serde_json::to_value(step).unwrap())
         }
 
         "task_submit" | "task.submit" => {
@@ -370,6 +480,30 @@ fn execute_mcp_tool(
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id = resolve_agent_id(raw_agent_id)?;
             state.coordinator.submit_task(task_id, &agent_id).map(|res| serde_json::to_value(res).unwrap())
+        }
+
+        "task_cancel" | "task.cancel" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
+            let reason = params.get("reason").and_then(|v| v.as_str());
+            state.coordinator.cancel_task(task_id, agent_id_opt.as_deref(), reason).map(|task| serde_json::json!({
+                "success": true,
+                "task_id": task.id,
+                "state": task.state.as_str(),
+                "message": "Task cancelled and scope leases released."
+            }))
+        }
+
+        "task_requeue" | "task.requeue" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
+            state.coordinator.requeue_task(task_id, agent_id_opt.as_deref()).map(|_| serde_json::json!({
+                "success": true,
+                "task_id": task_id,
+                "message": "Task chunk requeued to masterplan pending steps and scope leases released."
+            }))
         }
 
         "scope_acquire" | "scope.acquire" | "scope.propose" => {
@@ -385,29 +519,56 @@ fn execute_mcp_tool(
 
         "scope_release" | "scope.release" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            state.coordinator.scope.release_scope(task_id).map(|_| serde_json::json!({ "status": "released" }))
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            if let Ok(agent_id) = resolve_agent_id(raw_agent_id) {
+                state.coordinator.scope.release_scope_by_agent(task_id, &agent_id).map(|_| serde_json::json!({ "status": "released" }))
+            } else {
+                state.coordinator.scope.release_scope(task_id).map(|_| serde_json::json!({ "status": "released" }))
+            }
         }
 
         "criteria_satisfy" | "criteria.satisfy" => {
-            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let criterion_id = params.get("criterion_id").and_then(|v| v.as_str()).unwrap_or("");
-            let evidence = params.get("evidence").and_then(|v| v.as_str());
-            state.coordinator.satisfy_acceptance_criterion(task_id, criterion_id, evidence)
-                .map(|_| serde_json::json!({ "status": "satisfied" }))
+            Err("Authorization rejected: Autonomous agents cannot self-satisfy criteria. Criteria satisfaction is derived strictly from automated coordinator machine evaluators.".to_string())
         }
 
         // Masterplan Hub Tools
+        "prepare_masterplan" | "masterplan.prepare" => {
+            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_text = params.get("raw_text").and_then(|v| v.as_str()).unwrap_or("");
+            let target_step_count = params.get("target_step_count").and_then(|v| v.as_i64()).unwrap_or(20) as i32;
+            let max_steps_per_agent = params.get("max_steps_per_agent").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
+            state.coordinator.prepare_masterplan(project_id, raw_text, target_step_count, max_steps_per_agent)
+                .map(|snap| serde_json::to_value(snap).unwrap())
+        }
+
         "masterplan_get" | "masterplan.get" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
+            }
+            let proj = state.coordinator.list_projects()?.into_iter().find(|p| p.id == project_id)
+                .ok_or_else(|| format!("Project '{}' not found", project_id))?;
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
-                    let instruction = if plan.status == "UNSORTED" {
-                        "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array.".to_string()
+                    let (next_action, instruction) = if plan.status == "UNSORTED" {
+                        (
+                            "masterplan_decompose",
+                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array."
+                        )
                     } else {
-                        "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk.".to_string()
+                        (
+                            "masterplan_claim_chunk",
+                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk."
+                        )
                     };
                     Ok(serde_json::json!({
+                        "project_name": proj.name,
+                        "project_id": proj.id,
+                        "repository_path": proj.path,
+                        "masterplan_id": plan.id,
+                        "status": plan.status,
+                        "next_action": next_action,
                         "plan": plan,
                         "steps": steps,
                         "instruction": instruction,
@@ -420,6 +581,9 @@ fn execute_mcp_tool(
 
         "masterplan_status" | "masterplan.status" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
+            }
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
@@ -450,7 +614,21 @@ fn execute_mcp_tool(
                 .or_else(|| params.get("count"))
                 .and_then(|v| v.as_i64())
                 .map(|n| n as i32);
-            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count).map(|chunk| serde_json::to_value(chunk).unwrap())
+            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count).map(|chunk| {
+                serde_json::json!({
+                    "id": chunk.id,
+                    "task_id": chunk.id,
+                    "task": chunk,
+                    "project_id": chunk.project_id,
+                    "title": chunk.title,
+                    "description": chunk.description,
+                    "state": chunk.state.as_str(),
+                    "worktree_path": chunk.worktree_path,
+                    "branch_name": chunk.branch_name,
+                    "base_sha": chunk.base_sha,
+                    "message": "Chunk claimed successfully with exclusive write scope leases."
+                })
+            })
         }
 
         "masterplan_decompose" | "masterplan.decompose" => {
@@ -468,164 +646,6 @@ fn execute_mcp_tool(
 }
 
 fn get_tool_definitions() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "name": "agent_register",
-            "description": "Register an agent session and get a unique agent_id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Agent name (e.g. Claude, Codex, Antigravity)" },
-                    "agent_type": { "type": "string", "description": "Agent category type" }
-                },
-                "required": ["name"]
-            }
-        }),
-        serde_json::json!({
-            "name": "agent_heartbeat",
-            "description": "Keep agent session and active scope leases alive.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string", "description": "Unique agent identifier" }
-                },
-                "required": ["agent_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "task_list",
-            "description": "List all tasks in backlog or ready queue for a project.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string", "description": "Target project ID" }
-                },
-                "required": ["project_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "task_get",
-            "description": "Get task details including prompt, status, and worktree path.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "Task identifier" }
-                },
-                "required": ["task_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "task_claim",
-            "description": "Atomically claim a task and cut an isolated Git worktree on disk.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "Task identifier" },
-                    "agent_id": { "type": "string", "description": "Claiming agent ID" }
-                },
-                "required": ["task_id", "agent_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "scope_acquire",
-            "description": "Atomically lock file glob patterns for exclusive write access.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "Task identifier" },
-                    "agent_id": { "type": "string", "description": "Agent identifier" },
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "File glob patterns (e.g. ['src/auth/**', 'tests/auth_test.rs'])"
-                    }
-                },
-                "required": ["task_id", "agent_id", "patterns"]
-            }
-        }),
-        serde_json::json!({
-            "name": "task_complete_step",
-            "description": "Mark a required task step completed with test or build evidence.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "step_id": { "type": "string", "description": "Step identifier" },
-                    "evidence": { "type": "string", "description": "Structured command output or test log" }
-                },
-                "required": ["step_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "task_submit",
-            "description": "Submit task for coordinator verification and git mutation audit.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "Task identifier" },
-                    "agent_id": { "type": "string", "description": "Agent identifier" }
-                },
-                "required": ["task_id", "agent_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "masterplan_get",
-            "description": "Get masterplan specification, current status, and decomposition instructions.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string", "description": "Project ID" }
-                },
-                "required": ["project_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "masterplan_decompose",
-            "description": "Decompose raw masterplan into structured execution steps.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string", "description": "Project ID" },
-                    "steps": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "step_index": { "type": "integer" },
-                                "title": { "type": "string" },
-                                "description": { "type": "string" },
-                                "suggested_scope": { "type": "string" },
-                                "acceptance_criteria": { "type": "string" }
-                            },
-                            "required": ["step_index", "title", "description"]
-                        }
-                    }
-                },
-                "required": ["project_id", "steps"]
-            }
-        }),
-        serde_json::json!({
-            "name": "masterplan_claim_chunk",
-            "description": "Claim the next batch of steps from an organized masterplan.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string", "description": "Project ID" },
-                    "agent_id": { "type": "string", "description": "Claiming agent ID" },
-                    "count": { "type": "integer", "description": "Optional step count (capped by limit)" }
-                },
-                "required": ["project_id", "agent_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "merge_queue_status",
-            "description": "List all queued branch merges and their integration statuses.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string", "description": "Project ID" }
-                },
-                "required": ["project_id"]
-            }
-        })
-    ]
+    registry::get_all_tool_definitions()
 }
+

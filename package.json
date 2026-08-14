@@ -1,7 +1,7 @@
 {
-  "name": "viducia-agentxflow",
+  "name": "agentxflow",
   "author": "harlixay7",
-  "description": "Viducia: Cross-Agent Engineering Coordinator by harlixay7",
+  "description": "AgentXFlow by Viducia — Authoritative Multi-Agent Engineering Coordinator",
   "private": true,
   "version": "0.1.0",
   "type": "module",

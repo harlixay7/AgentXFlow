@@ -121,5 +121,104 @@ pub mod tests {
         let list = engine.merge.list_queue(&proj_id).unwrap();
         assert_eq!(list.len(), 1);
     }
+
+    #[test]
+    fn test_task_cancellation_and_scope_release() {
+        let (engine, proj_id) = setup_test_engine();
+        let agent = engine.register_agent("Agent-Alpha", "Coder").unwrap();
+        let task = engine.create_task(&proj_id, "Cancel Task", "Desc", "HIGH", vec![], vec![]).unwrap();
+
+        // Claim and acquire scope
+        let claimed = engine.claim_task(&task.id, &agent.id).unwrap();
+        assert_eq!(claimed.state, TaskState::Running);
+        engine.scope.acquire_scope(&task.id, &agent.id, vec!["crates/engine/**".to_string()], "EXCLUSIVE_WRITE").unwrap();
+
+        // Verify scope lease exists
+        let leases = engine.get_task_details(&task.id).unwrap().leases;
+        assert_eq!(leases.len(), 1);
+
+        // Cancel task explicitly
+        let cancelled = engine.cancel_task(&task.id, Some(&agent.id), Some("User requested stop")).unwrap();
+        assert_eq!(cancelled.state, TaskState::Cancelled);
+        assert!(cancelled.is_stale);
+
+        // Verify scope leases were fully released
+        let leases_after = engine.get_task_details(&task.id).unwrap().leases;
+        assert_eq!(leases_after.len(), 0);
+
+        // Another task can now acquire the same scope pattern without collision
+        let agent2 = engine.register_agent("Agent-Beta", "Coder").unwrap();
+        let task2 = engine.create_task(&proj_id, "Task 2", "Desc", "HIGH", vec![], vec![]).unwrap();
+        let claimed2 = engine.claim_task(&task2.id, &agent2.id).unwrap();
+        assert!(engine.scope.acquire_scope(&claimed2.id, &agent2.id, vec!["crates/engine/**".to_string()], "EXCLUSIVE_WRITE").is_ok());
+    }
+
+    #[test]
+    fn test_masterplan_lifecycle_and_reset_invalidation() {
+        let (engine, proj_id) = setup_test_engine();
+        let agent = engine.register_agent("Agent-1", "Coder").unwrap();
+
+        // 1. Prepare masterplan
+        let raw_plan = "# Step 1: Init\nInit project\n# Step 2: Core\nCore logic";
+        let prep = engine.prepare_masterplan(&proj_id, raw_plan, 2, 2).unwrap();
+        assert_eq!(prep.steps.len(), 2);
+
+        // 2. Claim chunk
+        let claimed_chunk = engine.claim_masterplan_chunk(&proj_id, &agent.id, Some(1)).unwrap();
+        assert_eq!(claimed_chunk.state, TaskState::Running);
+        assert!(!claimed_chunk.is_stale);
+
+        // 3. Reset masterplan
+        assert!(engine.reset_masterplan(&proj_id).is_ok());
+
+        // 4. Verify claimed task is now marked CANCELLED & is_stale = true, and its scopes released
+        let task_after = engine.get_task(&claimed_chunk.id).unwrap();
+        assert_eq!(task_after.state, TaskState::Cancelled);
+        assert!(task_after.is_stale);
+
+        let leases = engine.get_task_details(&claimed_chunk.id).unwrap().leases;
+        assert_eq!(leases.len(), 0);
+    }
+
+    #[test]
+    fn test_decompose_blocked_while_tasks_active() {
+        let (engine, proj_id) = setup_test_engine();
+        let agent = engine.register_agent("Agent-Decomp", "Coder").unwrap();
+
+        // Prepare plan
+        let raw_plan = "# Step 1: A\nDesc A\n# Step 2: B\nDesc B";
+        engine.prepare_masterplan(&proj_id, raw_plan, 2, 2).unwrap();
+
+        // Claim a chunk so an active task exists
+        let claimed = engine.claim_masterplan_chunk(&proj_id, &agent.id, Some(1)).unwrap();
+        assert_eq!(claimed.state, TaskState::Running);
+
+        // Attempting to re-decompose while task is active MUST fail
+        let decomp_res = engine.decompose_masterplan(&proj_id, vec![
+            crate::models::DecomposedStepInput {
+                step_index: 1,
+                title: "New 1".to_string(),
+                description: "New desc".to_string(),
+                suggested_scope: Some("src/**".to_string()),
+                acceptance_criteria: Some("Pass".to_string()),
+            }
+        ]);
+        assert!(decomp_res.is_err(), "Decomposing while active tasks are running must be blocked");
+
+        // Cancel the active task
+        engine.cancel_task(&claimed.id, Some(&agent.id), Some("Cancelled for test")).unwrap();
+
+        // Now re-decomposition succeeds
+        let decomp_res2 = engine.decompose_masterplan(&proj_id, vec![
+            crate::models::DecomposedStepInput {
+                step_index: 1,
+                title: "New 1".to_string(),
+                description: "New desc".to_string(),
+                suggested_scope: Some("src/**".to_string()),
+                acceptance_criteria: Some("Pass".to_string()),
+            }
+        ]);
+        assert!(decomp_res2.is_ok(), "Decomposing after cancelling active task must succeed");
+    }
 }
 

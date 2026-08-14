@@ -29,6 +29,39 @@ impl MergeEngine {
         head_sha: &str,
     ) -> Result<MergeQueueItem, String> {
         let conn = self.db.lock();
+        let existing = conn.query_row(
+            "SELECT id, project_id, task_id, branch_name, target_branch, position, status, base_sha, head_sha, queued_at, processed_at FROM merge_queue WHERE project_id = ?1 AND task_id = ?2 AND processed_at IS NULL",
+            [project_id, task_id],
+            |r| {
+                Ok(MergeQueueItem {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    task_id: r.get(2)?,
+                    branch_name: r.get(3)?,
+                    target_branch: r.get(4)?,
+                    position: r.get(5)?,
+                    status: r.get(6)?,
+                    base_sha: r.get(7)?,
+                    head_sha: r.get(8)?,
+                    queued_at: r.get(9)?,
+                    processed_at: r.get(10)?,
+                })
+            },
+        ).ok();
+
+        if let Some(mut item) = existing {
+            conn.execute(
+                "UPDATE merge_queue SET branch_name = ?1, target_branch = ?2, base_sha = ?3, head_sha = ?4, status = 'READY' WHERE id = ?5",
+                rusqlite::params![branch_name, target_branch, base_sha, head_sha, item.id],
+            ).map_err(|e| e.to_string())?;
+            item.branch_name = branch_name.to_string();
+            item.target_branch = target_branch.to_string();
+            item.base_sha = base_sha.to_string();
+            item.head_sha = head_sha.to_string();
+            item.status = "READY".to_string();
+            return Ok(item);
+        }
+
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
@@ -123,10 +156,48 @@ impl MergeEngine {
             ).map_err(|e| format!("Queue item '{}' not found: {}", queue_item_id, e))?
         };
 
+        // 1. Strict FIFO Serialization Check: No earlier item may be skipped
+        {
+            let conn = self.db.lock();
+            let older_ready_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merge_queue WHERE project_id = ?1 AND target_branch = ?2 AND status = 'READY' AND position < ?3",
+                    rusqlite::params![item.project_id, item.target_branch, item.position],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            if older_ready_count > 0 {
+                return Err(format!(
+                    "FIFO queue ordering violation: {} earlier candidate(s) are queued ahead of item '{}'. Merges must proceed sequentially.",
+                    older_ready_count, item.id
+                ));
+            }
+
+            // 2. Active integration check: Max 1 active integration per target branch
+            let running_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merge_queue WHERE project_id = ?1 AND target_branch = ?2 AND status = 'RUNNING_CHECKS' AND id != ?3",
+                    rusqlite::params![item.project_id, item.target_branch, item.id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            if running_count > 0 {
+                return Err(format!(
+                    "Concurrency lock: Target branch '{}' currently has an active merge integration in progress. Please wait for completion.",
+                    item.target_branch
+                ));
+            }
+
+            // Atomically mark RUNNING_CHECKS
+            conn.execute("UPDATE merge_queue SET status = 'RUNNING_CHECKS' WHERE id = ?1", [&item.id]).ok();
+        }
+
         self.process_merge(&item.project_id, repo_path, &item)
     }
 
-    /// Merges candidate using isolated hidden integration worktree without dirtying user root checkout
+    /// Merges candidate using isolated disposable integration worktree without dirtying user root checkout
     pub fn process_merge(
         &self,
         project_id: &str,
@@ -146,7 +217,7 @@ impl MergeEngine {
             return Err(format!("Target branch '{}' has moved (current SHA: {}). Candidate base is STALE. Rebase required.", item.target_branch, target_sha_before));
         }
 
-        // 2. Ensure dedicated hidden integration worktree exists
+        // 2. Ensure dedicated disposable integration worktree exists
         let integration_dir = self.git.ensure_integration_worktree(repo_path, project_id, &item.target_branch)?;
 
         // Reset integration workspace to exact target branch state
@@ -233,6 +304,18 @@ impl MergeEngine {
                 conn.execute("UPDATE tasks SET state = 'DONE', substate = 'NONE', updated_at = ?1 WHERE id = ?2", [&now, &item.task_id]).ok();
                 // Complete associated masterplan steps
                 conn.execute("UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2", [&now, &item.task_id]).ok();
+
+                let pending_remaining: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM masterplan_steps ms
+                     JOIN masterplans mp ON ms.masterplan_id = mp.id
+                     WHERE mp.project_id = ?1 AND ms.status != 'COMPLETED'",
+                    [&item.project_id],
+                    |r| r.get(0),
+                ).unwrap_or(1);
+
+                if pending_remaining == 0 {
+                    conn.execute("UPDATE masterplans SET status = 'COMPLETED', updated_at = ?1 WHERE project_id = ?2", [&now, &item.project_id]).ok();
+                }
 
                 let attempt = IntegrationAttempt {
                     id: attempt_id,

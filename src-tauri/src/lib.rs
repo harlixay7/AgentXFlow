@@ -54,7 +54,8 @@ fn get_mcp_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, St
         "url": format!("http://127.0.0.1:{}/mcp", state.mcp_port),
         "sse_url": format!("http://127.0.0.1:{}/mcp/sse", state.mcp_port),
         "token": token,
-        "protocol_version": "2026-07-28",
+        "protocol_version": "2024-11-05",
+        "supported_versions": ["2024-11-05", "2026-07-28"],
     }))
 }
 
@@ -128,9 +129,10 @@ fn claim_task(
 fn complete_step(
     state: State<'_, Arc<AppState>>,
     step_id: String,
+    agent_id: Option<String>,
     evidence_json: Option<String>,
 ) -> Result<TaskStep, String> {
-    state.coordinator.complete_step(&step_id, evidence_json.as_deref())
+    state.coordinator.complete_step(&step_id, agent_id.as_deref(), evidence_json.as_deref())
 }
 
 #[tauri::command]
@@ -140,6 +142,25 @@ fn submit_task(
     agent_id: String,
 ) -> Result<VerificationResult, String> {
     state.coordinator.submit_task(&task_id, &agent_id)
+}
+
+#[tauri::command]
+fn cancel_task(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+    agent_id: Option<String>,
+    reason: Option<String>,
+) -> Result<Task, String> {
+    state.coordinator.cancel_task(&task_id, agent_id.as_deref(), reason.as_deref())
+}
+
+#[tauri::command]
+fn requeue_task(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+    agent_id: Option<String>,
+) -> Result<(), String> {
+    state.coordinator.requeue_task(&task_id, agent_id.as_deref())
 }
 
 #[tauri::command]
@@ -188,16 +209,12 @@ fn list_merge_queue(
 }
 
 #[tauri::command]
-fn enqueue_task_for_merge(
+fn enqueue_task_by_id(
     state: State<'_, Arc<AppState>>,
     project_id: String,
     task_id: String,
-    branch_name: String,
-    target_branch: String,
-    base_sha: String,
-    head_sha: String,
 ) -> Result<MergeQueueItem, String> {
-    state.coordinator.merge.enqueue_task(&project_id, &task_id, &branch_name, &target_branch, &base_sha, &head_sha)
+    state.coordinator.enqueue_task_by_id(&project_id, &task_id)
 }
 
 #[tauri::command]
@@ -208,16 +225,6 @@ fn satisfy_acceptance_criterion(
     evidence: Option<String>,
 ) -> Result<(), String> {
     state.coordinator.satisfy_acceptance_criterion(&task_id, &criterion_id, evidence.as_deref())
-}
-
-#[tauri::command]
-fn process_merge_candidate(
-    state: State<'_, Arc<AppState>>,
-    project_id: String,
-    item: MergeQueueItem,
-) -> Result<IntegrationAttempt, String> {
-    let proj = state.coordinator.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
-    state.coordinator.merge.process_merge(&project_id, Path::new(&proj.path), &item)
 }
 
 #[tauri::command]
@@ -323,6 +330,55 @@ fn reset_masterplan(
     state.coordinator.reset_masterplan(&project_id)
 }
 
+#[tauri::command]
+fn prepare_masterplan(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    raw_text: String,
+    target_step_count: i32,
+    max_steps_per_agent: i32,
+) -> Result<crate::models::PreparedMasterplanSnapshot, String> {
+    state.coordinator.prepare_masterplan(&project_id, &raw_text, target_step_count, max_steps_per_agent)
+}
+
+#[tauri::command]
+fn list_all_masterplans(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::models::MasterplanSummary>, String> {
+    state.coordinator.list_all_masterplans()
+}
+
+#[tauri::command]
+fn get_current_context(
+    state: State<'_, Arc<AppState>>,
+    agent_id: Option<String>,
+    project_id: Option<String>,
+) -> Result<crate::models::CurrentContext, String> {
+    state.coordinator.get_current_context(agent_id.as_deref(), project_id.as_deref())
+}
+
+pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = dirs_next::data_dir()
+        .map(|p| p.join("AgentXFlow"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    std::fs::create_dir_all(&data_dir).ok();
+    let db_path = data_dir.join("agentxflow_v2.db");
+
+    let db_pool = DbPool::new(&db_path)?;
+    let coordinator = CoordinatorEngine::new(db_pool);
+
+    let security = SecurityManager::init_or_load(&data_dir)?;
+    let mcp_port = 7890;
+
+    let mcp_server = McpServer::new(coordinator, mcp_port, security);
+    let addr = mcp_server.start().await.map_err(|e| format!("Failed to start MCP server: {}", e))?;
+    println!("AgentXFlow Coordinator Daemon running on http://{}", addr);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = dirs_next::data_dir()
@@ -368,6 +424,8 @@ pub fn run() {
             get_task_details,
             list_tasks,
             claim_task,
+            cancel_task,
+            requeue_task,
             complete_step,
             satisfy_acceptance_criterion,
             submit_task,
@@ -376,8 +434,7 @@ pub fn run() {
             add_task_dependency,
             get_task_dependencies,
             list_merge_queue,
-            enqueue_task_for_merge,
-            process_merge_candidate,
+            enqueue_task_by_id,
             process_merge_by_id,
             get_events_after,
             get_context_pack,
@@ -385,11 +442,14 @@ pub fn run() {
             unregister_agent,
             list_agents,
             create_or_update_masterplan,
+            prepare_masterplan,
             get_masterplan,
             list_masterplan_steps,
             decompose_masterplan,
             claim_masterplan_chunk,
             reset_masterplan,
+            list_all_masterplans,
+            get_current_context,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

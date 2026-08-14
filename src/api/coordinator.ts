@@ -14,60 +14,33 @@ import {
   RepoInspectionResult,
   McpInfo,
   ContextPack,
+  TaskDetails,
 } from '../types';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 export const coordinatorApi = {
   async pickFolder(): Promise<string | null> {
-    if (!isTauri) return 'b:/AgentXFlow';
+    if (!isTauri) return null;
     return await invoke('pick_folder');
   },
 
   async inspectRepository(path: string): Promise<RepoInspectionResult> {
     if (!isTauri) {
-      return {
-        is_git_repo: true,
-        active_branch: 'main',
-        remote_url: 'https://github.com/agentxflow/engine.git',
-        languages: ['Rust', 'TypeScript'],
-        package_managers: ['Cargo', 'npm'],
-        build_scripts: ['cargo build', 'npm run build'],
-        test_scripts: ['cargo test', 'npm test'],
-        lint_scripts: ['cargo clippy', 'npm run lint'],
-        has_ci: true,
-        has_instruction_file: true,
-      };
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
     }
     return await invoke('inspect_repository', { path });
   },
 
   async getMcpInfo(): Promise<McpInfo> {
     if (!isTauri) {
-      return {
-        url: 'http://127.0.0.1:7890/mcp',
-        sse_url: 'http://127.0.0.1:7890/mcp/sse',
-        token: 'axf_sec_v2_live_token_7890',
-        protocol_version: '2026-07-28',
-      };
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
     }
     return await invoke('get_mcp_info');
   },
 
   async listProjects(): Promise<Project[]> {
-    if (!isTauri) {
-      return [
-        {
-          id: 'proj-agentxflow-v2',
-          name: 'AgentXFlow V2 Engine',
-          path: 'b:/AgentXFlow',
-          master_spec: 'Authoritative Multi-Agent Software Engineering Control Plane',
-          target_branch: 'main',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-      ];
-    }
+    if (!isTauri) return [];
     return await invoke('list_projects');
   },
 
@@ -78,15 +51,7 @@ export const coordinatorApi = {
     target_branch: string = 'main'
   ): Promise<Project> {
     if (!isTauri) {
-      return {
-        id: `proj-${Date.now()}`,
-        name,
-        path,
-        master_spec,
-        target_branch,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
     }
     return await invoke('create_project', { name, path, masterSpec: master_spec, targetBranch: target_branch });
   },
@@ -115,12 +80,20 @@ export const coordinatorApi = {
     return await invoke('claim_task', { taskId, agentId });
   },
 
-  async completeStep(stepId: string, evidenceJson?: string): Promise<TaskStep> {
-    return await invoke('complete_step', { stepId, evidenceJson });
+  async completeStep(stepId: string, evidenceJson?: string, agentId?: string): Promise<TaskStep> {
+    return await invoke('complete_step', { stepId, agentId, evidenceJson });
   },
 
   async submitTask(taskId: string, agentId: string): Promise<VerificationResult> {
     return await invoke('submit_task', { taskId, agentId });
+  },
+
+  async cancelTask(taskId: string, agentId?: string, reason?: string): Promise<Task> {
+    return await invoke('cancel_task', { taskId, agentId, reason });
+  },
+
+  async requeueTask(taskId: string, agentId?: string): Promise<void> {
+    return await invoke('requeue_task', { taskId, agentId });
   },
 
   async requestScope(taskId: string, agentId: string, patterns: string[]): Promise<ScopeLease[]> {
@@ -144,19 +117,12 @@ export const coordinatorApi = {
     return await invoke('list_merge_queue', { projectId });
   },
 
-  async enqueueTaskForMerge(
-    projectId: string,
-    taskId: string,
-    branchName: string,
-    targetBranch: string,
-    baseSha: string,
-    headSha: string
-  ): Promise<MergeQueueItem> {
-    return await invoke('enqueue_task_for_merge', { projectId, taskId, branchName, targetBranch, baseSha, headSha });
+  async enqueueTaskById(projectId: string, taskId: string): Promise<MergeQueueItem> {
+    return await invoke('enqueue_task_by_id', { projectId, taskId });
   },
 
-  async processMergeCandidate(projectId: string, item: MergeQueueItem): Promise<IntegrationAttempt> {
-    return await invoke('process_merge_candidate', { projectId, item });
+  async processMergeById(projectId: string, queueItemId: string): Promise<IntegrationAttempt> {
+    return await invoke('process_merge_by_id', { projectId, queueItemId });
   },
 
   async getEventsAfter(lastSequence: number): Promise<EventItem[]> {
@@ -172,7 +138,7 @@ export const coordinatorApi = {
     return await invoke('register_agent', { name, agentType });
   },
 
-  async getTaskDetails(taskId: string): Promise<import('../types').TaskDetails> {
+  async getTaskDetails(taskId: string): Promise<TaskDetails> {
     return await invoke('get_task_details', { taskId });
   },
 
@@ -184,10 +150,6 @@ export const coordinatorApi = {
     return await invoke('create_example_project', { rootDir });
   },
 
-  async processMergeById(projectId: string, queueItemId: string): Promise<IntegrationAttempt> {
-    return await invoke('process_merge_by_id', { projectId, queueItemId });
-  },
-
   async satisfyAcceptanceCriterion(taskId: string, criterionId: string, evidence?: string): Promise<void> {
     return await invoke('satisfy_acceptance_criterion', { taskId, criterionId, evidence });
   },
@@ -196,4 +158,52 @@ export const coordinatorApi = {
     if (!isTauri) return [];
     return await invoke('list_agents');
   },
+
+  async listAllMasterplans(): Promise<import('../types').MasterplanSummary[]> {
+    if (!isTauri) return [];
+    return await invoke('list_all_masterplans');
+  },
+
+  async saveMasterplan(
+    projectId: string,
+    rawText: string,
+    targetStepCount: number = 20,
+    maxStepsPerAgent: number = 4
+  ): Promise<import('../types').Masterplan> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('create_or_update_masterplan', {
+      projectId,
+      rawText,
+      targetStepCount,
+      maxStepsPerAgent,
+    });
+  },
+
+  async prepareMasterplan(
+    projectId: string,
+    rawText: string,
+    targetStepCount: number = 20,
+    maxStepsPerAgent: number = 4
+  ): Promise<import('../types').PreparedMasterplanSnapshot> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('prepare_masterplan', {
+      projectId,
+      rawText,
+      targetStepCount,
+      maxStepsPerAgent,
+    });
+  },
+
+  async getCurrentContext(agentId?: string, projectId?: string): Promise<import('../types').CurrentContext> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('get_current_context', { agentId, projectId });
+  },
 };
+
+

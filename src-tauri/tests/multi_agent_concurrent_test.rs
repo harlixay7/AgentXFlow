@@ -164,7 +164,7 @@ async fn test_multi_agent_concurrent_collaboration_and_merge() {
     for tid in [&t1.id, &t2.id, &t3.id] {
         let step_ids = get_task_step_ids(tid);
         for step_id in step_ids {
-            let s = coordinator.complete_step(&step_id, Some(r#"{"stdout": "check ok", "exit_code": 0}"#)).unwrap();
+            let s = coordinator.complete_step(&step_id, None, Some(r#"{"stdout": "check ok", "exit_code": 0}"#)).unwrap();
             assert_eq!(s.status, "COMPLETED");
         }
         let details = coordinator.get_task_details(tid).unwrap();

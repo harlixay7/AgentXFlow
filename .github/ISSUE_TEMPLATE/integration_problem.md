@@ -24,7 +24,7 @@ Please share your MCP configuration snippet (e.g. from `.cursor/mcp.json`, `clau
 What happens when the agent attempts to connect or execute MCP tool calls?
 
 ### Expected Behavior
-What should happen according to the MCP 2026-07-28 specification?
+What should happen according to the Model Context Protocol (MCP) specification?
 
 ### Diagnostics
 Paste the MCP server response or error code (e.g., 401, 403, JSON-RPC error):

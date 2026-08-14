@@ -5,6 +5,8 @@ pub enum TaskState {
     Backlog,
     Ready,
     Running,
+    Verifying,
+    Verified,
     Blocked,
     Review,
     MergeReady,
@@ -19,6 +21,8 @@ impl TaskState {
             TaskState::Backlog => "BACKLOG",
             TaskState::Ready => "READY",
             TaskState::Running => "RUNNING",
+            TaskState::Verifying => "VERIFYING",
+            TaskState::Verified => "VERIFIED",
             TaskState::Blocked => "BLOCKED",
             TaskState::Review => "REVIEW",
             TaskState::MergeReady => "MERGE_READY",
@@ -33,6 +37,8 @@ impl TaskState {
             "BACKLOG" => TaskState::Backlog,
             "READY" => TaskState::Ready,
             "RUNNING" | "WORKING" | "CLAIMED" | "ANALYZING" | "SCOPE_APPROVED" => TaskState::Running,
+            "VERIFYING" => TaskState::Verifying,
+            "VERIFIED" => TaskState::Verified,
             "BLOCKED" => TaskState::Blocked,
             "REVIEW" => TaskState::Review,
             "MERGE_READY" => TaskState::MergeReady,
@@ -47,11 +53,19 @@ impl TaskState {
         match (self, next) {
             (TaskState::Backlog, TaskState::Ready) => true,
             (TaskState::Ready, TaskState::Running) => true,
+            (TaskState::Running, TaskState::Verifying) => true,
+            (TaskState::Verifying, TaskState::Verified) => true,
+            (TaskState::Verified, TaskState::MergeReady) => true,
             (TaskState::Running, TaskState::Review) => true,
+            (TaskState::Running, TaskState::MergeReady) => true,
             (TaskState::Review, TaskState::MergeReady) => true,
             (TaskState::Review, TaskState::Running) => true, // Re-work
             (TaskState::MergeReady, TaskState::Done) => true,
             (TaskState::MergeReady, TaskState::Blocked) => true, // Conflict
+            (TaskState::Verifying, TaskState::Failed) => true,
+            (TaskState::Verifying, TaskState::Blocked) => true,
+            (TaskState::Failed, TaskState::Running) => true, // Retry
+            (TaskState::Failed, TaskState::Ready) => true,
             (TaskState::Blocked, TaskState::Ready) => true,
             (TaskState::Blocked, TaskState::Running) => true,
             (_, TaskState::Blocked) => true,
@@ -166,6 +180,9 @@ pub struct Task {
     pub branch_name: Option<String>,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    pub masterplan_id: Option<String>,
+    pub masterplan_revision_id: Option<String>,
+    pub is_stale: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -177,20 +194,6 @@ pub struct TaskDependency {
     pub depends_on_task_id: String,
     pub dependency_type: String, // BLOCKS, RELATED_TO, PARENT_CHILD
     pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskAttempt {
-    pub id: String,
-    pub task_id: String,
-    pub agent_id: String,
-    pub run_number: i32,
-    pub base_sha: String,
-    pub head_sha: Option<String>,
-    pub worktree_path: String,
-    pub started_at: String,
-    pub finished_at: Option<String>,
-    pub status: String, // RUNNING, COMPLETED, FAILED, CANCELLED
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,15 +357,6 @@ pub struct WorktreeRecord {
     pub is_integration: bool,
     pub is_healthy: bool,
     pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerificationProfile {
-    pub id: String,
-    pub project_id: String,
-    pub name: String,
-    pub checks_json: String,
-    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,6 +537,63 @@ pub struct EvidenceRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAttempt {
+    pub id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub attempt_number: i32,
+    pub base_sha: String,
+    pub head_sha: Option<String>,
+    pub status: String, // ACTIVE, VERIFYING, VERIFIED, FAILED, ABORTED, SUPERSEDED
+    pub rejection_reasons: Option<String>, // JSON array of reasons
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorResult {
+    pub id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub criterion_id: Option<String>,
+    pub evaluator_name: String,
+    pub evaluator_type: String, // COMMAND, SCOPE_AUDIT, TEST, LINT, BUILD, ACCEPTANCE
+    pub evaluator_version: String,
+    pub commit_sha: String,
+    pub exit_code: i32,
+    pub stdout_output: String,
+    pub stderr_output: String,
+    pub output_sha256: String,
+    pub duration_ms: i64,
+    pub passed: bool,
+    pub evaluated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationProfile {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: Option<String>,
+    pub check_type: String, // FORMAT, TYPECHECK, UNIT_TESTS, INTEGRATION_TESTS, BUILD, SCOPE_AUDIT, ACCEPTANCE
+    pub command: String,
+    pub args_json: String,
+    pub timeout_secs: i32,
+    pub required: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedMasterplanSnapshot {
+    pub masterplan: Masterplan,
+    pub steps: Vec<MasterplanStep>,
+    pub total_steps: usize,
+    pub target_step_count: i32,
+    pub max_steps_per_agent: i32,
+    pub handoff_prompt: String,
+    pub next_action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDetails {
     pub task: Task,
     pub steps: Vec<TaskStep>,
@@ -554,5 +605,48 @@ pub struct TaskDetails {
     pub evidence_records: Vec<EvidenceRecord>,
     pub proof_bundle: Option<ProofBundle>,
     pub assigned_agent: Option<Agent>,
+    pub active_attempt: Option<TaskAttempt>,
+    pub evaluator_results: Vec<EvaluatorResult>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MasterplanSummary {
+    pub project_id: String,
+    pub project_name: String,
+    pub repository_path: String,
+    pub masterplan_id: String,
+    pub status: String,
+    pub target_step_count: i32,
+    pub max_steps_per_agent: i32,
+    pub total_steps: usize,
+    pub pending_steps: usize,
+    pub claimed_steps: usize,
+    pub completed_steps: usize,
+    pub last_updated: String,
+    pub next_action: String,
+    pub handoff_prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentContext {
+    pub active_project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub repository_path: Option<String>,
+    pub masterplan_id: Option<String>,
+    pub masterplan_status: Option<String>,
+    pub masterplan_revision: Option<i32>,
+    pub caller_agent_id: Option<String>,
+    pub active_task_id: Option<String>,
+    pub active_attempt_id: Option<String>,
+    pub active_scopes: Vec<String>,
+    pub current_state: Option<String>,
+    pub last_updated: Option<String>,
+    pub next_recommended_action: String,
+    pub handoff_prompt: String,
+    pub active_agents_count: usize,
+    pub pending_tasks_count: usize,
+    pub instructions: String,
+}
+
+
 

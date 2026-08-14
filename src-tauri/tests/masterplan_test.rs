@@ -113,6 +113,28 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     assert_eq!(task1.assigned_agent_id, Some(agent1.id.clone()));
     assert!(task1.worktree_path.is_some());
 
+    // 4b. Hostile Invariant Verification: An agent attempts to re-decompose the masterplan
+    // while Agent 1 has active claims. This MUST be rejected to prevent claim wiping.
+    let hostile_decompose = engine.decompose_masterplan(
+        proj_id,
+        vec![DecomposedStepInput {
+            step_index: 1,
+            title: "Hostile Overwrite".to_string(),
+            description: "Attempt to wipe claims".to_string(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        }],
+    );
+    assert!(hostile_decompose.is_err(), "Re-decomposition must be blocked when steps are claimed");
+    let err_msg = hostile_decompose.unwrap_err();
+    assert!(err_msg.contains("Cannot re-decompose masterplan") || err_msg.contains("actively claimed"));
+
+    // Verify Agent 1's claims are completely intact
+    let active_steps = engine.list_masterplan_steps(proj_id).unwrap();
+    assert_eq!(active_steps.len(), 12);
+    assert_eq!(active_steps[0].status, "CLAIMED");
+    assert_eq!(active_steps[0].claimed_agent_id, Some(agent1.id.clone()));
+
     // 5. Agent 2 Claims Chunk 2 with Anti-Hoarding Cap (requests 10, should get max 4 -> Steps 5 to 8)
     let task2 = engine
         .claim_masterplan_chunk(proj_id, &agent2.id, Some(10))
@@ -144,4 +166,19 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     // 8. Attempting to claim further should return clean error
     let no_more = engine.claim_masterplan_chunk(proj_id, &agent1.id, Some(4));
     assert!(no_more.is_err());
+
+    // 9. Verify Agent Registration Idempotency: Re-registering with the same name returns identical agent_id
+    let re_agent1 = engine.register_agent("Antigravity-Lead", "Antigravity").unwrap();
+    assert_eq!(re_agent1.id, agent1.id);
+    assert_eq!(re_agent1.session_token, agent1.session_token);
+
+    // 10. Verify Masterplan Reset: Executes cleanly without deadlock, clearing all steps and plan
+    let reset_res = engine.reset_masterplan(proj_id);
+    assert!(reset_res.is_ok(), "Resetting masterplan must succeed without deadlock: {:?}", reset_res.err());
+
+    let plan_after_reset = engine.get_masterplan(proj_id).unwrap();
+    assert!(plan_after_reset.is_none());
+
+    let steps_after_reset = engine.list_masterplan_steps(proj_id).unwrap();
+    assert_eq!(steps_after_reset.len(), 0);
 }

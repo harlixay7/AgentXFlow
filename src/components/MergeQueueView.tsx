@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { MergeQueueItem } from '../types';
-import { Play, RefreshCw, GitMerge, CheckCircle2 } from 'lucide-react';
+import { Play, RefreshCw, GitMerge, CheckCircle2, AlertCircle } from 'lucide-react';
 import { coordinatorApi } from '../api/coordinator';
 
 interface MergeQueueViewProps {
@@ -10,23 +10,34 @@ interface MergeQueueViewProps {
 }
 
 export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId, onRefresh }) => {
+  const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
   const handleProcess = async (item: MergeQueueItem) => {
+    setFeedback(null);
     try {
-      const attempt = await coordinatorApi.processMergeCandidate(projectId, item);
+      const attempt = await coordinatorApi.processMergeById(projectId, item.id);
       if (attempt.simulation_passed) {
-        alert('Merge successfully executed in dedicated hidden worktree (.agentxflow/integration/) and committed to main branch!');
+        setFeedback({
+          message: `Task "${item.task_id}" successfully merged in disposable integration worktree and committed to ${item.target_branch}!`,
+          type: 'success',
+        });
       } else {
-        alert(`Merge conflict detected:\n${attempt.conflicts_json || 'Unknown conflict'}`);
+        setFeedback({
+          message: `Merge conflict or verification failure for task "${item.task_id}": ${attempt.conflicts_json || 'Post-merge checks failed'}`,
+          type: 'error',
+        });
       }
       onRefresh();
     } catch (e: any) {
-      alert(e.toString());
+      setFeedback({
+        message: `Integration error: ${e.toString()}`,
+        type: 'error',
+      });
     }
   };
 
   return (
     <div style={{ flex: 1, padding: 20, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* Header with Plain English Explanation */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: '1px solid var(--border-medium)', paddingBottom: 14 }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -34,7 +45,7 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
             <h2 style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--font-mono)' }}>Serialized Merge Queue</h2>
           </div>
           <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4, maxWidth: 700, lineHeight: 1.5 }}>
-            <strong>How it works:</strong> Merge operations are simulated one-by-one inside an isolated worktree (<code style={{ fontFamily: 'var(--font-mono)' }}>.agentxflow/integration/</code>). Merges <strong>never touch your working root directory</strong>. If tests pass and there are no conflicts, the change is committed into <code>main</code>.
+            Verified candidate branches integrated sequentially via isolated integration worktrees and atomic CAS ref updates.
           </p>
         </div>
         <button
@@ -45,6 +56,25 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
           <RefreshCw size={12} /> Refresh Queue
         </button>
       </div>
+
+      {feedback && (
+        <div
+          style={{
+            padding: '10px 14px',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
+            color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+          }}
+        >
+          {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+          <span style={{ userSelect: 'text' }}>{feedback.message}</span>
+        </div>
+      )}
 
       {queue.length === 0 ? (
         <div style={{ padding: 40, textAlign: 'center', backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)', color: 'var(--text-muted)', fontSize: 12 }}>
@@ -69,17 +99,18 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
             >
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                  <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--accent-blue)' }}>#{item.position}</span>
+                  <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--accent-blue)', userSelect: 'text' }}>#{item.position}</span>
                   <span
                     className={`badge ${item.status === 'READY' ? 'badge-READY' : item.status === 'MERGED' ? 'badge-DONE' : 'badge-BLOCKED'}`}
                     title={`Candidate merge status: ${item.status}`}
                   >
                     {item.status}
                   </span>
-                  <span style={{ fontWeight: 600, fontFamily: 'var(--font-mono)' }}>Task ID: {item.task_id}</span>
+                  <span style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', userSelect: 'text' }}>Task ID: {item.task_id}</span>
                 </div>
-                <div style={{ fontSize: 11, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', userSelect: 'text' }}>
                   Branch: <span style={{ color: 'var(--accent-blue)' }}>{item.branch_name}</span> → Target: <span style={{ color: 'var(--accent-green)' }}>{item.target_branch}</span>
+                  <span style={{ marginLeft: 12, color: 'var(--text-muted)' }}>HEAD: {item.head_sha ? item.head_sha.substring(0, 8) : 'N/A'}</span>
                 </div>
               </div>
 
@@ -87,7 +118,7 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
                 <button
                   className="btn btn-primary"
                   onClick={() => handleProcess(item)}
-                  title="Execute background test-merge and commit to main branch"
+                  title="Execute background test-merge and CAS commit to target branch"
                 >
                   <Play size={12} /> Process Integration
                 </button>
