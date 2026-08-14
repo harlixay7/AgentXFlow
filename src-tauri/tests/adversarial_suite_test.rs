@@ -1,7 +1,7 @@
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::mcp::McpServer;
-use agent_x_flow_lib::models::{DecomposedStepInput, TaskState, TaskSubstate};
+use agent_x_flow_lib::models::DecomposedStepInput;
 use agent_x_flow_lib::security::SecurityManager;
 use serde_json::json;
 use std::path::PathBuf;
@@ -112,35 +112,87 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     let task1 = coordinator.create_task(&proj.id, "Task 1", "Work on auth", "HIGH", vec![("Step 1".into(), "Do work".into(), true)], vec!["Done".into()]).unwrap();
     let task2 = coordinator.create_task(&proj.id, "Task 2", "Work on db", "HIGH", vec![("Step 1".into(), "Do work".into(), true)], vec!["Done".into()]).unwrap();
 
-    // Test 7: Two agents claim same task simultaneously -> exactly one wins
-    let claimed_a = coordinator.claim_task(&task1.id, &agent_a.id);
-    assert!(claimed_a.is_ok());
+    // Test 7: True parallel concurrency - Two agents claim same task simultaneously -> exactly one wins
+    let barrier_claim = Arc::new(tokio::sync::Barrier::new(2));
+    let coord_c1 = coordinator.clone();
+    let coord_c2 = coordinator.clone();
+    let b1 = barrier_claim.clone();
+    let b2 = barrier_claim.clone();
+    let t1_id1 = task1.id.clone();
+    let t1_id2 = task1.id.clone();
+    let a1_id = agent_a.id.clone();
+    let a2_id = agent_b.id.clone();
 
-    let claimed_b = coordinator.claim_task(&task1.id, &agent_b.id);
-    assert!(claimed_b.is_err(), "Agent B should be rejected from claiming already-claimed task");
-    println!("   ✔ Test 7 PASS: Concurrent claim race - Agent A won, Agent B cleanly rejected");
+    let h1 = tokio::spawn(async move {
+        b1.wait().await;
+        coord_c1.claim_task(&t1_id1, &a1_id)
+    });
+    let h2 = tokio::spawn(async move {
+        b2.wait().await;
+        coord_c2.claim_task(&t1_id2, &a2_id)
+    });
 
-    // Test 8: Two agents request same exclusive scope simultaneously -> exactly one wins
-    let scope_a = coordinator.scope.acquire_scope(&task1.id, &agent_a.id, vec!["src/auth/**".into()], "EXCLUSIVE_WRITE");
-    assert!(scope_a.is_ok());
+    let (res_claim1, res_claim2) = tokio::join!(h1, h2);
+    let claim1_ok = res_claim1.unwrap().is_ok();
+    let claim2_ok = res_claim2.unwrap().is_ok();
 
-    let scope_b_overlap = coordinator.scope.acquire_scope(&task2.id, &agent_b.id, vec!["src/auth/**".into()], "EXCLUSIVE_WRITE");
-    assert!(scope_b_overlap.is_err(), "Agent B should be rejected due to scope collision");
-    println!("   ✔ Test 8 PASS: Conflicting exclusive scope request rejected with collision error");
+    assert!(
+        (claim1_ok && !claim2_ok) || (!claim1_ok && claim2_ok),
+        "Exactly one concurrent claim must succeed. (Claim1: {}, Claim2: {})",
+        claim1_ok,
+        claim2_ok
+    );
+    println!("   ✔ Test 7 PASS: True parallel Barrier concurrency race - exactly one agent won");
 
-    // Test 9: Two agents request non-overlapping scopes -> both succeed
-    let scope_b_non_overlap = coordinator.scope.acquire_scope(&task2.id, &agent_b.id, vec!["src/db/**".into()], "EXCLUSIVE_WRITE");
-    assert!(scope_b_non_overlap.is_ok());
+    // Test 8: True parallel concurrency - Two agents request conflicting exclusive scopes -> exactly one wins
+    let barrier_scope = Arc::new(tokio::sync::Barrier::new(2));
+    let coord_s1 = coordinator.clone();
+    let coord_s2 = coordinator.clone();
+    let sb1 = barrier_scope.clone();
+    let sb2 = barrier_scope.clone();
+    let st1_id = task1.id.clone();
+    let t2_id = task2.id.clone();
+    let a_id = agent_a.id.clone();
+    let b_id = agent_b.id.clone();
+
+    let sh1 = tokio::spawn(async move {
+        sb1.wait().await;
+        coord_s1.scope.acquire_scope(&st1_id, &a_id, vec!["src/auth/**".into()], "EXCLUSIVE_WRITE")
+    });
+    let sh2 = tokio::spawn(async move {
+        sb2.wait().await;
+        coord_s2.scope.acquire_scope(&t2_id, &b_id, vec!["src/auth/**".into()], "EXCLUSIVE_WRITE")
+    });
+
+    let (res_scope1, res_scope2) = tokio::join!(sh1, sh2);
+    let scope1_ok = res_scope1.unwrap().is_ok();
+    let scope2_ok = res_scope2.unwrap().is_ok();
+
+    assert!(
+        (scope1_ok && !scope2_ok) || (!scope1_ok && scope2_ok),
+        "Exactly one concurrent conflicting scope request must succeed. (Scope1: {}, Scope2: {})",
+        scope1_ok,
+        scope2_ok
+    );
+    println!("   ✔ Test 8 PASS: True parallel Barrier concurrency scope race - collision rejected");
+
+    // Test 9: Non-overlapping scopes -> both succeed
+    let non_overlap_res = coordinator.scope.acquire_scope(&task2.id, &agent_b.id, vec!["src/db/**".into()], "EXCLUSIVE_WRITE");
+    assert!(non_overlap_res.is_ok());
     println!("   ✔ Test 9 PASS: Non-overlapping scopes granted successfully to both agents");
 
     // Test 10, 11, 12: Cross-agent tampering rejections
-    // Test 12: Agent B submits Agent A's task -> rejected
-    let tamper_submit = coordinator.submit_task(&task1.id, &agent_b.id);
-    assert!(tamper_submit.is_err(), "Agent B must not be able to submit Agent A's task");
-    println!("   ✔ Test 12 PASS: Agent B blocked from submitting Agent A's task");
+    let task1_claimed = coordinator.get_task(&task1.id).unwrap();
+    let winner_id = task1_claimed.assigned_agent_id.clone().expect("Task 1 must have an assigned agent");
+    let non_owner_id = if winner_id == agent_a.id { agent_b.id.clone() } else { agent_a.id.clone() };
+
+    // Test 12: Non-owner submits task -> rejected
+    let tamper_submit = coordinator.submit_task(&task1.id, &non_owner_id);
+    assert!(tamper_submit.is_err(), "Non-owner agent must not be able to submit task");
+    println!("   ✔ Test 12 PASS: Non-owner agent blocked from submitting another agent's task");
 
     // Test 13: Scope violation - Unreserved file edit detected on submission
-    let worktree_dir = PathBuf::from(claimed_a.unwrap().worktree_path.unwrap());
+    let worktree_dir = PathBuf::from(task1_claimed.worktree_path.expect("Task must have worktree_path"));
     let out_of_scope_file = worktree_dir.join("src").join("unlocked_service.rs");
     std::fs::create_dir_all(out_of_scope_file.parent().unwrap()).ok();
     std::fs::write(&out_of_scope_file, "// Unreserved modification\n").unwrap();
@@ -151,7 +203,7 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
 
     // Audit mutations
     let mutations = coordinator.git.get_worktree_mutations(&worktree_dir, "main").unwrap();
-    let violations = coordinator.scope.audit_actual_mutations(&task1.id, &agent_a.id, &mutations).unwrap();
+    let violations = coordinator.scope.audit_actual_mutations(&task1.id, &winner_id, &mutations).unwrap();
     assert!(!violations.is_empty(), "Unreserved mutation must trigger a ScopeViolation");
     println!("   ✔ Test 13 PASS: Unreserved committed file detected and flagged as scope violation");
 

@@ -74,10 +74,8 @@ impl DagEngine {
             .map_err(|e| e.to_string())?;
 
         let mut res = Vec::new();
-        for r in rows {
-            if let Ok(dep) = r {
-                res.push(dep);
-            }
+        for dep in rows.flatten() {
+            res.push(dep);
         }
         Ok(res)
     }
@@ -93,11 +91,9 @@ impl DagEngine {
             .query_map([task_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
 
-        for r in rows {
-            if let Ok(state_str) = r {
-                if state_str != "DONE" {
-                    return Ok(false);
-                }
+        for state_str in rows.flatten() {
+            if state_str != "DONE" {
+                return Ok(false);
             }
         }
 
@@ -116,10 +112,8 @@ impl DagEngine {
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
             .map_err(|e| e.to_string())?;
 
-        for r in rows {
-            if let Ok((u, v)) = r {
-                adj.entry(u).or_default().push(v);
-            }
+        for (u, v) in rows.flatten() {
+            adj.entry(u).or_default().push(v);
         }
 
         // Add hypothetical edge: task_id -> depends_on_task_id

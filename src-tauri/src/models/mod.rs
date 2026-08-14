@@ -259,6 +259,8 @@ pub struct Agent {
     pub capabilities: AgentCapabilitySet,
     pub last_heartbeat: String,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,10 +292,10 @@ pub struct AgentRun {
 pub struct AgentSession {
     pub id: String,
     pub agent_id: String,
-    pub task_id: Option<String>,
-    pub token: String,
-    pub connected_at: String,
+    pub session_token: String,
+    pub created_at: String,
     pub expires_at: String,
+    pub last_activity_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

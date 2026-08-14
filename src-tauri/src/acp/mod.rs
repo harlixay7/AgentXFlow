@@ -51,7 +51,7 @@ impl AcpRuntime {
             let check_cmd = format!("which {}", bin);
 
             let is_installed = std::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
-                .args(&[if cfg!(target_os = "windows") { "/c" } else { "-c" }, &check_cmd])
+                .args([if cfg!(target_os = "windows") { "/c" } else { "-c" }, &check_cmd])
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
@@ -97,12 +97,14 @@ impl AcpRuntime {
             completion_tokens: 0,
         };
 
-        let conn = self.db.lock();
-        conn.execute(
-            "INSERT INTO agent_runs (id, task_id, agent_id, parent_run_id, role, prompt, status, started_at, prompt_tokens, completion_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ACTIVE', ?7, 0, 0)",
-            rusqlite::params![run.id, run.task_id, run.agent_id, run.parent_run_id, run.role, run.prompt, run.started_at],
-        ).map_err(|e| e.to_string())?;
+        {
+            let conn = self.db.lock();
+            conn.execute(
+                "INSERT INTO agent_runs (id, task_id, agent_id, parent_run_id, role, prompt, status, started_at, prompt_tokens, completion_tokens)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ACTIVE', ?7, 0, 0)",
+                rusqlite::params![run.id, run.task_id, run.agent_id, run.parent_run_id, run.role, run.prompt, run.started_at],
+            ).map_err(|e| e.to_string())?;
+        }
 
         let mut lock = self.active_sessions.lock().await;
         lock.insert(run_id.clone(), agent_id.to_string());

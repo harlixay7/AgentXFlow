@@ -188,6 +188,10 @@ export const coordinatorApi = {
     return await invoke('process_merge_by_id', { projectId, queueItemId });
   },
 
+  async satisfyAcceptanceCriterion(taskId: string, criterionId: string, evidence?: string): Promise<void> {
+    return await invoke('satisfy_acceptance_criterion', { taskId, criterionId, evidence });
+  },
+
   async listAgents(): Promise<Agent[]> {
     if (!isTauri) return [];
     return await invoke('list_agents');

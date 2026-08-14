@@ -127,20 +127,20 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
     }
   };
 
-  const handleSimulateDecomposition = async () => {
+  const handleParseStructuredSteps = async () => {
     if (!rawText.trim()) return;
-    const lines = rawText.split('\n').filter((l) => l.trim().length > 0);
-    const count = Math.max(lines.length, targetStepCount);
+    const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('#'));
+    if (lines.length === 0) return;
 
-    const generatedSteps = Array.from({ length: Math.min(count, targetStepCount) }, (_, i) => {
+    const generatedSteps = lines.slice(0, targetStepCount).map((line, i) => {
       const idx = i + 1;
-      const sampleTitle = lines[i] ? lines[i].replace(/^[0-9]+[.)\- ]+/, '').trim() : `Execution Step ${idx}`;
+      const cleanTitle = line.replace(/^[0-9]+[.)\- ]+/, '').trim();
       return {
         step_index: idx,
-        title: sampleTitle.slice(0, 70),
-        description: `Execute required sub-spec specifications for step #${idx}:\n${lines[i] || 'Perform atomic verified implementation changes.'}`,
-        suggested_scope: idx <= 4 ? 'src/db/**, src/models/**' : idx <= 8 ? 'src/services/**, src/api/**' : 'src/ui/**, src/components/**',
-        acceptance_criteria: `Automated unit tests and proof bundle verification pass for Step #${idx}.`,
+        title: cleanTitle.slice(0, 80),
+        description: `Execute specifications for: ${cleanTitle}`,
+        suggested_scope: '',
+        acceptance_criteria: `Automated test verification and criteria satisfied for Step #${idx}.`,
       };
     });
 
@@ -396,11 +396,11 @@ Example:
               <button
                 className="btn btn-secondary"
                 style={{ fontSize: 11, height: 30 }}
-                onClick={handleSimulateDecomposition}
+                onClick={handleParseStructuredSteps}
                 disabled={!rawText.trim()}
-                title="Simulate autonomous AI decomposition directly inside the UI"
+                title="Parse masterplan lines into structured steps"
               >
-                <Sparkles size={12} /> Auto-Decompose (UI Sim)
+                <Sparkles size={12} /> Parse Steps
               </button>
 
               <button

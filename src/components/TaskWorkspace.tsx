@@ -62,6 +62,19 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
     }
   };
 
+  const handleSatisfyCriterion = async (criterionId: string) => {
+    setLoading(true);
+    try {
+      await coordinatorApi.satisfyAcceptanceCriterion(currentTask.id, criterionId, 'Manual User Review Sign-off');
+      await fetchDetails();
+      onRefresh();
+    } catch (e: any) {
+      alert(e.toString());
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleScope = async () => {
     const agentId = currentTask.assigned_agent_id || activeAgentId;
     if (!agentId) return;
@@ -196,7 +209,21 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
                     <div key={c.id} style={{ padding: '8px 10px', backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
                       <CheckSquare size={13} style={{ color: c.is_satisfied ? 'var(--accent-green)' : 'var(--text-muted)' }} />
                       <span style={{ flex: 1, color: c.is_satisfied ? 'var(--text-primary)' : 'var(--text-secondary)' }}>{c.criterion}</span>
-                      <span className={`badge ${c.is_satisfied ? 'badge-DONE' : 'badge-BACKLOG'}`}>{c.is_satisfied ? 'Satisfied' : 'Pending'}</span>
+                      {c.is_satisfied ? (
+                        <span className="badge badge-DONE">Satisfied</span>
+                      ) : (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span className="badge badge-BACKLOG">Pending</span>
+                          <button
+                            className="btn btn-sm"
+                            style={{ fontSize: 10, padding: '2px 8px', height: 'auto', backgroundColor: 'var(--bg-card)' }}
+                            onClick={() => handleSatisfyCriterion(c.id)}
+                            title="Sign-off on this criterion"
+                          >
+                            Sign-off
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

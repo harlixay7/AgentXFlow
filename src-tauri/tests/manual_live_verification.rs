@@ -1,10 +1,9 @@
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::mcp::McpServer;
-use agent_x_flow_lib::models::DecomposedStepInput;
 use agent_x_flow_lib::security::SecurityManager;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -43,6 +42,9 @@ fn create_real_git_project() -> PathBuf {
         &cargo_toml,
         "[package]\nname = \"live_test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     ).unwrap();
+
+    let gitignore = repo_dir.join(".gitignore");
+    std::fs::write(&gitignore, "target/\nCargo.lock\n").unwrap();
 
     run_cmd(&["add", "."]);
     run_cmd(&["commit", "-m", "Initial baseline commit"]);
@@ -200,7 +202,7 @@ async fn test_manual_live_end_to_end_system() {
             "jsonrpc": "2.0",
             "id": 8,
             "method": "scope_acquire",
-            "params": { "task_id": task.id, "agent_id": agent_a_id, "patterns": ["src/auth/**"] }
+            "params": { "task_id": task.id, "agent_id": agent_a_id, "patterns": ["src/auth/**", "src/lib.rs"] }
         }))
         .send().await.unwrap();
     assert_eq!(scope_resp.status(), reqwest::StatusCode::OK);
@@ -229,6 +231,10 @@ async fn test_manual_live_end_to_end_system() {
         auth_dir.join("session.rs"),
         "pub struct Session { pub id: String, pub valid: bool }\nimpl Session { pub fn is_active(&self) -> bool { self.valid } }\n\n#[test]\nfn test_session() { let s = Session { id: \"s1\".into(), valid: true }; assert!(s.is_active()); }\n",
     ).unwrap();
+    std::fs::write(
+        worktree_path.join("src").join("lib.rs"),
+        "pub mod auth { pub mod session; }\npub fn core_logic() -> bool { true }\n",
+    ).unwrap();
 
     // Commit changes in task worktree
     Command::new("git").args(&["add", "."]).current_dir(&worktree_path).output().unwrap();
@@ -252,9 +258,21 @@ async fn test_manual_live_end_to_end_system() {
             .send().await.unwrap();
         assert_eq!(step_resp.status(), reqwest::StatusCode::OK);
     }
-    // Satisfy acceptance criteria
-    coordinator.db.lock().execute("UPDATE acceptance_criteria SET is_satisfied = 1 WHERE task_id = ?1", [&task.id]).unwrap();
-    println!("16. Completed all execution steps with recorded evidence and satisfied acceptance criteria");
+    // Satisfy acceptance criteria through authoritative workflow API
+    for crit in &details_before.criteria {
+        coordinator.satisfy_acceptance_criterion(&task.id, &crit.id, Some("Manual verification sign-off")).unwrap();
+    }
+    // Execute real coordinator verification check in the worktree against HEAD
+    let task_head = coordinator.git.get_worktree_head_sha(&worktree_path).unwrap();
+    coordinator.verify.execute_check(
+        &task.id,
+        "chk-auth",
+        "Cargo Unit Tests",
+        &worktree_path,
+        &task_head,
+        "cargo test",
+    ).unwrap();
+    println!("16. Completed all execution steps with recorded evidence, satisfied acceptance criteria, and executed coordinator verification");
 
     // 17. Submit Task to Authoritative Verification Gate
     let submit_resp = client.post(format!("{}/mcp", base_url))
@@ -267,14 +285,15 @@ async fn test_manual_live_end_to_end_system() {
         }))
         .send().await.unwrap();
     let submit_json: serde_json::Value = submit_resp.json().await.unwrap();
-    assert_eq!(submit_json["result"]["is_valid"], true);
+    println!("submit_json: {:?}", submit_json);
+    assert_eq!(submit_json["result"]["is_valid"], true, "Submission rejected: {:?}", submit_json["result"]["rejection_reasons"]);
     println!("17. Task verified and approved by Coordinator Verification Gate! (State moved to REVIEW)");
 
     // 18. Inspect Task Details Aggregation Query (Used by Frontend Task Workspace)
     let final_details = coordinator.get_task_details(&task.id).unwrap();
     assert_eq!(final_details.steps.len(), 2);
     assert_eq!(final_details.criteria.len(), 1);
-    assert_eq!(final_details.leases.len(), 1);
+    assert_eq!(final_details.leases.len(), 2);
     assert!(final_details.proof_bundle.is_some(), "Proof bundle must be generated and sealed");
     let bundle = final_details.proof_bundle.unwrap();
     println!("18. Inspected TaskDetails & Proof Bundle: SHA-256 Digest = [{}...{}]", &bundle.proof_hash[0..8], &bundle.proof_hash[bundle.proof_hash.len()-8..]);

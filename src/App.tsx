@@ -50,7 +50,7 @@ export function App() {
       try {
         const newEvents = await coordinatorApi.getEventsAfter(lastSeqRef.current);
         if (newEvents && newEvents.length > 0) {
-          setEvents((prev) => [...prev, ...newEvents]);
+          setEvents((prev) => [...prev, ...newEvents].slice(-300));
           const maxSeq = Math.max(...newEvents.map((e) => e.sequence));
           lastSeqRef.current = maxSeq;
           // Trigger targeted data refresh when meaningful events occur

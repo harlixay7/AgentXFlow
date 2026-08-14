@@ -167,10 +167,22 @@ async fn test_multi_agent_concurrent_collaboration_and_merge() {
             let s = coordinator.complete_step(&step_id, Some(r#"{"stdout": "check ok", "exit_code": 0}"#)).unwrap();
             assert_eq!(s.status, "COMPLETED");
         }
-        let conn = pool.lock();
-        conn.execute("UPDATE acceptance_criteria SET is_satisfied = 1 WHERE task_id = ?1", [tid]).unwrap();
+        let details = coordinator.get_task_details(tid).unwrap();
+        for crit in &details.criteria {
+            coordinator.satisfy_acceptance_criterion(tid, &crit.id, Some("Automated test pass")).unwrap();
+        }
+        let wt_path = std::path::PathBuf::from(details.task.worktree_path.unwrap());
+        let head = coordinator.git.get_worktree_head_sha(&wt_path).unwrap();
+        coordinator.verify.execute_check(
+            tid,
+            "chk-1",
+            "Unit Tests",
+            &wt_path,
+            &head,
+            "cmd /c exit 0",
+        ).unwrap();
     }
-    println!("   ✔ All mandatory steps marked COMPLETED and criteria satisfied.");
+    println!("   ✔ All mandatory steps marked COMPLETED, criteria satisfied, and coordinator checks passed.");
 
     // 7. Authoritative Task Submissions
     println!("\n▶ Step 6: Submitting Tasks to Authoritative Verification Engine...");

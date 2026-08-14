@@ -1,6 +1,6 @@
 use chrono::Utc;
 use std::path::Path;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::db::DbPool;
@@ -161,10 +161,37 @@ impl MergeEngine {
 
         match merge_res {
             Ok(_) => {
-                // 4. Run post-merge verification tests if configured in repo
-                let post_merge_passed = true;
+                // 4. Run real post-merge verification tests if configured
+                let mut post_merge_passed = true;
                 if integration_dir.join("Cargo.toml").exists() {
-                    let _ = self.git.run_git_cmd(&integration_dir, &["test"]);
+                    let out = std::process::Command::new("cargo")
+                        .args(["test"])
+                        .current_dir(&integration_dir)
+                        .output();
+                    if let Ok(res) = out {
+                        if !res.status.success() {
+                            post_merge_passed = false;
+                        }
+                    }
+                } else if integration_dir.join("package.json").exists() {
+                    let out = std::process::Command::new("npm")
+                        .args(["test"])
+                        .current_dir(&integration_dir)
+                        .output();
+                    if let Ok(res) = out {
+                        if !res.status.success() {
+                            post_merge_passed = false;
+                        }
+                    }
+                }
+
+                if !post_merge_passed {
+                    self.git.run_git_cmd(&integration_dir, &["merge", "--abort"]).ok();
+                    let conn = self.db.lock();
+                    conn.execute("UPDATE merge_queue SET status = 'FAILED_TESTS' WHERE id = ?1", [&item.id]).ok();
+                    conn.execute("UPDATE tasks SET state = 'BLOCKED', substate = 'NONE' WHERE id = ?1", [&item.task_id]).ok();
+                    self.git.remove_worktree(repo_path, &integration_dir).ok();
+                    return Err("Post-merge verification test suite failed in integration worktree. Integration aborted.".to_string());
                 }
 
                 // 5. Commit merge in integration worktree
@@ -177,25 +204,42 @@ impl MergeEngine {
                     self.git.run_git_cmd(&integration_dir, &["merge", "--abort"]).ok();
                     let conn = self.db.lock();
                     conn.execute("UPDATE merge_queue SET status = 'FAILED' WHERE id = ?1", [&item.id]).ok();
+                    self.git.remove_worktree(repo_path, &integration_dir).ok();
                     return Err(format!("Failed to commit merge in integration worktree: {}", commit_err));
                 }
 
-                // 6. Advance the real target branch ref to match integration commit
+                // 6. Advance the target branch ref atomically using Compare-and-Swap (CAS)
                 let integration_head = self.git.get_head_sha(&integration_dir)?;
-                self.git.run_git_cmd(repo_path, &["update-ref", &format!("refs/heads/{}", item.target_branch), &integration_head])?;
+                self.git.run_git_cmd(
+                    repo_path,
+                    &["update-ref", &format!("refs/heads/{}", item.target_branch), &integration_head, &target_sha_before],
+                )?;
+
+                // 7. Safely synchronize root working tree if target branch is currently checked out
+                if let Ok(current_branch) = self.git.get_current_branch(repo_path) {
+                    if current_branch == item.target_branch {
+                        if self.git.check_worktree_cleanliness(repo_path).is_ok() {
+                            self.git.run_git_cmd(repo_path, &["merge", "--ff-only", &integration_head]).ok();
+                        } else {
+                            warn!("User root repo has uncommitted edits on {}. Ref was advanced, working copy left untouched.", item.target_branch);
+                        }
+                    }
+                }
 
                 let target_sha_after = self.git.get_ref_sha(repo_path, &item.target_branch).ok();
 
                 let conn = self.db.lock();
                 conn.execute("UPDATE merge_queue SET status = 'MERGED', processed_at = ?1 WHERE id = ?2", [&now, &item.id]).ok();
                 conn.execute("UPDATE tasks SET state = 'DONE', substate = 'NONE', updated_at = ?1 WHERE id = ?2", [&now, &item.task_id]).ok();
+                // Complete associated masterplan steps
+                conn.execute("UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2", [&now, &item.task_id]).ok();
 
                 let attempt = IntegrationAttempt {
                     id: attempt_id,
                     merge_queue_id: item.id.clone(),
                     simulation_passed: true,
                     conflicts_json: None,
-                    post_merge_verification_passed: post_merge_passed,
+                    post_merge_verification_passed: true,
                     merge_strategy: "MERGE_COMMIT".to_string(),
                     target_sha_before,
                     target_sha_after,
@@ -207,6 +251,9 @@ impl MergeEngine {
                      VALUES (?1, ?2, 1, NULL, 1, 'MERGE_COMMIT', ?3, ?4, ?5)",
                     rusqlite::params![attempt.id, attempt.merge_queue_id, attempt.target_sha_before, attempt.target_sha_after, attempt.attempted_at],
                 ).ok();
+
+                // Clean up disposable integration worktree
+                self.git.remove_worktree(repo_path, &integration_dir).ok();
 
                 Ok(attempt)
             }
@@ -237,6 +284,9 @@ impl MergeEngine {
                      VALUES (?1, ?2, 0, ?3, 0, 'MERGE_COMMIT', ?4, NULL, ?5)",
                     rusqlite::params![attempt.id, attempt.merge_queue_id, attempt.conflicts_json, attempt.target_sha_before, attempt.attempted_at],
                 ).ok();
+
+                // Clean up disposable integration worktree
+                self.git.remove_worktree(repo_path, &integration_dir).ok();
 
                 Ok(attempt)
             }

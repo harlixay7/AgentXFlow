@@ -158,14 +158,14 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             permission_policy TEXT NOT NULL
         );
 
-        -- Agent Sessions
+        -- Authenticated Agent Sessions
         CREATE TABLE IF NOT EXISTS agent_sessions (
             id TEXT PRIMARY KEY,
             agent_id TEXT NOT NULL,
-            task_id TEXT,
-            token TEXT NOT NULL UNIQUE,
-            connected_at TEXT NOT NULL,
+            session_token TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
+            last_activity_at TEXT NOT NULL,
             FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
         );
 
@@ -393,6 +393,8 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_masterplans_project ON masterplans(project_id);
         CREATE INDEX IF NOT EXISTS idx_masterplan_steps_plan_idx ON masterplan_steps(masterplan_id, step_index);
         CREATE INDEX IF NOT EXISTS idx_evidence_records_task ON evidence_records(task_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_token ON agent_sessions(session_token);
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent ON agent_sessions(agent_id);
         "
     )?;
 

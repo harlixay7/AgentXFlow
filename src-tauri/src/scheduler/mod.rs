@@ -92,12 +92,10 @@ impl SchedulerEngine {
             .map_err(|e| e.to_string())?;
 
         let mut schedulable = Vec::new();
-        for t_res in tasks_iter {
-            if let Ok(task) = t_res {
-                // Check if dependencies are satisfied
-                if self.dag.are_dependencies_satisfied(&task.id)? {
-                    schedulable.push(task);
-                }
+        for task in tasks_iter.flatten() {
+            // Check if dependencies are satisfied
+            if self.dag.are_dependencies_satisfied(&task.id)? {
+                schedulable.push(task);
             }
         }
 

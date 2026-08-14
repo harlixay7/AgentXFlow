@@ -17,7 +17,7 @@ pub struct RepoInspectionResult {
     pub has_instruction_file: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GitService;
 
 impl GitService {

@@ -40,13 +40,13 @@ impl VerificationEngine {
 
         #[cfg(target_os = "windows")]
         let output_res = Command::new("cmd")
-            .args(&["/c", command_str])
+            .args(["/c", command_str])
             .current_dir(worktree_path)
             .output();
 
         #[cfg(not(target_os = "windows"))]
         let output_res = Command::new("sh")
-            .args(&["-c", command_str])
+            .args(["-c", command_str])
             .current_dir(worktree_path)
             .output();
 
@@ -190,8 +190,10 @@ impl VerificationEngine {
             })
             .map_err(|e| e.to_string())?;
 
+        let mut total_runs_count = 0;
         let mut failed_checks = Vec::new();
         for r in runs_iter.flatten() {
+            total_runs_count += 1;
             let (check_name, is_passed, is_stale) = r;
             if !is_passed || is_stale {
                 failed_checks.push(check_name);
@@ -199,6 +201,9 @@ impl VerificationEngine {
         }
 
         let mut rejection_reasons = Vec::new();
+        if total_runs_count == 0 {
+            rejection_reasons.push("UNVERIFIED: Zero coordinator verification checks were executed against submitted commit HEAD. At least one passing check is required.".to_string());
+        }
         for step in &missing_steps {
             rejection_reasons.push(format!("Mandatory step '{}' is not marked COMPLETED", step));
         }
@@ -225,6 +230,7 @@ impl VerificationEngine {
     }
 
     /// Generates a deterministic Verified Evidence Bundle with canonical SHA-256 digest
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_proof_bundle(
         &self,
         task_id: &str,

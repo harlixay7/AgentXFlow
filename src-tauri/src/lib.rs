@@ -201,6 +201,16 @@ fn enqueue_task_for_merge(
 }
 
 #[tauri::command]
+fn satisfy_acceptance_criterion(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+    criterion_id: String,
+    evidence: Option<String>,
+) -> Result<(), String> {
+    state.coordinator.satisfy_acceptance_criterion(&task_id, &criterion_id, evidence.as_deref())
+}
+
+#[tauri::command]
 fn process_merge_candidate(
     state: State<'_, Arc<AppState>>,
     project_id: String,
@@ -359,6 +369,7 @@ pub fn run() {
             list_tasks,
             claim_task,
             complete_step,
+            satisfy_acceptance_criterion,
             submit_task,
             request_scope,
             calculate_collision_risk,

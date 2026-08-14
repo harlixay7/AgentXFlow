@@ -33,10 +33,19 @@ pub struct CoordinatorEngine {
     pub acp: AcpRuntime,
     pub policy: PolicyEngine,
     pub scheduler: SchedulerEngine,
+    pub worktrees_root: std::path::PathBuf,
 }
 
 impl CoordinatorEngine {
     pub fn new(db: DbPool) -> Self {
+        let worktrees_root = dirs_next::data_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("AgentXFlow")
+            .join("worktrees");
+        Self::new_with_worktree_root(db, worktrees_root)
+    }
+
+    pub fn new_with_worktree_root(db: DbPool, worktrees_root: std::path::PathBuf) -> Self {
         let git = GitService::new();
         let scope = ScopeManager::new(db.clone());
         let verify = VerificationEngine::new(db.clone());
@@ -56,6 +65,7 @@ impl CoordinatorEngine {
             acp,
             policy,
             scheduler,
+            worktrees_root,
         };
 
         engine.reconcile_on_startup();
@@ -143,7 +153,7 @@ impl CoordinatorEngine {
         next_substate: TaskSubstate,
         reason: Option<&str>,
     ) -> Result<Task, CoordinatorError> {
-        let mut task = self.get_task(task_id).map_err(|e| CoordinatorError::TaskNotFound(e))?;
+        let mut task = self.get_task(task_id).map_err(CoordinatorError::TaskNotFound)?;
 
         if !task.state.can_transition_to(&next_state) && task.state != next_state {
             return Err(CoordinatorError::InvalidStateTransition {
@@ -503,6 +513,7 @@ impl CoordinatorEngine {
                         capabilities: AgentCapabilitySet::default(),
                         last_heartbeat: r.get(5)?,
                         created_at: r.get(6)?,
+                        session_token: None,
                     })
                 },
             ).ok()
@@ -569,7 +580,7 @@ impl CoordinatorEngine {
 
         let repo_path = Path::new(&proj_path);
         let branch_name = format!("agentxflow/task-{}", task_id);
-        let worktree_dir = repo_path.join(".agentxflow").join("worktrees").join(format!("task-{}", task_id));
+        let worktree_dir = self.worktrees_root.join(&project_id).join(format!("task-{}", task_id));
         let worktree_path_str = worktree_dir.to_string_lossy().to_string();
 
         let base_sha = self.git.get_ref_sha(repo_path, &target_branch).ok();
@@ -649,7 +660,7 @@ impl CoordinatorEngine {
         }
 
         let proj = self.list_projects()?.into_iter().find(|p| p.id == task.project_id).ok_or("Project not found")?;
-        let repo_path = Path::new(&proj.path);
+        let _repo_path = Path::new(&proj.path);
 
         let worktree_dir = match task.worktree_path.as_deref() {
             Some(path) => Path::new(path),
@@ -721,12 +732,22 @@ impl CoordinatorEngine {
     pub fn register_agent(&self, name: &str, agent_type: &str) -> Result<Agent, String> {
         let conn = self.db.lock();
         let id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
+        let session_token = format!("axf_sess_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let expires_str = (now + chrono::Duration::hours(24)).to_rfc3339();
 
         conn.execute(
             "INSERT INTO agents (id, name, agent_type, profile, status, capabilities_json, last_heartbeat, created_at)
              VALUES (?1, ?2, ?3, 'Implementer', 'IDLE', '{}', ?4, ?4)",
-            params![id, name, agent_type, now],
+            params![id, name, agent_type, now_str],
+        ).map_err(|e| e.to_string())?;
+
+        let sess_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO agent_sessions (id, agent_id, session_token, created_at, expires_at, last_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
+            params![sess_id, id, session_token, now_str, expires_str],
         ).map_err(|e| e.to_string())?;
 
         let agent = Agent {
@@ -736,13 +757,86 @@ impl CoordinatorEngine {
             profile: "Implementer".to_string(),
             status: "IDLE".to_string(),
             capabilities: AgentCapabilitySet::default(),
-            last_heartbeat: now.clone(),
-            created_at: now,
+            last_heartbeat: now_str.clone(),
+            created_at: now_str,
+            session_token: Some(session_token),
         };
 
         drop(conn);
         self.emit_event(None, None, Some(&id), "AGENT_REGISTERED", json!({ "name": name, "type": agent_type }));
         Ok(agent)
+    }
+
+    pub fn get_agent_by_session(&self, token: &str) -> Option<Agent> {
+        let conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
+        let agent_id: String = conn
+            .query_row(
+                "SELECT agent_id FROM agent_sessions WHERE session_token = ?1 AND expires_at > ?2",
+                rusqlite::params![token, now],
+                |r| r.get(0),
+            )
+            .ok()?;
+
+        let mut stmt = conn
+            .prepare("SELECT id, name, agent_type, profile, status, last_heartbeat, created_at FROM agents WHERE id = ?1")
+            .ok()?;
+
+        let agent = stmt
+            .query_row([&agent_id], |row| {
+                Ok(Agent {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    agent_type: row.get(2)?,
+                    profile: row.get(3)?,
+                    status: row.get(4)?,
+                    capabilities: AgentCapabilitySet::default(),
+                    last_heartbeat: row.get(5)?,
+                    created_at: row.get(6)?,
+                    session_token: Some(token.to_string()),
+                })
+            })
+            .ok();
+
+        if agent.is_some() {
+            conn.execute(
+                "UPDATE agent_sessions SET last_activity_at = ?1 WHERE session_token = ?2",
+                rusqlite::params![now, token],
+            ).ok();
+        }
+
+        agent
+    }
+
+    pub fn satisfy_acceptance_criterion(
+        &self,
+        task_id: &str,
+        criterion_id: &str,
+        evidence: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
+
+        let rows_affected = conn.execute(
+            "UPDATE acceptance_criteria SET is_satisfied = 1 WHERE id = ?1 AND task_id = ?2",
+            rusqlite::params![criterion_id, task_id],
+        ).map_err(|e| e.to_string())?;
+
+        if rows_affected == 0 {
+            return Err(format!("Criterion '{}' for task '{}' not found", criterion_id, task_id));
+        }
+
+        let ev_id = Uuid::new_v4().to_string();
+        let note = evidence.unwrap_or("Manual User / Verification Sign-off");
+        conn.execute(
+            "INSERT INTO evidence_records (id, task_id, step_id, evidence_type, source, payload_json, recorded_at)
+             VALUES (?1, ?2, NULL, 'USER_APPROVAL', 'COORDINATOR_OBSERVED', ?3, ?4)",
+            rusqlite::params![ev_id, task_id, note, now],
+        ).ok();
+
+        drop(conn);
+        self.emit_event(None, Some(task_id), None, "CRITERIA_SATISFIED", json!({ "criterion_id": criterion_id }));
+        Ok(())
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, String> {
@@ -762,6 +856,7 @@ impl CoordinatorEngine {
                     capabilities: AgentCapabilitySet::default(),
                     last_heartbeat: row.get(5)?,
                     created_at: row.get(6)?,
+                    session_token: None,
                 })
             })
             .map_err(|e| e.to_string())?;

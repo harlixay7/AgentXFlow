@@ -125,11 +125,17 @@ fn validate_security_headers(headers: &HeaderMap) -> Result<(), (StatusCode, Str
 
     if let Some(origin) = headers.get("origin") {
         if let Ok(origin_str) = origin.to_str() {
-            if !origin_str.starts_with("http://127.0.0.1")
-                && !origin_str.starts_with("http://localhost")
-                && !origin_str.starts_with("tauri://")
-                && !origin_str.starts_with("https://tauri.localhost")
-            {
+            let is_permitted = if origin_str == "tauri://localhost" || origin_str == "https://tauri.localhost" {
+                true
+            } else if let Ok(uri) = origin_str.parse::<axum::http::Uri>() {
+                let host = uri.host().unwrap_or("");
+                let scheme = uri.scheme_str().unwrap_or("");
+                (scheme == "http" || scheme == "https" || scheme == "tauri") && (host == "127.0.0.1" || host == "localhost")
+            } else {
+                false
+            };
+
+            if !is_permitted {
                 return Err((StatusCode::FORBIDDEN, format!("Forbidden: Origin '{}' is not permitted", origin_str)));
             }
         }
@@ -162,16 +168,22 @@ async fn handle_mcp_streamable_http(
         );
     }
 
-    // 2. Bearer Authentication validation
-    let is_authenticated = if let Some(auth) = headers.get("authorization") {
+    // 2. Bearer Authentication validation (Master token or Agent Session token)
+    let (is_authenticated, caller_agent) = if let Some(auth) = headers.get("authorization") {
         if let Ok(token_str) = auth.to_str() {
             let clean_token = token_str.trim_start_matches("Bearer ").trim();
-            state.security.validate_token(clean_token)
+            if state.security.validate_token(clean_token) {
+                (true, None)
+            } else if let Some(agent) = state.coordinator.get_agent_by_session(clean_token) {
+                (true, Some(agent))
+            } else {
+                (false, None)
+            }
         } else {
-            false
+            (false, None)
         }
     } else {
-        false
+        (false, None)
     };
 
     if !is_authenticated {
@@ -224,7 +236,7 @@ async fn handle_mcp_streamable_http(
         "tools/call" => {
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-            execute_mcp_tool(&state, tool_name, &arguments)
+            execute_mcp_tool(&state, caller_agent.as_ref(), tool_name, &arguments)
                 .map(|val| serde_json::json!({
                     "content": [{
                         "type": "text",
@@ -235,7 +247,7 @@ async fn handle_mcp_streamable_http(
         }
 
         // --- 2. Direct Tool Method Fallback Routing ---
-        other => execute_mcp_tool(&state, other, &params),
+        other => execute_mcp_tool(&state, caller_agent.as_ref(), other, &params),
     };
 
     match response_result {
@@ -269,17 +281,28 @@ async fn handle_mcp_streamable_http(
 /// Executes individual tool logic with strict ownership and session checking
 fn execute_mcp_tool(
     state: &Arc<McpServerState>,
+    caller_agent: Option<&crate::models::Agent>,
     tool_name: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let validate_agent = |agent_id: &str| -> Result<(), String> {
-        if agent_id.trim().is_empty() {
-            return Err("Agent registration required: The 'agent_id' parameter is missing. Call 'agent_register' first.".to_string());
+    let resolve_agent_id = |req_id: &str| -> Result<String, String> {
+        if let Some(agent) = caller_agent {
+            if !req_id.is_empty() && req_id != agent.id {
+                return Err(format!(
+                    "Agent impersonation rejected: Authenticated session belongs to '{}', cannot act on behalf of '{}'",
+                    agent.id, req_id
+                ));
+            }
+            Ok(agent.id.clone())
+        } else {
+            if req_id.trim().is_empty() {
+                return Err("Agent registration required: The 'agent_id' parameter is missing. Call 'agent_register' first.".to_string());
+            }
+            if !state.coordinator.is_agent_registered(req_id) {
+                return Err(format!("Agent ID '{}' is not registered. Call 'agent_register' first.", req_id));
+            }
+            Ok(req_id.to_string())
         }
-        if !state.coordinator.is_agent_registered(agent_id) {
-            return Err(format!("Agent ID '{}' is not registered. Call 'agent_register' first.", agent_id));
-        }
-        Ok(())
     };
 
     match tool_name {
@@ -323,17 +346,17 @@ fn execute_mcp_tool(
         }
 
         "agent_heartbeat" | "agent.heartbeat" => {
-            let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            validate_agent(agent_id)?;
-            state.coordinator.agent_heartbeat(agent_id).map(|_| serde_json::json!({ "status": "ok" }))
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.agent_heartbeat(&agent_id).map(|_| serde_json::json!({ "status": "ok" }))
         }
 
         // Mutation & Task Execution
         "task_claim" | "task.claim" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            validate_agent(agent_id)?;
-            state.coordinator.claim_task(task_id, agent_id).map(|task| serde_json::to_value(task).unwrap())
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.claim_task(task_id, &agent_id).map(|task| serde_json::to_value(task).unwrap())
         }
 
         "task_complete_step" | "task.complete_step" => {
@@ -344,25 +367,33 @@ fn execute_mcp_tool(
 
         "task_submit" | "task.submit" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            validate_agent(agent_id)?;
-            state.coordinator.submit_task(task_id, agent_id).map(|res| serde_json::to_value(res).unwrap())
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.submit_task(task_id, &agent_id).map(|res| serde_json::to_value(res).unwrap())
         }
 
         "scope_acquire" | "scope.acquire" | "scope.propose" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            validate_agent(agent_id)?;
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
             let patterns: Vec<String> = params
                 .get("patterns")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
-            state.coordinator.scope.acquire_scope(task_id, agent_id, patterns, "EXCLUSIVE_WRITE").map(|leases| serde_json::to_value(leases).unwrap())
+            state.coordinator.scope.acquire_scope(task_id, &agent_id, patterns, "EXCLUSIVE_WRITE").map(|leases| serde_json::to_value(leases).unwrap())
         }
 
         "scope_release" | "scope.release" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             state.coordinator.scope.release_scope(task_id).map(|_| serde_json::json!({ "status": "released" }))
+        }
+
+        "criteria_satisfy" | "criteria.satisfy" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let criterion_id = params.get("criterion_id").and_then(|v| v.as_str()).unwrap_or("");
+            let evidence = params.get("evidence").and_then(|v| v.as_str());
+            state.coordinator.satisfy_acceptance_criterion(task_id, criterion_id, evidence)
+                .map(|_| serde_json::json!({ "status": "satisfied" }))
         }
 
         // Masterplan Hub Tools
@@ -410,6 +441,18 @@ fn execute_mcp_tool(
             }
         }
 
+        "masterplan_claim_chunk" | "masterplan.claim_chunk" => {
+            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            let count = params
+                .get("chunk_size")
+                .or_else(|| params.get("count"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
+            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count).map(|chunk| serde_json::to_value(chunk).unwrap())
+        }
+
         "masterplan_decompose" | "masterplan.decompose" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let steps_val = params.get("steps").cloned().unwrap_or(serde_json::json!([]));
@@ -418,14 +461,6 @@ fn execute_mcp_tool(
                 Ok(steps) => state.coordinator.decompose_masterplan(project_id, steps).map(|decomposed| serde_json::to_value(decomposed).unwrap()),
                 Err(e) => Err(format!("Invalid step array format: {}. Expected [{{ 'step_index': 1, 'title': '...', 'description': '...' }}]", e)),
             }
-        }
-
-        "masterplan_claim_chunk" | "masterplan.claim_chunk" => {
-            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            let count = params.get("count").and_then(|v| v.as_i64()).map(|n| n as i32);
-            validate_agent(agent_id)?;
-            state.coordinator.claim_masterplan_chunk(project_id, agent_id, count).map(|task| serde_json::to_value(task).unwrap())
         }
 
         _ => Err(format!("Unknown MCP tool: '{}'. Call tools/list to see available methods.", tool_name)),
