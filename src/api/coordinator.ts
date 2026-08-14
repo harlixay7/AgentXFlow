@@ -109,23 +109,8 @@ export const coordinatorApi = {
     return await invoke('list_merge_queue', { projectId });
   },
 
-  async enqueueTaskForMerge(
-    projectId: string,
-    taskId: string,
-    branchName: string,
-    targetBranch: string,
-    baseSha: string,
-    headSha: string
-  ): Promise<MergeQueueItem> {
-    return await invoke('enqueue_task_for_merge', { projectId, taskId, branchName, targetBranch, baseSha, headSha });
-  },
-
   async enqueueTaskById(projectId: string, taskId: string): Promise<MergeQueueItem> {
     return await invoke('enqueue_task_by_id', { projectId, taskId });
-  },
-
-  async processMergeCandidate(projectId: string, item: MergeQueueItem): Promise<IntegrationAttempt> {
-    return await invoke('process_merge_candidate', { projectId, item });
   },
 
   async processMergeById(projectId: string, queueItemId: string): Promise<IntegrationAttempt> {

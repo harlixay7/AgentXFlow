@@ -1,13 +1,12 @@
 @echo off
-title AgentXFlow Launcher (Viducia)
+title AgentXFlow Launcher
 cd /d "%~dp0"
 echo ===================================================
-echo   Starting AgentXFlow Engineering Coordinator...
-echo   Organization: Viducia ^| Developer: harlixay7
+echo   Starting AgentXFlow by Viducia...
 echo ===================================================
 echo.
 
-call npm run tauri dev
+call npm.cmd run tauri dev
 if %ERRORLEVEL% NEQ 0 (
     echo.
     echo ===================================================

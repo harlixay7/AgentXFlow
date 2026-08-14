@@ -31,14 +31,13 @@ export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) 
 
   return (
     <div style={{ flex: 1, padding: 20, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* Header with Plain English Explanation */}
       <div style={{ borderBottom: '1px solid var(--border-medium)', paddingBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <ShieldCheck size={18} style={{ color: 'var(--accent-purple)' }} />
           <h2 style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--font-mono)' }}>Review Center & Proof Bundles</h2>
         </div>
         <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4 }}>
-          <strong>What happens here?</strong> Tasks listed here have passed all mandatory steps and automated verification tests. Inspect the changes, verify the cryptographic proof bundle, and click <strong>"Enqueue for 3-Way Merge"</strong> to safely integrate into <code>main</code>.
+          Tasks listed here have passed all mandatory steps and automated verification checks.
         </p>
       </div>
 
@@ -103,7 +102,6 @@ export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) 
                 )}
               </div>
 
-              {/* Coordinator Proof Checklist Card */}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 10, backgroundColor: 'var(--bg-card)', padding: 12, borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', fontSize: 11 }}>
                 <div style={{ color: 'var(--accent-green)', display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600 }} title="Coordinator verified test output against submitted commit HEAD">
                   <ShieldCheck size={14} /> Verification Passed

@@ -189,19 +189,6 @@ fn list_merge_queue(
 }
 
 #[tauri::command]
-fn enqueue_task_for_merge(
-    state: State<'_, Arc<AppState>>,
-    project_id: String,
-    task_id: String,
-    branch_name: String,
-    target_branch: String,
-    base_sha: String,
-    head_sha: String,
-) -> Result<MergeQueueItem, String> {
-    state.coordinator.merge.enqueue_task(&project_id, &task_id, &branch_name, &target_branch, &base_sha, &head_sha)
-}
-
-#[tauri::command]
 fn enqueue_task_by_id(
     state: State<'_, Arc<AppState>>,
     project_id: String,
@@ -218,16 +205,6 @@ fn satisfy_acceptance_criterion(
     evidence: Option<String>,
 ) -> Result<(), String> {
     state.coordinator.satisfy_acceptance_criterion(&task_id, &criterion_id, evidence.as_deref())
-}
-
-#[tauri::command]
-fn process_merge_candidate(
-    state: State<'_, Arc<AppState>>,
-    project_id: String,
-    item: MergeQueueItem,
-) -> Result<IntegrationAttempt, String> {
-    let proj = state.coordinator.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
-    state.coordinator.merge.process_merge(&project_id, Path::new(&proj.path), &item)
 }
 
 #[tauri::command]
@@ -386,9 +363,7 @@ pub fn run() {
             add_task_dependency,
             get_task_dependencies,
             list_merge_queue,
-            enqueue_task_for_merge,
             enqueue_task_by_id,
-            process_merge_candidate,
             process_merge_by_id,
             get_events_after,
             get_context_pack,

@@ -38,7 +38,6 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
 
   return (
     <div style={{ flex: 1, padding: 20, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* Header with Plain English Explanation */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: '1px solid var(--border-medium)', paddingBottom: 14 }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -46,7 +45,7 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
             <h2 style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--font-mono)' }}>Serialized Merge Queue</h2>
           </div>
           <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4, maxWidth: 700, lineHeight: 1.5 }}>
-            <strong>How it works:</strong> Merge operations are simulated one-by-one inside an isolated app-data worktree. Merges <strong>never touch or dirty your local repository workspace</strong>. If tests pass and there are no conflicts, the target branch ref is advanced using atomic Compare-and-Swap (CAS).
+            Verified candidate branches integrated sequentially via isolated integration worktrees and atomic CAS ref updates.
           </p>
         </div>
         <button

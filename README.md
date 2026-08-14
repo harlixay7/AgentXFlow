@@ -1,43 +1,21 @@
 # AgentXFlow
 
-**AgentXFlow** is an authoritative local desktop application and coordination daemon that lets multiple AI coding agents work on the same Git repository simultaneously without merge conflicts, file overwrites, or broken builds.
+**AgentXFlow** is an authoritative desktop application and Model Context Protocol (MCP) coordination daemon that enables multiple AI coding agents to collaborate concurrently on a single Git repository through isolated worktrees, write scope leases, automated verification gates, and a serialized FIFO merge queue.
 
-Developed by **[harlixay7](https://github.com/harlixay7)** • **Viducia**
-
----
-
-## Quick Setup with an AI Agent
-
-You can give this repository URL directly to your AI coding assistant (Claude Code, Cursor, Antigravity, or Codex CLI) and prompt:
-
-```
-Clone https://github.com/harlixay7/AgentXFlow.git, read AGENT_SETUP.md, run setup.bat, and start the app with run.bat.
-```
-
-The AI agent will read [`AGENT_SETUP.md`](AGENT_SETUP.md), verify the toolchain, install dependencies, validate the test suites, and boot the coordinator.
+Developed by **[harlixay7](https://github.com/harlixay7)** • **AgentXFlow by Viducia**
 
 ---
 
-## The Problem
+## Core Capabilities
 
-When multiple AI agents (like Claude Code, Cursor, Antigravity, or Codex CLI) work on the same codebase at the same time:
-1. They write to the same working directory and overwrite each other's changes.
-2. They generate git branch conflicts that require manual resolution.
-3. They claim tasks are completed in chat without actually running builds or test suites.
-4. Concurrent merges into `main` break the build because changes were tested against outdated base commits.
-
----
-
-## How AgentXFlow Solves This
-
-AgentXFlow acts as an authoritative coordinator running on your machine:
-
-- **Isolated Git Worktrees**: When an agent claims a task, AgentXFlow creates a private Git worktree on disk at `.agentxflow/worktrees/task-<id>`. Agents never touch your active checkout or the `main` branch directly.
-- **Write Scope Locks**: Agents must declare which files they plan to edit using glob patterns (e.g. `src/auth/**`). If two agents request overlapping files, the collision is detected and blocked.
-- **Mutation Auditing**: On task submission, AgentXFlow runs `git diff --name-only <base_sha>` inside the worktree. Any unreserved file edits trigger a scope violation and reject the task.
-- **Authoritative Verification**: AgentXFlow runs the test suite itself inside the worktree. An agent cannot mark a task done by claiming it in chat; it must pass the coordinator's automated checks.
-- **Serialized Merge Queue**: Verified tasks enter a FIFO merge queue. AgentXFlow simulates a 3-way merge and runs tests inside a hidden integration worktree before committing to `main`.
-- **Masterplan Execution Hub**: Drop in an unformatted master plan of any length. The first connected agent normalizes the specification into structured steps (from `UNSORTED` to `RESORTED`). Subsequent agents claim progressive chunks (with anti-hoarding limits) and execute in sequence.
+- **Isolated Git Worktrees**: When an agent claims a task or masterplan chunk, AgentXFlow allocates an isolated Git worktree on disk. Agents work exclusively within their assigned worktree branch.
+- **Write Scope Leases**: Agents declare intended file glob patterns (e.g. `src/auth/**`) before modifying files. Overlapping write patterns are detected and rejected.
+- **Mutation Auditing**: On task submission, the coordinator audits `git diff` against active scope leases. Unreserved file edits trigger scope violations.
+- **Authoritative Verification Gate**: The coordinator executes configured test and build checks with a 30-second execution timeout, 64KB capped output streams, and automatic stale invalidation on commit HEAD shifts.
+- **Cryptographic Proof Bundles**: Verified submissions generate an immutable `ProofBundle` sealed with a SHA-256 digest over task metadata, file diffs, and test outputs.
+- **Human Review & Sign-Off**: Acceptance criteria require human/reviewer credentials, preventing autonomous agent self-approvals.
+- **Serialized FIFO Merge Queue**: Verified candidate branches are integrated sequentially inside disposable integration worktrees, validated with post-merge tests, and advanced via atomic Compare-and-Swap (CAS) `git update-ref` operations.
+- **Masterplan Hub**: Decomposes unstructured master specifications into ordered, non-overlapping step chunks with anti-hoarding active claim limits.
 
 ---
 
@@ -46,23 +24,23 @@ AgentXFlow acts as an authoritative coordinator running on your machine:
 ```
 +---------------------------------------------------------------+
 |                          AI Agents                            |
-|   Antigravity     Claude Code CLI     Cursor      Codex CLI   |
+|      Antigravity       Claude Code       Cursor       Codex   |
 +---------------------------------------------------------------+
                                 |
-                                | (HTTP JSON-RPC / MCP)
+                                | (HTTP JSON-RPC / MCP 2024-11-05)
                                 v
 +---------------------------------------------------------------+
 |                     AgentXFlow Coordinator                    |
-|   - Masterplan Hub (Unsorted -> Resorted decomposition engine)|
-|   - SQLite Database (Tasks, Agents, Leases, Proof Bundles)    |
-|   - Scope Engine (Glob lease manager & git diff auditor)      |
-|   - Verification Engine (Independent test runner)             |
-|   - Merge Engine (Serialized FIFO 3-way integration)          |
+|   - Masterplan Hub (Decomposition & anti-hoarding chunking)   |
+|   - SQLite Database (Versioned migrations, WAL mode)          |
+|   - Scope Engine (Conservative glob collision detection)      |
+|   - Verification Engine (Independent process test runner)     |
+|   - Merge Queue Engine (Serialized FIFO 3-way integration)    |
 +---------------------------------------------------------------+
          |                      |                      |
          v                      v                      v
     Worktree #1            Worktree #2            Integration Worktree
- (task-auth branch)     (task-db branch)          (merges to main)
+ (task branch A)        (task branch B)           (merges to target)
 ```
 
 ---
@@ -75,11 +53,11 @@ AgentXFlow acts as an authoritative coordinator running on your machine:
 - Git CLI
 
 ### 1-Click Setup (Windows)
-Double-click **`setup.bat`** (or run `.\setup.bat` in terminal). This automated script:
-1. Checks for Node.js, Git CLI, and Rust compiler.
-2. Installs missing npm dependencies.
-3. Builds and type-checks the React frontend.
-4. Checks Rust backend compilation.
+Double-click **`setup.bat`** (or run `.\setup.bat` in terminal). This script:
+1. Verifies Node.js, Git CLI, and the Rust toolchain.
+2. Installs required npm dependencies.
+3. Compiles and type-checks the React frontend.
+4. Validates Rust backend compilation.
 
 ### Run the App
 - On Windows: Double-click **`run.bat`**
@@ -93,44 +71,15 @@ npm run tauri dev
 npm run tauri build
 ```
 
-### Freeing Disk Space
-During development, the Rust compiler stores debug symbols in `src-tauri/target/`. You can safely clean these temporary build files anytime without losing source code or database records:
-```bash
-cd src-tauri
-cargo clean
-```
-
 ---
 
-## Running Tests
+## Connecting AI Agents via MCP
 
-AgentXFlow includes full unit and integration test suites:
+AgentXFlow hosts a local Model Context Protocol (MCP) server conforming to the `2024-11-05` standard on `http://127.0.0.1:7890/mcp`.
 
-```bash
-# Run all backend unit tests
-cargo test --manifest-path src-tauri/Cargo.toml
+Authentication tokens are generated dynamically per coordinator instance. Copy your active token from the **MCP Gateway** tab in the desktop application.
 
-# Run the masterplan decomposition and chunk claiming test
-cargo test --test masterplan_test --manifest-path src-tauri/Cargo.toml
-
-# Run the live HTTP MCP network test
-cargo test --test mcp_e2e_test --manifest-path src-tauri/Cargo.toml
-
-# Run the 3-agent concurrent collaboration test
-cargo test --test multi_agent_concurrent_test --manifest-path src-tauri/Cargo.toml
-
-# Type check frontend
-npm run build
-```
-
----
-
-## Connecting Coding Agents
-
-AgentXFlow runs a local Model Context Protocol (MCP) server on `http://127.0.0.1:7890/mcp`.
-
-### OpenCode (`.mcp.json`)
-Add this to your project repository:
+### Cursor (`.cursor/mcp.json`)
 ```json
 {
   "mcpServers": {
@@ -138,61 +87,87 @@ Add this to your project repository:
       "url": "http://127.0.0.1:7890/mcp",
       "transport": "http",
       "headers": {
-        "Authorization": "Bearer axf_sec_v2_live_token_7890"
+        "Authorization": "Bearer <YOUR_COORDINATOR_TOKEN>"
       }
     }
   }
 }
 ```
 
-### Claude Code & Codex CLI
-Connect via HTTP streamable transport:
-- Server URL: `http://127.0.0.1:7890/mcp`
-- Header: `Authorization: Bearer axf_sec_v2_live_token_7890`
+### Claude Desktop (`claude_desktop_config.json`) / Claude Code
+```json
+{
+  "mcpServers": {
+    "agentxflow": {
+      "url": "http://127.0.0.1:7890/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_COORDINATOR_TOKEN>"
+      }
+    }
+  }
+}
+```
 
 ### Antigravity
-The coordinator skill specification is located at `SKILL.md`.
+The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 
 ---
 
-## MCP Tool Reference
+## MCP Tools Reference
 
 | Tool | Parameters | Description |
 |---|---|---|
-| `agent.register` | `name`, `agent_type` | Register an agent session and declare its tool capabilities. |
-| `agent.heartbeat` | `agent_id` | Keep session lease and file locks active. |
-| `masterplan.get` | `project_id` | Inspect masterplan state, raw text, and decomposition instructions. |
-| `masterplan.status` | `project_id` | Query plan progress stats and step states. |
-| `masterplan.decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured execution steps. |
-| `masterplan.claim_chunk`| `project_id`, `agent_id`, `count` | Claim next batch of steps (capped by limit) and cut a Git worktree. |
+| `agent.register` | `name`, `agent_type` | Register an agent session and receive an authenticated session token. |
+| `agent.heartbeat` | `agent_id` | Refresh session heartbeat and active lease timers. |
+| `masterplan.get` | `project_id` | Inspect masterplan state, raw specification text, and decomposition instructions. |
+| `masterplan.status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
+| `masterplan.decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured, non-overlapping execution steps. |
+| `masterplan.claim_chunk`| `project_id`, `agent_id`, `count` | Claim next batch of steps (capped by limit) and allocate an isolated Git worktree. |
 | `task.list` | `project_id`, `state` | List tasks in the backlog or ready queue. |
 | `task.get` | `task_id` | Get task prompt, acceptance criteria, and worktree path. |
 | `task.claim` | `task_id`, `agent_id` | Claim a task and create an isolated Git worktree on disk. |
 | `project.context` | `project_id`, `task_id` | Fetch contract hash and project architectural rules. |
-| `scope.acquire` | `task_id`, `patterns` | Lock file globs (e.g. `src/auth/**`) for exclusive writes. |
+| `scope.acquire` | `task_id`, `patterns` | Lock file globs (e.g. `src/auth/**`) for exclusive write access. |
 | `scope.release` | `task_id` | Release held write locks back to the pool. |
 | `task.complete_step` | `step_id`, `evidence` | Mark a required task step complete with test output. |
 | `dag.dependencies` | `task_id` | List blocker tasks that must finish before this task starts. |
-| `task.submit` | `task_id`, `agent_id` | Submit task; coordinator runs tests and checks git diff. |
+| `task.submit` | `task_id`, `agent_id` | Submit task for coordinator verification and git mutation audit. |
 | `merge.queue_status` | `project_id` | Check queue position for pending branch merges. |
 
 ---
 
-## Codebase Layout
+## Testing & Quality Gates
 
-- `src-tauri/src/core/`: Coordinator engine, state machines, and Tauri IPC commands.
-- `src-tauri/src/mcp/`: Axum HTTP Model Context Protocol (MCP) server implementation (2024-11-05 standard, 2026-07-28 compatible).
-- `src-tauri/src/scope/`: Glob pattern collision detection and git diff mutation auditor.
-- `src-tauri/src/verification/`: Server-side test runner and SHA-256 proof bundle generator.
-- `src-tauri/src/merge/`: Serialized 3-way merge engine inside isolated integration worktree.
-- `src-tauri/src/db/`: SQLite database pool, 24 tables with strict foreign keys, and WAL mode.
-- `src/`: React 19 workbench user interface.
+```bash
+# Run all backend unit and integration test suites
+cargo test --manifest-path src-tauri/Cargo.toml
+
+# Run the complete A-to-Z pipeline integration test
+cargo test --test pipeline_a_to_z_test --manifest-path src-tauri/Cargo.toml
+
+# Run the 30-scenario adversarial security and concurrency test suite
+cargo test --test adversarial_suite_test --manifest-path src-tauri/Cargo.toml
+
+# Run Rust linter with zero warnings allowed
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+# Type-check and build production frontend bundle
+npm run build
+```
 
 ---
 
-## Author & Organization
+## Repository Structure
 
-Created and developed by **[harlixay7](https://github.com/harlixay7)** • **Viducia**.
+- `src-tauri/src/core/`: Coordinator engine, state machines, and Tauri IPC commands.
+- `src-tauri/src/mcp/`: Model Context Protocol (MCP 2024-11-05) Axum HTTP server with session derivation.
+- `src-tauri/src/scope/`: Glob pattern collision detection and git diff mutation auditor.
+- `src-tauri/src/verification/`: Process-isolated test runner and SHA-256 proof bundle generator.
+- `src-tauri/src/merge/`: Serialized FIFO merge engine with disposable integration worktrees and CAS ref updates.
+- `src-tauri/src/db/`: Versioned SQLite migrations (1–4), connection pooling, and single-instance file lock.
+- `src/`: React 19 / TypeScript workbench UI.
+
+---
 
 ## License
 

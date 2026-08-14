@@ -39,10 +39,6 @@ fn setup_test_repo(name: &str) -> PathBuf {
 
 #[tokio::test]
 async fn test_entire_pipeline_from_a_to_z() {
-    println!("\n========================================================================");
-    println!("🚀 AGENTXFLOW — COMPLETE PIPELINE INTEGRATION TEST (A TO Z)");
-    println!("========================================================================\n");
-
     let repo_dir = setup_test_repo("pipeline");
     let pool = DbPool::new_in_memory().expect("Failed to create SQLite in-memory DB");
     let coordinator = CoordinatorEngine::new(pool.clone());
@@ -441,8 +437,4 @@ async fn test_entire_pipeline_from_a_to_z() {
 
     // Clean up temporary repo
     std::fs::remove_dir_all(&repo_dir).ok();
-
-    println!("\n========================================================================");
-    println!("🎉 ALL 28 PIPELINE STEPS (A TO Z) VERIFIED 100% WITH ZERO FLAWS!");
-    println!("========================================================================\n");
 }

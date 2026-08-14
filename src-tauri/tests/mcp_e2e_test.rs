@@ -218,5 +218,4 @@ async fn test_full_e2e_mcp_workflow() {
 
     // Cleanup temp dir
     std::fs::remove_dir_all(&temp_repo).ok();
-    println!(">>> All MCP 2026-07-28 tools and protocol handlers verified 100% successfully!");
 }

@@ -15,14 +15,12 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
   const [pingStatus, setPingStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
-  // Agent Fleet Registration State
   const [agentName, setAgentName] = useState('');
   const [agentType, setAgentType] = useState('Antigravity');
   const [isRegistering, setIsRegistering] = useState(false);
 
   useEffect(() => {
     coordinatorApi.getMcpInfo().then(setMcpInfo).catch(console.error);
-    // Initial health check
     fetch('http://127.0.0.1:7890/health')
       .then((res) => {
         if (res.ok) setPingStatus('success');
@@ -307,7 +305,6 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
         </div>
       </div>
 
-      {/* Client Configuration Setup Snippets */}
       <div style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-md)', overflow: 'hidden' }}>
         <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-input)' }}>
           <div

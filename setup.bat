@@ -1,11 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
-title AgentXFlow - Dependency & Environment Setup (Viducia)
+title AgentXFlow Setup
 cd /d "%~dp0"
 
 echo ===================================================
-echo   AgentXFlow Dependency & Environment Setup
-echo   Organization: Viducia • Developer: harlixay7
+echo   AgentXFlow by Viducia — Environment Setup
 echo ===================================================
 echo.
 

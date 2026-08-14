@@ -55,13 +55,9 @@ fn create_real_git_project() -> PathBuf {
 
 #[tokio::test]
 async fn test_manual_live_end_to_end_system() {
-    println!("\n============================================================");
-    println!("🔍 STARTING LIVE MANUAL SYSTEM TEST OF ALL FEATURES");
-    println!("============================================================\n");
-
     // 1. Initializing Real Git Workspace & Database
     let repo_dir = create_real_git_project();
-    println!("1. Initialized real Git repository at: {:?}", repo_dir);
+    println!("1. Initialized Git repository at: {:?}", repo_dir);
 
     let db_path = repo_dir.join("coordinator.db");
     let pool = DbPool::new(&db_path).expect("Failed to initialize SQLite pool");
@@ -334,8 +330,4 @@ async fn test_manual_live_end_to_end_system() {
 
     // Cleanup temp repo
     std::fs::remove_dir_all(&repo_dir).ok();
-
-    println!("\n============================================================");
-    println!("🎉 ALL 22 LIVE MANUAL FEATURES VERIFIED 100% CLEANLY!");
-    println!("============================================================\n");
 }
