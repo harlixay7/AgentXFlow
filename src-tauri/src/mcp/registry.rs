@@ -263,6 +263,17 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         json!({
+            "name": "task_details",
+            "description": "Get complete task details including steps, acceptance criteria, active scope leases, attempts, and verification results.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" }
+                },
+                "required": ["task_id"]
+            }
+        }),
+        json!({
             "name": "merge_queue_status",
             "description": "List all queued branch merges and their integration statuses.",
             "inputSchema": {
@@ -271,6 +282,40 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
                     "project_id": { "type": "string", "description": "Project ID" }
                 },
                 "required": ["project_id"]
+            }
+        }),
+        json!({
+            "name": "merge_enqueue",
+            "description": "Enqueue a verified or MERGE_READY task into the serialized merge queue.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Project ID" },
+                    "task_id": { "type": "string", "description": "Task identifier" }
+                },
+                "required": ["project_id", "task_id"]
+            }
+        }),
+        json!({
+            "name": "merge_process",
+            "description": "Process the next ready serialized branch merge in queue for a project.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Project ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        json!({
+            "name": "task_reconcile",
+            "description": "Reconcile task state, task attempt, proof bundle, and merge queue status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" }
+                },
+                "required": ["task_id"]
             }
         }),
     ]

@@ -446,6 +446,34 @@ fn execute_mcp_tool(
             state.coordinator.merge.list_queue(project_id).map(|items| serde_json::to_value(items).unwrap())
         }
 
+        "merge_enqueue" | "merge.enqueue" => {
+            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() || task_id.trim().is_empty() {
+                return Err("Missing required parameters 'project_id' and 'task_id'.".to_string());
+            }
+            state.coordinator.enqueue_task_by_id(project_id, task_id).map(|item| serde_json::to_value(item).unwrap())
+        }
+
+        "merge_process" | "merge.process" => {
+            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'.".to_string());
+            }
+            state.coordinator.process_next_merge(project_id).map(|res| serde_json::json!({
+                "processed": res.is_some(),
+                "attempt": res
+            }))
+        }
+
+        "task_reconcile" | "task.reconcile" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            if task_id.trim().is_empty() {
+                return Err("Missing required parameter 'task_id'.".to_string());
+            }
+            state.coordinator.reconcile_task(task_id)
+        }
+
         // Agent Identity
         "agent_register" | "agent.register" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("Agent");
@@ -470,7 +498,11 @@ fn execute_mcp_tool(
         "task_complete_step" | "task.complete_step" => {
             let step_id = params.get("step_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
+            let agent_id_opt = if !raw_agent_id.trim().is_empty() {
+                Some(resolve_agent_id(raw_agent_id)?)
+            } else {
+                None
+            };
             let evidence_json = params.get("evidence").map(|v| v.to_string());
             state.coordinator.complete_step(step_id, agent_id_opt.as_deref(), evidence_json.as_deref()).map(|step| serde_json::to_value(step).unwrap())
         }
@@ -485,7 +517,11 @@ fn execute_mcp_tool(
         "task_cancel" | "task.cancel" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
+            let agent_id_opt = if !raw_agent_id.trim().is_empty() {
+                Some(resolve_agent_id(raw_agent_id)?)
+            } else {
+                None
+            };
             let reason = params.get("reason").and_then(|v| v.as_str());
             state.coordinator.cancel_task(task_id, agent_id_opt.as_deref(), reason).map(|task| serde_json::json!({
                 "success": true,
@@ -498,7 +534,11 @@ fn execute_mcp_tool(
         "task_requeue" | "task.requeue" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
+            let agent_id_opt = if !raw_agent_id.trim().is_empty() {
+                Some(resolve_agent_id(raw_agent_id)?)
+            } else {
+                None
+            };
             state.coordinator.requeue_task(task_id, agent_id_opt.as_deref()).map(|_| serde_json::json!({
                 "success": true,
                 "task_id": task_id,
@@ -520,7 +560,8 @@ fn execute_mcp_tool(
         "scope_release" | "scope.release" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            if let Ok(agent_id) = resolve_agent_id(raw_agent_id) {
+            if !raw_agent_id.trim().is_empty() {
+                let agent_id = resolve_agent_id(raw_agent_id)?;
                 state.coordinator.scope.release_scope_by_agent(task_id, &agent_id).map(|_| serde_json::json!({ "status": "released" }))
             } else {
                 state.coordinator.scope.release_scope(task_id).map(|_| serde_json::json!({ "status": "released" }))
@@ -609,12 +650,24 @@ fn execute_mcp_tool(
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id = resolve_agent_id(raw_agent_id)?;
-            let count = params
+            let count_opt = params
                 .get("chunk_size")
                 .or_else(|| params.get("count"))
                 .and_then(|v| v.as_i64())
                 .map(|n| n as i32);
-            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count).map(|chunk| {
+            let requested_cnt = count_opt.unwrap_or(4);
+            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count_opt).map(|chunk| {
+                let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
+                let claimed_step_ids: Vec<String> = steps
+                    .iter()
+                    .filter(|s| s.claimed_task_id.as_deref() == Some(&chunk.id))
+                    .map(|s| s.id.clone())
+                    .collect();
+                let claimed_cnt = claimed_step_ids.len();
+                let max_cap = state.coordinator.get_masterplan(project_id).ok().flatten().map(|p| p.max_steps_per_agent).unwrap_or(4);
+                let total_agent_active = steps.iter().filter(|s| s.claimed_agent_id.as_deref() == Some(&agent_id) && s.status == "CLAIMED").count();
+                let remaining_capacity = (max_cap as usize).saturating_sub(total_agent_active);
+
                 serde_json::json!({
                     "id": chunk.id,
                     "task_id": chunk.id,
@@ -622,6 +675,10 @@ fn execute_mcp_tool(
                     "project_id": chunk.project_id,
                     "title": chunk.title,
                     "description": chunk.description,
+                    "requested_count": requested_cnt,
+                    "claimed_count": claimed_cnt,
+                    "remaining_capacity": remaining_capacity,
+                    "claimed_step_ids": claimed_step_ids,
                     "state": chunk.state.as_str(),
                     "worktree_path": chunk.worktree_path,
                     "branch_name": chunk.branch_name,

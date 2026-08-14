@@ -45,6 +45,7 @@ The coordinator enforces task integrity on the server with deterministic, machin
 | `agent_heartbeat` | `agent_id` | Refresh your session heartbeat and active lease timers. |
 | `task_list` | `project_id` | List tasks in the backlog or ready queue for a specific project. |
 | `task_get` | `task_id` | Get task prompt, acceptance criteria, and worktree path. |
+| `task_details` | `task_id` | Get complete task details including steps, acceptance criteria, active scope leases, attempts, and verification results. |
 | `task_claim` | `task_id`, `agent_id` | Claim a task and create an isolated Git worktree on disk with an active task attempt. |
 | `scope_acquire` | `task_id`, `agent_id`, `patterns` | Lock file globs (e.g. `['src/auth/**', 'tests/auth_test.rs']`) for exclusive writes. |
 | `scope_release` | `task_id`, `agent_id?` | Release held write locks back to the pool. |
@@ -53,7 +54,10 @@ The coordinator enforces task integrity on the server with deterministic, machin
 | `task_submit` | `task_id`, `agent_id` | Submit task; coordinator automatically executes verification profiles, machine evaluators, and git diff mutation audit. |
 | `task_cancel` | `task_id`, `agent_id?`, `reason?` | Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING. |
 | `task_requeue` | `task_id`, `agent_id?` | Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases. |
+| `task_reconcile` | `task_id` | Reconcile task state, task attempt, proof bundle, and merge queue status. |
 | `merge_queue_status` | `project_id` | Check queue position and status for serialized branch merges. |
+| `merge_enqueue` | `project_id`, `task_id` | Enqueue a verified or MERGE_READY task into the serialized merge queue. |
+| `merge_process` | `project_id` | Process the next ready serialized branch merge in queue for a project. |
 
 ---
 

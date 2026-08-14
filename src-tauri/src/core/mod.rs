@@ -13,7 +13,7 @@ use crate::git::GitService;
 use crate::merge::MergeEngine;
 use crate::models::{
     AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, CurrentContext, DecomposedStepInput,
-    EvaluatorResult, EventItem, EvidenceRecord, Masterplan, MasterplanStep, MasterplanSummary,
+    EvaluatorResult, EventItem, EvidenceRecord, IntegrationAttempt, Masterplan, MasterplanStep, MasterplanSummary,
     MergeQueueItem, PreparedMasterplanSnapshot, Project, ProofBundle, ScopeLease, ScopeViolation,
     Task, TaskAttempt, TaskDependency, TaskDetails, TaskState, TaskStep, TaskSubstate,
     VerificationResult, VerificationRun,
@@ -160,6 +160,13 @@ impl CoordinatorEngine {
         // 3. Mark expired scope leases
         let now = Utc::now().to_rfc3339();
         conn.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now]).ok();
+
+        // 4. Reconcile orphaned claimed masterplan steps whose tasks are missing or cancelled
+        conn.execute(
+            "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL
+             WHERE status = 'CLAIMED' AND (claimed_task_id IS NULL OR claimed_task_id IN (SELECT id FROM tasks WHERE state = 'CANCELLED' OR is_stale = 1))",
+            [],
+        ).ok();
     }
 
     // --- Projects ---
@@ -849,9 +856,10 @@ impl CoordinatorEngine {
         // Transition state to VERIFYING
         let now = Utc::now().to_rfc3339();
         let conn = self.db.lock();
-        conn.execute("UPDATE tasks SET state = 'VERIFYING', substate = 'VERIFYING', updated_at = ?1 WHERE id = ?2", [&now, task_id]).ok();
+        conn.execute("UPDATE tasks SET state = 'VERIFYING', substate = 'VERIFYING', updated_at = ?1 WHERE id = ?2", [&now, task_id])
+            .map_err(|e| format!("Failed to set task to VERIFYING: {}", e))?;
 
-        // Retrieve or create active task attempt
+        // Retrieve or create active task attempt with strict error propagation and run_number compatibility
         let attempt_opt: Option<(String, i32)> = conn
             .query_row(
                 "SELECT id, attempt_number FROM task_attempts WHERE task_id = ?1 AND status = 'ACTIVE' ORDER BY attempt_number DESC LIMIT 1",
@@ -870,10 +878,10 @@ impl CoordinatorEngine {
                 |r| r.get(0),
             ).unwrap_or(1);
             conn.execute(
-                "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, base_sha, status, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'ACTIVE', ?6)",
-                rusqlite::params![new_id, task_id, agent_id, new_num, task.base_sha.as_deref().unwrap_or(""), now],
-            ).ok();
+                "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, run_number, base_sha, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ACTIVE', ?7)",
+                rusqlite::params![new_id, task_id, agent_id, new_num, new_num, task.base_sha.as_deref().unwrap_or(""), now],
+            ).map_err(|e| format!("Failed to create task attempt: {}", e))?;
             (new_id, new_num)
         };
         drop(conn);
@@ -882,7 +890,7 @@ impl CoordinatorEngine {
         let head_sha = self.git.get_worktree_head_sha(worktree_dir)?;
 
         // 4. Invalidate stale verifications from previous commit SHAs
-        self.verify.invalidate_stale_verifications(task_id, &head_sha).ok();
+        self.verify.invalidate_stale_verifications(task_id, &head_sha)?;
 
         // 5. Automatically execute comprehensive verification profile and machine evaluators
         self.verify.execute_profile_for_attempt(
@@ -891,7 +899,7 @@ impl CoordinatorEngine {
             &task.project_id,
             worktree_dir,
             &head_sha,
-        ).ok();
+        )?;
 
         // 6. Perform actual Git mutation audit against held scope leases for this attempt
         let changed_files = if let Some(ref base) = task.base_sha {
@@ -899,27 +907,15 @@ impl CoordinatorEngine {
         } else {
             Vec::new()
         };
-        self.scope.audit_attempt_mutations(task_id, Some(&attempt_id), agent_id, &changed_files).ok();
+        self.scope.audit_attempt_mutations(task_id, Some(&attempt_id), agent_id, &changed_files)?;
 
         // 7. Verification checks gate evaluation
         let verify_res = self.verify.verify_task_submission(task_id, &head_sha)?;
 
         let now_finished = Utc::now().to_rfc3339();
-        let conn = self.db.lock();
 
         if verify_res.is_valid {
-            conn.execute(
-                "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', head_sha = ?1, updated_at = ?2 WHERE id = ?3",
-                params![head_sha, now_finished, task_id],
-            ).map_err(|e| e.to_string())?;
-
-            conn.execute(
-                "UPDATE task_attempts SET status = 'VERIFIED', head_sha = ?1, finished_at = ?2 WHERE id = ?3",
-                params![head_sha, now_finished, attempt_id],
-            ).ok();
-            drop(conn);
-
-            // Generate deterministic Proof-of-Completion bundle
+            // 8. Generate deterministic Proof-of-Completion bundle (strictly required before MERGE_READY)
             self.verify.generate_proof_bundle(
                 task_id,
                 &task.project_id,
@@ -929,23 +925,38 @@ impl CoordinatorEngine {
                 &head_sha,
                 &changed_files,
                 "Authoritative Coordinator Automated Verification Passed",
-            ).ok();
+            ).map_err(|e| format!("Failed to generate proof bundle: {}", e))?;
 
-            // Auto-enqueue for serialized merge queue
-            let _ = self.enqueue_task_by_id(&task.project_id, task_id);
+            // 9. Auto-enqueue for serialized merge queue (strictly required before MERGE_READY)
+            self.enqueue_task_by_id(&task.project_id, task_id)
+                .map_err(|e| format!("Failed to enqueue task in merge queue: {}", e))?;
+
+            // 10. Atomically transition state to MERGE_READY & attempt to VERIFIED
+            let conn = self.db.lock();
+            conn.execute(
+                "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', head_sha = ?1, updated_at = ?2 WHERE id = ?3",
+                params![head_sha, now_finished, task_id],
+            ).map_err(|e| format!("Failed to transition task to MERGE_READY: {}", e))?;
+
+            conn.execute(
+                "UPDATE task_attempts SET status = 'VERIFIED', head_sha = ?1, finished_at = ?2 WHERE id = ?3",
+                params![head_sha, now_finished, attempt_id],
+            ).map_err(|e| format!("Failed to update task attempt status: {}", e))?;
+            drop(conn);
 
             self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_VERIFIED", json!({ "head_sha": head_sha }));
         } else {
             let reasons_json = serde_json::to_string(&verify_res.rejection_reasons).unwrap_or_else(|_| "[]".to_string());
+            let conn = self.db.lock();
             conn.execute(
                 "UPDATE tasks SET state = 'FAILED', substate = 'NONE', updated_at = ?1 WHERE id = ?2",
                 params![now_finished, task_id],
-            ).ok();
+            ).map_err(|e| format!("Failed to set task to FAILED: {}", e))?;
 
             conn.execute(
                 "UPDATE task_attempts SET status = 'FAILED', rejection_reasons = ?1, finished_at = ?2 WHERE id = ?3",
                 params![reasons_json, now_finished, attempt_id],
-            ).ok();
+            ).map_err(|e| format!("Failed to update task attempt status: {}", e))?;
             drop(conn);
 
             self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_VERIFICATION_FAILED", json!({ "reasons": verify_res.rejection_reasons }));
@@ -961,8 +972,8 @@ impl CoordinatorEngine {
             return Err(format!("Task '{}' does not belong to project '{}'", task_id, project_id));
         }
 
-        if task.state != TaskState::Review && task.state != TaskState::MergeReady {
-            return Err(format!("Task '{}' is in state '{:?}'. Only tasks in REVIEW state can be enqueued for merge.", task_id, task.state));
+        if task.state != TaskState::Review && task.state != TaskState::MergeReady && task.state != TaskState::Verifying {
+            return Err(format!("Task '{}' is in state '{:?}'. Only tasks in VERIFYING, REVIEW, or MERGE_READY state can be enqueued for merge.", task_id, task.state));
         }
 
         let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
@@ -1564,6 +1575,12 @@ impl CoordinatorEngine {
             return Err("Cannot claim steps from an UNSORTED masterplan. Decompose the plan first via 'masterplan.decompose'.".to_string());
         }
 
+        if let Some(rc) = requested_count {
+            if rc <= 0 {
+                return Err(format!("Invalid chunk count {}: requested count must be greater than 0.", rc));
+            }
+        }
+
         let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
@@ -1829,6 +1846,27 @@ impl CoordinatorEngine {
 
     /// Automatically parses raw masterplan specification into structured execution steps
     pub fn parse_masterplan_text_to_steps(&self, raw_text: &str, _target_step_count: i32) -> Result<Vec<DecomposedStepInput>, String> {
+        let infer_scope = |title: &str, desc: &str| -> String {
+            let lower = format!("{} {}", title, desc).to_lowercase();
+            if lower.contains("backend") || lower.contains("rust") || lower.contains("src-tauri") || lower.contains("tauri") || lower.contains("mcp") || lower.contains("coordinator") || lower.contains("sqlite") || lower.contains("migration") || lower.contains("database") {
+                "src-tauri/**".to_string()
+            } else if lower.contains("frontend") || lower.contains("ui") || lower.contains("component") || lower.contains("react") || lower.contains("css") || lower.contains("view") || lower.contains("workbench") || lower.contains("modal") {
+                "src/**".to_string()
+            } else if lower.contains("crates/") {
+                "crates/**".to_string()
+            } else if lower.contains("packages/") {
+                "packages/**".to_string()
+            } else if lower.contains("apps/") {
+                "apps/**".to_string()
+            } else if lower.contains("test") || lower.contains("tests/") {
+                "tests/**".to_string()
+            } else if lower.contains("doc") || lower.contains("readme") || lower.contains("specification") {
+                "*.md".to_string()
+            } else {
+                "**".to_string()
+            }
+        };
+
         let mut steps = Vec::new();
         let lines: Vec<&str> = raw_text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
         let mut current_title: Option<String> = None;
@@ -1852,11 +1890,12 @@ impl CoordinatorEngine {
                     } else {
                         current_desc.join("\n")
                     };
+                    let scope = infer_scope(&title, &desc);
                     steps.push(DecomposedStepInput {
                         step_index,
                         title,
                         description: desc,
-                        suggested_scope: Some("src/**".to_string()),
+                        suggested_scope: Some(scope),
                         acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
                     });
                     step_index += 1;
@@ -1886,11 +1925,12 @@ impl CoordinatorEngine {
             } else {
                 current_desc.join("\n")
             };
+            let scope = infer_scope(&title, &desc);
             steps.push(DecomposedStepInput {
                 step_index,
                 title,
                 description: desc,
-                suggested_scope: Some("src/**".to_string()),
+                suggested_scope: Some(scope),
                 acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
             });
         }
@@ -1900,12 +1940,60 @@ impl CoordinatorEngine {
                 step_index: 1,
                 title: "Execute Masterplan Specification".to_string(),
                 description: raw_text.to_string(),
-                suggested_scope: Some("src/**".to_string()),
+                suggested_scope: Some("**".to_string()),
                 acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
             });
         }
 
         Ok(steps)
+    }
+
+    /// Automatically processes the next serialized merge in queue for a project
+    pub fn process_next_merge(&self, project_id: &str) -> Result<Option<IntegrationAttempt>, String> {
+        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
+        let queue = self.merge.list_queue(project_id)?;
+        let next_ready = queue.into_iter().find(|item| item.status == "READY");
+        if let Some(item) = next_ready {
+            let attempt = self.merge.process_merge_by_id(&item.id, Path::new(&proj.path))?;
+            Ok(Some(attempt))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reconciles task status, attempt, proof bundle, and merge queue health
+    pub fn reconcile_task(&self, task_id: &str) -> Result<serde_json::Value, String> {
+        let task = self.get_task(task_id)?;
+        let conn = self.db.lock();
+        let attempt: Option<(String, String)> = conn.query_row(
+            "SELECT id, status FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
+            [task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).ok();
+        let has_proof: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM proof_bundles WHERE task_id = ?1",
+            [task_id],
+            |r| r.get(0),
+        ).unwrap_or(false);
+        let queue_status: Option<String> = conn.query_row(
+            "SELECT status FROM merge_queue WHERE task_id = ?1 AND processed_at IS NULL",
+            [task_id],
+            |r| r.get(0),
+        ).ok();
+        drop(conn);
+
+        // Auto-heal if MERGE_READY but not enqueued
+        if task.state == TaskState::MergeReady && queue_status.is_none() {
+            let _ = self.enqueue_task_by_id(&task.project_id, task_id);
+        }
+
+        Ok(serde_json::json!({
+            "task_id": task.id,
+            "state": task.state.as_str(),
+            "attempt": attempt.map(|(id, st)| serde_json::json!({ "attempt_id": id, "status": st })),
+            "has_proof_bundle": has_proof,
+            "merge_queue_status": queue_status.unwrap_or_else(|| "NOT_ENQUEUED".to_string()),
+        }))
     }
 
     /// Single atomic backend operation: Saves revision, parses steps, normalizes scopes, decomposes, and emits event

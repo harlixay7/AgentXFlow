@@ -10,7 +10,34 @@ interface ReviewCenterProps {
 
 export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) => {
   const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [queuedTaskIds, setQueuedTaskIds] = useState<Set<string>>(new Set());
   const reviewTasks = tasks.filter((t) => t.state === 'REVIEW' || t.state === 'MERGE_READY');
+
+  React.useEffect(() => {
+    let isMounted = true;
+    const fetchQueue = async () => {
+      if (reviewTasks.length === 0) return;
+      const projectIds = Array.from(new Set(reviewTasks.map((t) => t.project_id)));
+      const ids = new Set<string>();
+      for (const pid of projectIds) {
+        try {
+          const items = await coordinatorApi.listMergeQueue(pid);
+          items.filter((item) => !item.processed_at).forEach((item) => ids.add(item.task_id));
+        } catch {
+          // ignore
+        }
+      }
+      if (isMounted) {
+        setQueuedTaskIds(ids);
+      }
+    };
+    fetchQueue();
+    const interval = setInterval(fetchQueue, 3000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [tasks]);
 
   const handleEnqueue = async (t: Task) => {
     setFeedback(null);
@@ -68,39 +95,41 @@ export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) 
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {reviewTasks.map((t) => (
-            <div
-              key={t.id}
-              style={{
-                backgroundColor: 'var(--bg-surface)',
-                border: '1px solid var(--border-medium)',
-                borderRadius: 'var(--radius-md)',
-                padding: 16,
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                    <span className={`badge badge-${t.state}`} style={{ marginRight: 4 }}>{t.state}</span>
-                    <span style={{ fontWeight: 700, fontSize: 13, fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', userSelect: 'text' }}>{t.id}: </span>
-                    <span style={{ fontWeight: 600, fontSize: 13, userSelect: 'text' }}>{t.title}</span>
+          {reviewTasks.map((t) => {
+            const isEnqueued = queuedTaskIds.has(t.id);
+            return (
+              <div
+                key={t.id}
+                style={{
+                  backgroundColor: 'var(--bg-surface)',
+                  border: '1px solid var(--border-medium)',
+                  borderRadius: 'var(--radius-md)',
+                  padding: 16,
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                      <span className={`badge badge-${t.state}`} style={{ marginRight: 4 }}>{t.state}</span>
+                      <span style={{ fontWeight: 700, fontSize: 13, fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', userSelect: 'text' }}>{t.id}: </span>
+                      <span style={{ fontWeight: 600, fontSize: 13, userSelect: 'text' }}>{t.title}</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', userSelect: 'text' }}>{t.description}</div>
                   </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-secondary)', userSelect: 'text' }}>{t.description}</div>
+                  {isEnqueued ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--accent-blue)', fontWeight: 600 }}>
+                      <Info size={14} /> Enqueued in Merge Queue
+                    </div>
+                  ) : (
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => handleEnqueue(t)}
+                      title="Move this verified task into the background merge queue"
+                    >
+                      <GitMerge size={13} /> Enqueue for 3-Way Merge
+                    </button>
+                  )}
                 </div>
-                {t.state === 'REVIEW' ? (
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => handleEnqueue(t)}
-                    title="Move this verified task into the background merge queue"
-                  >
-                    <GitMerge size={13} /> Enqueue for 3-Way Merge
-                  </button>
-                ) : (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--accent-blue)', fontWeight: 600 }}>
-                    <Info size={14} /> Enqueued in Merge Queue
-                  </div>
-                )}
-              </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 10, backgroundColor: 'var(--bg-card)', padding: 12, borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', fontSize: 11 }}>
                 <div style={{ color: 'var(--accent-green)', display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600 }} title="Coordinator verified test output against submitted commit HEAD">
@@ -117,7 +146,8 @@ export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) 
                 </div>
               </div>
             </div>
-          ))}
+          );
+        })}
         </div>
       )}
     </div>

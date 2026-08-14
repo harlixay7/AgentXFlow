@@ -125,6 +125,14 @@ export const coordinatorApi = {
     return await invoke('process_merge_by_id', { projectId, queueItemId });
   },
 
+  async processNextMerge(projectId: string): Promise<IntegrationAttempt | null> {
+    return await invoke('process_next_merge', { projectId });
+  },
+
+  async reconcileTask(taskId: string): Promise<Record<string, unknown>> {
+    return await invoke('reconcile_task', { taskId });
+  },
+
   async getEventsAfter(lastSequence: number): Promise<EventItem[]> {
     if (!isTauri) return [];
     return await invoke('get_events_after', { lastSequence });
