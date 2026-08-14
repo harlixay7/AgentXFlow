@@ -166,4 +166,19 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     // 8. Attempting to claim further should return clean error
     let no_more = engine.claim_masterplan_chunk(proj_id, &agent1.id, Some(4));
     assert!(no_more.is_err());
+
+    // 9. Verify Agent Registration Idempotency: Re-registering with the same name returns identical agent_id
+    let re_agent1 = engine.register_agent("Antigravity-Lead", "Antigravity").unwrap();
+    assert_eq!(re_agent1.id, agent1.id);
+    assert_eq!(re_agent1.session_token, agent1.session_token);
+
+    // 10. Verify Masterplan Reset: Executes cleanly without deadlock, clearing all steps and plan
+    let reset_res = engine.reset_masterplan(proj_id);
+    assert!(reset_res.is_ok(), "Resetting masterplan must succeed without deadlock: {:?}", reset_res.err());
+
+    let plan_after_reset = engine.get_masterplan(proj_id).unwrap();
+    assert!(plan_after_reset.is_none());
+
+    let steps_after_reset = engine.list_masterplan_steps(proj_id).unwrap();
+    assert_eq!(steps_after_reset.len(), 0);
 }

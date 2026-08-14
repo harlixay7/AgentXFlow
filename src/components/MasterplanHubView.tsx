@@ -147,6 +147,8 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
     }
     try {
       await invoke('reset_masterplan', { projectId });
+      setMasterplan(null);
+      setSteps([]);
       setIsEditing(true);
       await fetchPlan();
       onRefreshTasks();

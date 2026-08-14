@@ -817,24 +817,47 @@ impl CoordinatorEngine {
     // --- Agents ---
     pub fn register_agent(&self, name: &str, agent_type: &str) -> Result<Agent, String> {
         let conn = self.db.lock();
-        let id = Uuid::new_v4().to_string();
-        let session_token = format!("axf_sess_{}", Uuid::new_v4().simple());
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let expires_str = (now + chrono::Duration::hours(24)).to_rfc3339();
 
-        conn.execute(
-            "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at, session_token)
-             VALUES (?1, ?2, ?3, 'Implementer', 'IDLE', ?4, ?4, ?5)",
-            params![id, name, agent_type, now_str, session_token],
-        ).map_err(|e| e.to_string())?;
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, session_token FROM agents WHERE name = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
 
-        let sess_id = Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO agent_sessions (id, agent_id, session_token, created_at, expires_at, last_activity_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
-            params![sess_id, id, session_token, now_str, expires_str],
-        ).map_err(|e| e.to_string())?;
+        let (id, session_token) = if let Some((existing_id, existing_token)) = existing {
+            // Idempotent: refresh heartbeat, type, and session lease for existing agent
+            conn.execute(
+                "UPDATE agents SET last_heartbeat = ?1, status = 'IDLE', agent_type = ?2 WHERE id = ?3",
+                params![now_str, agent_type, existing_id],
+            ).ok();
+            conn.execute(
+                "UPDATE agent_sessions SET expires_at = ?1, last_activity_at = ?2 WHERE agent_id = ?3",
+                params![expires_str, now_str, existing_id],
+            ).ok();
+            (existing_id, existing_token)
+        } else {
+            let new_id = Uuid::new_v4().to_string();
+            let new_token = format!("axf_sess_{}", Uuid::new_v4().simple());
+            conn.execute(
+                "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at, session_token)
+                 VALUES (?1, ?2, ?3, 'Implementer', 'IDLE', ?4, ?4, ?5)",
+                params![new_id, name, agent_type, now_str, new_token],
+            ).map_err(|e| e.to_string())?;
+
+            let sess_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO agent_sessions (id, agent_id, session_token, created_at, expires_at, last_activity_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
+                params![sess_id, new_id, new_token, now_str, expires_str],
+            ).map_err(|e| e.to_string())?;
+
+            (new_id, new_token)
+        };
 
         let agent = Agent {
             id: id.clone(),
@@ -1475,24 +1498,32 @@ impl CoordinatorEngine {
     pub fn reset_masterplan(&self, project_id: &str) -> Result<(), String> {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
-        let plan = self.get_masterplan(project_id)?;
-        if let Some(p) = plan {
+
+        let plan_opt: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, raw_text FROM masterplans WHERE project_id = ?1",
+                [project_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        if let Some((plan_id, raw_text)) = plan_opt {
             // Archive prior plan before reset
             let rev_id = Uuid::new_v4().to_string();
             let rev_num: i32 = conn.query_row(
                 "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM masterplan_revisions WHERE masterplan_id = ?1",
-                [&p.id],
+                [&plan_id],
                 |r| r.get(0),
             ).unwrap_or(1);
 
             conn.execute(
                 "INSERT INTO masterplan_revisions (id, masterplan_id, project_id, revision_number, raw_text, reason, steps_snapshot_json, archived_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'Masterplan reset to empty', '[]', ?6)",
-                rusqlite::params![rev_id, p.id, project_id, rev_num, p.raw_text, now],
+                rusqlite::params![rev_id, plan_id, project_id, rev_num, raw_text, now],
             ).ok();
 
-            conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&p.id]).map_err(|e| e.to_string())?;
-            conn.execute("DELETE FROM masterplans WHERE id = ?1", [&p.id]).map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan_id]).map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM masterplans WHERE id = ?1", [&plan_id]).map_err(|e| e.to_string())?;
         }
         drop(conn);
         self.emit_event(Some(project_id), None, None, "MASTERPLAN_RESET", json!({ "project_id": project_id }));

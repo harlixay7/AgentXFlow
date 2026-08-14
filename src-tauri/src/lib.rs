@@ -339,8 +339,11 @@ pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_port = 7890;
 
     let mcp_server = McpServer::new(coordinator, mcp_port, security);
-    mcp_server.start().await?;
-    Ok(())
+    let addr = mcp_server.start().await.map_err(|e| format!("Failed to start MCP server: {}", e))?;
+    println!("AgentXFlow Coordinator Daemon running on http://{}", addr);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

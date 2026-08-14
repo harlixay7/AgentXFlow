@@ -345,8 +345,23 @@ fn execute_mcp_tool(
                 ));
             }
             Ok(agent.id.clone())
+        } else if !req_id.is_empty() {
+            if state.coordinator.is_agent_registered(req_id) {
+                Ok(req_id.to_string())
+            } else {
+                Err(format!(
+                    "Agent '{}' is not registered. Call 'agent_register' with your agent name first.",
+                    req_id
+                ))
+            }
         } else {
-            Err("Authenticated agent session required for state mutations. Call 'agent_register' with bootstrap auth to obtain a session token.".to_string())
+            // Check if there is exactly one registered agent on the coordinator
+            let agents = state.coordinator.list_agents().unwrap_or_default();
+            if agents.len() == 1 {
+                Ok(agents[0].id.clone())
+            } else {
+                Err("Missing 'agent_id' parameter. Pass 'agent_id' or call 'agent_register'.".to_string())
+            }
         }
     };
 

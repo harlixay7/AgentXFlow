@@ -57,7 +57,7 @@ The coordinator enforces task integrity on the server. You cannot mark tasks don
 ## 3. Rules to Follow
 
 1. **Discover Context First**: Call `agentxflow_current_context` to determine current project handoff instructions.
-2. **Register Before Modifying State**: Call `agent_register` to receive your session token.
+2. **Register Before Modifying State**: Call `agent_register` to receive your session token. Registration is idempotent—re-calling with the same name refreshes your session and preserves your agent ID.
 3. **Always Pass Exact Project ID**: Never guess project IDs; retrieve exact IDs via `project_list` or `agentxflow_current_context`.
 4. **Decompose Unsorted Masterplans**: If `masterplan_get` reports `status: "UNSORTED"`, read the full specification and call `masterplan_decompose` preserving all requirements.
 5. **Respect Chunk Caps**: Claims are capped by anti-hoarding limits to prevent starvation.
