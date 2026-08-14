@@ -11,6 +11,30 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
          PRAGMA foreign_keys = ON;"
     )?;
 
+    // Schema Patching for Existing Databases
+    if let Ok(mut check_sessions_stmt) = conn.prepare("PRAGMA table_info(agent_sessions)") {
+        let session_cols = check_sessions_stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map(|rows| rows.flatten().collect::<Vec<String>>())
+            .unwrap_or_default();
+
+        if !session_cols.is_empty() && !session_cols.contains(&"session_token".to_string()) {
+            info!("Upgrading legacy agent_sessions table schema to authoritative session format...");
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS agent_sessions;
+                 CREATE TABLE agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    session_token TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL,
+                    FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+                 );"
+            )?;
+        }
+    }
+
     conn.execute_batch(
         "
         -- Projects
