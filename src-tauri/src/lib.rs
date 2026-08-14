@@ -238,6 +238,22 @@ fn process_merge_by_id(
 }
 
 #[tauri::command]
+fn process_next_merge(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<Option<IntegrationAttempt>, String> {
+    state.coordinator.process_next_merge(&project_id)
+}
+
+#[tauri::command]
+fn reconcile_task(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+) -> Result<serde_json::Value, String> {
+    state.coordinator.reconcile_task(&task_id)
+}
+
+#[tauri::command]
 fn get_events_after(
     state: State<'_, Arc<AppState>>,
     last_sequence: i64,
@@ -371,9 +387,22 @@ pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let security = SecurityManager::init_or_load(&data_dir)?;
     let mcp_port = 7890;
 
-    let mcp_server = McpServer::new(coordinator, mcp_port, security);
+    let mcp_server = McpServer::new(coordinator.clone(), mcp_port, security);
     let addr = mcp_server.start().await.map_err(|e| format!("Failed to start MCP server: {}", e))?;
     println!("AgentXFlow Coordinator Daemon running on http://{}", addr);
+
+    let bg_coordinator = coordinator.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            if let Ok(projects) = bg_coordinator.list_projects() {
+                for p in projects {
+                    let _ = bg_coordinator.process_next_merge(&p.id);
+                }
+            }
+        }
+    });
+
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
     }
@@ -399,6 +428,19 @@ pub fn run() {
     tauri::async_runtime::spawn(async move {
         if let Err(e) = mcp_server.start().await {
             eprintln!("Failed to start MCP server: {}", e);
+        }
+    });
+
+    // Autonomous coordinator background merge queue worker
+    let bg_coordinator = coordinator.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            if let Ok(projects) = bg_coordinator.list_projects() {
+                for p in projects {
+                    let _ = bg_coordinator.process_next_merge(&p.id);
+                }
+            }
         }
     });
 
@@ -436,6 +478,8 @@ pub fn run() {
             list_merge_queue,
             enqueue_task_by_id,
             process_merge_by_id,
+            process_next_merge,
+            reconcile_task,
             get_events_after,
             get_context_pack,
             register_agent,

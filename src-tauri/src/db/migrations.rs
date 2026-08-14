@@ -50,6 +50,14 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         }
     }
 
+    // Defensive schema verification before accepting coordinator operations
+    verify_schema_integrity(conn).map_err(|e| rusqlite::Error::SqlInputError {
+        error: rusqlite::ffi::Error::new(1),
+        msg: e,
+        sql: String::new(),
+        offset: 0,
+    })?;
+
     Ok(())
 }
 
@@ -84,6 +92,11 @@ fn get_all_migrations() -> Vec<Migration> {
             version: 6,
             name: "task_masterplan_lifecycle_and_stale_invalidation",
             run: migration_0006_task_masterplan_lifecycle_and_stale_invalidation,
+        },
+        Migration {
+            version: 7,
+            name: "normalize_proof_bundles_task_attempts_and_evaluators",
+            run: migration_0007_normalize_proof_bundles_task_attempts_and_evaluators,
         },
     ]
 }
@@ -799,6 +812,219 @@ fn migration_0006_task_masterplan_lifecycle_and_stale_invalidation(tx: &Transact
         CREATE INDEX IF NOT EXISTS idx_tasks_state_stale ON tasks(state, is_stale);
         "
     )?;
+
+    Ok(())
+}
+
+fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Transaction) -> Result<()> {
+    // 1. Defensively normalize proof_bundles table
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS proof_bundles (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            agent_id TEXT,
+            attempt_id TEXT,
+            attempt_number INTEGER NOT NULL DEFAULT 1,
+            prompt TEXT NOT NULL DEFAULT '',
+            base_sha TEXT NOT NULL DEFAULT '',
+            head_sha TEXT NOT NULL DEFAULT '',
+            files_changed_json TEXT NOT NULL DEFAULT '[]',
+            diff_summary TEXT NOT NULL DEFAULT '',
+            verification_runs_json TEXT NOT NULL DEFAULT '[]',
+            criteria_json TEXT NOT NULL DEFAULT '[]',
+            steps_json TEXT NOT NULL DEFAULT '[]',
+            proof_hash TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+        "
+    )?;
+
+    let mut check_pb_stmt = tx.prepare("PRAGMA table_info(proof_bundles)")?;
+    let pb_cols = check_pb_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_pb_stmt);
+
+    if !pb_cols.contains(&"agent_id".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN agent_id TEXT;")?;
+    }
+    if !pb_cols.contains(&"attempt_id".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN attempt_id TEXT;")?;
+    }
+    if !pb_cols.contains(&"attempt_number".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;")?;
+    }
+    if !pb_cols.contains(&"prompt".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN prompt TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !pb_cols.contains(&"base_sha".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !pb_cols.contains(&"head_sha".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN head_sha TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !pb_cols.contains(&"files_changed_json".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN files_changed_json TEXT NOT NULL DEFAULT '[]';")?;
+    }
+    if !pb_cols.contains(&"diff_summary".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN diff_summary TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !pb_cols.contains(&"verification_runs_json".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN verification_runs_json TEXT NOT NULL DEFAULT '[]';")?;
+    }
+    if !pb_cols.contains(&"criteria_json".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';")?;
+    }
+    if !pb_cols.contains(&"steps_json".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';")?;
+    }
+    if !pb_cols.contains(&"generated_at".to_string()) {
+        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN generated_at TEXT NOT NULL DEFAULT '';")?;
+    }
+
+    // 2. Defensively normalize task_attempts table
+    let mut check_ta_stmt = tx.prepare("PRAGMA table_info(task_attempts)")?;
+    let ta_cols = check_ta_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_ta_stmt);
+
+    if !ta_cols.contains(&"run_number".to_string()) {
+        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN run_number INTEGER NOT NULL DEFAULT 1;")?;
+    }
+    if !ta_cols.contains(&"attempt_number".to_string()) {
+        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;")?;
+    }
+    if !ta_cols.contains(&"rejection_reasons".to_string()) {
+        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN rejection_reasons TEXT;")?;
+    }
+    if !ta_cols.contains(&"base_sha".to_string()) {
+        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN base_sha TEXT;")?;
+    }
+    if !ta_cols.contains(&"head_sha".to_string()) {
+        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN head_sha TEXT;")?;
+    }
+
+    // Backfill run_number from attempt_number or vice versa where available
+    tx.execute_batch(
+        "
+        UPDATE task_attempts SET run_number = attempt_number WHERE run_number IS NULL OR run_number = 0;
+        UPDATE task_attempts SET attempt_number = run_number WHERE attempt_number IS NULL OR attempt_number = 0;
+        "
+    )?;
+
+    // 3. Ensure evaluator_results table exists with all columns
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS evaluator_results (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            criterion_id TEXT,
+            evaluator_name TEXT NOT NULL,
+            evaluator_type TEXT NOT NULL,
+            evaluator_version TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            stdout_output TEXT NOT NULL,
+            stderr_output TEXT NOT NULL,
+            output_sha256 TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            passed BOOLEAN NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+        "
+    )?;
+
+    // 4. Ensure merge_queue table has all tracking columns
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS merge_queue (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'READY',
+            enqueued_at TEXT NOT NULL,
+            base_sha TEXT,
+            head_sha TEXT,
+            queued_at TEXT,
+            processed_at TEXT,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+        "
+    )?;
+
+    let mut check_mq_stmt = tx.prepare("PRAGMA table_info(merge_queue)")?;
+    let mq_cols = check_mq_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_mq_stmt);
+
+    if !mq_cols.contains(&"base_sha".to_string()) {
+        tx.execute_batch("ALTER TABLE merge_queue ADD COLUMN base_sha TEXT;")?;
+    }
+    if !mq_cols.contains(&"head_sha".to_string()) {
+        tx.execute_batch("ALTER TABLE merge_queue ADD COLUMN head_sha TEXT;")?;
+    }
+    if !mq_cols.contains(&"queued_at".to_string()) {
+        tx.execute_batch("ALTER TABLE merge_queue ADD COLUMN queued_at TEXT;")?;
+    }
+    if !mq_cols.contains(&"processed_at".to_string()) {
+        tx.execute_batch("ALTER TABLE merge_queue ADD COLUMN processed_at TEXT;")?;
+    }
+
+    // 5. Create supporting indexes
+    tx.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_proof_bundles_task_attempt ON proof_bundles(task_id, attempt_number);
+        CREATE INDEX IF NOT EXISTS idx_evaluator_results_attempt_passed ON evaluator_results(attempt_id, passed);
+        CREATE INDEX IF NOT EXISTS idx_merge_queue_project_status ON merge_queue(project_id, status);
+        "
+    )?;
+
+    Ok(())
+}
+
+/// Verifies that all required database tables and columns exist before accepting coordinator traffic
+pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
+    // 1. Verify proof_bundles
+    let mut check_pb = conn.prepare("PRAGMA table_info(proof_bundles)").map_err(|e| e.to_string())?;
+    let pb_cols: Vec<String> = check_pb.query_map([], |r| r.get(1)).map_err(|e| e.to_string())?.flatten().collect();
+    drop(check_pb);
+    for col in &["id", "task_id", "project_id", "attempt_number", "verification_runs_json", "criteria_json", "steps_json", "proof_hash", "generated_at"] {
+        if !pb_cols.iter().any(|c| c == col) {
+            return Err(format!("Schema verification failed: column '{}' missing from proof_bundles", col));
+        }
+    }
+
+    // 2. Verify task_attempts
+    let mut check_ta = conn.prepare("PRAGMA table_info(task_attempts)").map_err(|e| e.to_string())?;
+    let ta_cols: Vec<String> = check_ta.query_map([], |r| r.get(1)).map_err(|e| e.to_string())?.flatten().collect();
+    drop(check_ta);
+    for col in &["id", "task_id", "attempt_number", "run_number", "status", "started_at"] {
+        if !ta_cols.iter().any(|c| c == col) {
+            return Err(format!("Schema verification failed: column '{}' missing from task_attempts", col));
+        }
+    }
+
+    // 3. Verify evaluator_results
+    let mut check_er = conn.prepare("PRAGMA table_info(evaluator_results)").map_err(|e| e.to_string())?;
+    let er_cols: Vec<String> = check_er.query_map([], |r| r.get(1)).map_err(|e| e.to_string())?.flatten().collect();
+    drop(check_er);
+    for col in &["id", "task_id", "attempt_id", "evaluator_name", "passed", "evaluated_at"] {
+        if !er_cols.iter().any(|c| c == col) {
+            return Err(format!("Schema verification failed: column '{}' missing from evaluator_results", col));
+        }
+    }
 
     Ok(())
 }

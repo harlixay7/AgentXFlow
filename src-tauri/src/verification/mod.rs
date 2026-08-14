@@ -310,19 +310,19 @@ impl VerificationEngine {
                     eval_res.stderr_output, eval_res.output_sha256, eval_res.duration_ms,
                     eval_res.passed, eval_res.evaluated_at
                 ],
-            ).ok();
+            ).map_err(|e| format!("Failed to record evaluator result for '{}': {}", eval_res.evaluator_name, e))?;
 
             results.push(eval_res);
         }
 
-        // Automatic machine criteria satisfaction derived from passing evaluators
+        // Automatic machine criteria satisfaction derived strictly from passing evaluators
         let all_evaluators_passed = !results.is_empty() && results.iter().all(|r| r.passed);
         if all_evaluators_passed {
             let conn = self.db.lock();
             conn.execute(
                 "UPDATE acceptance_criteria SET is_satisfied = 1 WHERE task_id = ?1",
                 [task_id],
-            ).ok();
+            ).map_err(|e| format!("Failed to update acceptance criteria: {}", e))?;
         }
 
         Ok(results)
@@ -386,6 +386,25 @@ impl VerificationEngine {
             }
         }
 
+        // 4. Evaluator Results Gate (Verifies Machine Evaluators for commit SHA)
+        let mut stmt_evals = conn
+            .prepare("SELECT evaluator_name, passed, exit_code FROM evaluator_results WHERE task_id = ?1 AND commit_sha = ?2")
+            .map_err(|e| e.to_string())?;
+
+        let evals_iter = stmt_evals
+            .query_map(rusqlite::params![task_id, current_head_sha], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, i32>(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut failed_evaluators = Vec::new();
+        for ev in evals_iter.flatten() {
+            let (name, passed, exit_code) = ev;
+            if !passed {
+                failed_evaluators.push(format!("Machine evaluator '{}' failed (exit code: {})", name, exit_code));
+            }
+        }
+
         let mut rejection_reasons = Vec::new();
         if total_runs_count == 0 {
             rejection_reasons.push("UNVERIFIED: Zero coordinator verification checks were executed against submitted commit HEAD. At least one passing check is required.".to_string());
@@ -398,6 +417,9 @@ impl VerificationEngine {
         }
         for check in &failed_checks {
             rejection_reasons.push(format!("Coordinator verification check '{}' failed or is stale", check));
+        }
+        for eval_err in &failed_evaluators {
+            rejection_reasons.push(eval_err.clone());
         }
 
         let is_valid = rejection_reasons.is_empty();
@@ -457,6 +479,44 @@ impl VerificationEngine {
             verification_runs.push(r);
         }
 
+        // Retrieve active attempt ID and attempt number
+        let (attempt_id, attempt_num): (String, i32) = conn
+            .query_row(
+                "SELECT id, attempt_number FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or_else(|_| (Uuid::new_v4().to_string(), 1));
+
+        // Fetch task criteria and steps snapshots for audit log
+        let mut criteria_stmt = conn.prepare("SELECT id, criterion, is_satisfied FROM acceptance_criteria WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let criteria_json: String = criteria_stmt
+            .query_map([task_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "criterion": r.get::<_, String>(1)?,
+                    "is_satisfied": r.get::<_, bool>(2)?,
+                }))
+            })
+            .map(|iter| serde_json::to_string(&iter.flatten().collect::<Vec<_>>()).unwrap_or("[]".to_string()))
+            .unwrap_or("[]".to_string());
+        drop(criteria_stmt);
+
+        let mut steps_stmt = conn.prepare("SELECT id, title, description, is_mandatory, status FROM task_steps WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let steps_json: String = steps_stmt
+            .query_map([task_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "title": r.get::<_, String>(1)?,
+                    "description": r.get::<_, String>(2)?,
+                    "is_mandatory": r.get::<_, bool>(3)?,
+                    "status": r.get::<_, String>(4)?,
+                }))
+            })
+            .map(|iter| serde_json::to_string(&iter.flatten().collect::<Vec<_>>()).unwrap_or("[]".to_string()))
+            .unwrap_or("[]".to_string());
+        drop(steps_stmt);
+
         // Canonical deterministic SHA256 digest across all verified package attributes
         let mut hasher = Sha256::new();
         hasher.update(task_id.as_bytes());
@@ -493,14 +553,14 @@ impl VerificationEngine {
         let id = Uuid::new_v4().to_string();
 
         conn.execute(
-            "INSERT OR REPLACE INTO proof_bundles (id, task_id, project_id, agent_id, attempt_number, prompt, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash, generated_at)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, '[]', '[]', ?11, ?12)",
+            "INSERT OR REPLACE INTO proof_bundles (id, task_id, project_id, agent_id, attempt_id, attempt_number, prompt, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash, generated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
-                id, bundle.task_id, bundle.project_id, bundle.agent_id, bundle.prompt,
-                bundle.base_sha, bundle.head_sha, files_json, bundle.diff_summary,
-                verification_runs_json, bundle.proof_hash, bundle.generated_at
+                id, bundle.task_id, bundle.project_id, bundle.agent_id, attempt_id, attempt_num,
+                bundle.prompt, bundle.base_sha, bundle.head_sha, files_json, bundle.diff_summary,
+                verification_runs_json, criteria_json, steps_json, bundle.proof_hash, bundle.generated_at
             ],
-        ).map_err(|e| e.to_string())?;
+        ).map_err(|e| format!("Failed to record proof bundle: {}", e))?;
 
         Ok(bundle)
     }
