@@ -128,6 +128,7 @@ async fn test_manual_live_end_to_end_system() {
         .send().await.unwrap();
     let agent_a_json: serde_json::Value = agent_a_resp.json().await.unwrap();
     let agent_a_id = agent_a_json["result"]["id"].as_str().unwrap().to_string();
+    let session_token_a = agent_a_json["result"]["session_token"].as_str().unwrap().to_string();
 
     let agent_b_resp = client.post(format!("{}/mcp", base_url))
         .header("Authorization", format!("Bearer {}", initial_token))
@@ -140,12 +141,13 @@ async fn test_manual_live_end_to_end_system() {
         .send().await.unwrap();
     let agent_b_json: serde_json::Value = agent_b_resp.json().await.unwrap();
     let agent_b_id = agent_b_json["result"]["id"].as_str().unwrap().to_string();
+    let session_token_b = agent_b_json["result"]["session_token"].as_str().unwrap().to_string();
 
     println!("8. Registered Agent A ({}) and Agent B ({})", &agent_a_id[0..8], &agent_b_id[0..8]);
 
     // 9. Send Heartbeats
     let hb_resp = client.post(format!("{}/mcp", base_url))
-        .header("Authorization", format!("Bearer {}", initial_token))
+        .header("Authorization", format!("Bearer {}", session_token_a))
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 6,
@@ -181,7 +183,7 @@ async fn test_manual_live_end_to_end_system() {
 
     // 12. Agent A Claims Task -> Tests Worktree Allocation
     let claim_resp = client.post(format!("{}/mcp", base_url))
-        .header("Authorization", format!("Bearer {}", initial_token))
+        .header("Authorization", format!("Bearer {}", session_token_a))
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 7,
@@ -197,7 +199,7 @@ async fn test_manual_live_end_to_end_system() {
 
     // 13. Acquire Exclusive Scope Lock on 'src/auth/**'
     let scope_resp = client.post(format!("{}/mcp", base_url))
-        .header("Authorization", format!("Bearer {}", initial_token))
+        .header("Authorization", format!("Bearer {}", session_token_a))
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 8,
@@ -212,7 +214,7 @@ async fn test_manual_live_end_to_end_system() {
     let task_b = coordinator.create_task(&proj.id, "Conflicting Task", "Desc", "HIGH", vec![], vec![]).unwrap();
     coordinator.claim_task(&task_b.id, &agent_b_id).unwrap();
     let conflict_scope_resp = client.post(format!("{}/mcp", base_url))
-        .header("Authorization", format!("Bearer {}", initial_token))
+        .header("Authorization", format!("Bearer {}", session_token_b))
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 9,
@@ -245,7 +247,7 @@ async fn test_manual_live_end_to_end_system() {
     let details_before = coordinator.get_task_details(&task.id).unwrap();
     for step in &details_before.steps {
         let step_resp = client.post(format!("{}/mcp", base_url))
-            .header("Authorization", format!("Bearer {}", initial_token))
+            .header("Authorization", format!("Bearer {}", session_token_a))
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 10,
@@ -276,7 +278,7 @@ async fn test_manual_live_end_to_end_system() {
 
     // 17. Submit Task to Authoritative Verification Gate
     let submit_resp = client.post(format!("{}/mcp", base_url))
-        .header("Authorization", format!("Bearer {}", initial_token))
+        .header("Authorization", format!("Bearer {}", session_token_a))
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 11,

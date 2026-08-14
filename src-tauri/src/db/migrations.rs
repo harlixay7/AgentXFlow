@@ -1,41 +1,85 @@
-use rusqlite::{Connection, Result};
+use chrono::Utc;
+use rusqlite::{Connection, Result, Transaction};
 use tracing::info;
 
-pub fn run_migrations(conn: &mut Connection) -> Result<()> {
-    info!("Running database schema migrations for AgentXFlow V2...");
+pub struct Migration {
+    pub version: i32,
+    pub name: &'static str,
+    pub run: fn(&Transaction) -> Result<()>,
+}
 
-    // Enable WAL mode & foreign keys for asynchronous local performance
+pub fn run_migrations(conn: &mut Connection) -> Result<()> {
+    info!("Running versioned database schema migrations for AgentXFlow...");
+
+    // Enable WAL mode & foreign keys for concurrency and durability
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;"
     )?;
 
-    // Schema Patching for Existing Databases
-    if let Ok(mut check_sessions_stmt) = conn.prepare("PRAGMA table_info(agent_sessions)") {
-        let session_cols = check_sessions_stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .map(|rows| rows.flatten().collect::<Vec<String>>())
-            .unwrap_or_default();
+    // Ensure migration history tracker table exists
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        );"
+    )?;
 
-        if !session_cols.is_empty() && !session_cols.contains(&"session_token".to_string()) {
-            info!("Upgrading legacy agent_sessions table schema to authoritative session format...");
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS agent_sessions;
-                 CREATE TABLE agent_sessions (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT NOT NULL,
-                    session_token TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    last_activity_at TEXT NOT NULL,
-                    FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
-                 );"
+    let migrations = get_all_migrations();
+
+    for m in migrations {
+        let already_applied: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM _schema_migrations WHERE version = ?1",
+            [m.version],
+            |row| row.get(0),
+        )?;
+
+        if !already_applied {
+            info!("Applying database migration #{:04}: {}...", m.version, m.name);
+            let tx = conn.transaction()?;
+            (m.run)(&tx)?;
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![m.version, m.name, now],
             )?;
+            tx.commit()?;
+            info!("Migration #{:04}: {} successfully applied.", m.version, m.name);
         }
     }
 
-    conn.execute_batch(
+    Ok(())
+}
+
+fn get_all_migrations() -> Vec<Migration> {
+    vec![
+        Migration {
+            version: 1,
+            name: "core_control_plane_entities",
+            run: migration_0001_core_entities,
+        },
+        Migration {
+            version: 2,
+            name: "authoritative_session_security",
+            run: migration_0002_authoritative_session_security,
+        },
+        Migration {
+            version: 3,
+            name: "immutable_proofs_and_masterplan_revisions",
+            run: migration_0003_immutable_proofs_and_revisions,
+        },
+        Migration {
+            version: 4,
+            name: "crash_safe_claim_and_merge_metadata",
+            run: migration_0004_claim_and_merge_metadata,
+        },
+    ]
+}
+
+fn migration_0001_core_entities(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
         "
         -- Projects
         CREATE TABLE IF NOT EXISTS projects (
@@ -98,46 +142,24 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             description TEXT NOT NULL,
             state TEXT NOT NULL DEFAULT 'BACKLOG',
             substate TEXT NOT NULL DEFAULT 'NONE',
-            assigned_agent_id TEXT,
             priority TEXT NOT NULL DEFAULT 'MEDIUM',
-            risk_score REAL NOT NULL DEFAULT 0.0,
+            risk_score REAL DEFAULT 0.0,
             estimated_scope TEXT,
+            assigned_agent_id TEXT,
+            assigned_profile_id TEXT,
+            allocated_budget_usd REAL,
+            spent_budget_usd REAL DEFAULT 0.0,
             worktree_path TEXT,
             branch_name TEXT,
             base_sha TEXT,
             head_sha TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(parent_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
 
-        -- Task Dependency Graph (DAG)
-        CREATE TABLE IF NOT EXISTS task_dependencies (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            depends_on_task_id TEXT NOT NULL,
-            dependency_type TEXT NOT NULL DEFAULT 'BLOCKS',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-            FOREIGN KEY(depends_on_task_id) REFERENCES tasks(id) ON DELETE CASCADE
-        );
-
-        -- Task Attempts (Execution Runs History)
-        CREATE TABLE IF NOT EXISTS task_attempts (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            run_number INTEGER NOT NULL,
-            base_sha TEXT NOT NULL,
-            head_sha TEXT,
-            worktree_path TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            status TEXT NOT NULL DEFAULT 'RUNNING',
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-        );
-
-        -- Task Steps (Checklist)
+        -- Linear Steps within a Task
         CREATE TABLE IF NOT EXISTS task_steps (
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
@@ -150,7 +172,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
 
-        -- Acceptance Criteria
+        -- Authoritative Acceptance Criteria
         CREATE TABLE IF NOT EXISTS acceptance_criteria (
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
@@ -160,14 +182,68 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
 
-        -- Agents
+        -- Task Dependencies (DAG)
+        CREATE TABLE IF NOT EXISTS task_dependencies (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            depends_on_task_id TEXT NOT NULL,
+            dependency_type TEXT NOT NULL DEFAULT 'BLOCKS',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(depends_on_task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        -- Exclusive & Shared Scope Leases
+        CREATE TABLE IF NOT EXISTS scope_leases (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            access_type TEXT NOT NULL DEFAULT 'EXCLUSIVE_WRITE',
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        -- Recorded Scope Violations
+        CREATE TABLE IF NOT EXISTS scope_violations (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            violation_type TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            resolved BOOLEAN NOT NULL DEFAULT 0,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        -- Autonomous Verification Runs
+        CREATE TABLE IF NOT EXISTS verification_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            run_id TEXT,
+            check_id TEXT NOT NULL,
+            check_name TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            command TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            stdout TEXT,
+            stderr TEXT,
+            duration_ms INTEGER NOT NULL,
+            is_passed BOOLEAN NOT NULL,
+            is_stale BOOLEAN NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'COORDINATOR_OBSERVED',
+            executed_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        -- Registered Autonomous Agents
         CREATE TABLE IF NOT EXISTS agents (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             agent_type TEXT NOT NULL,
-            profile TEXT NOT NULL DEFAULT 'Implementer',
+            profile TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'IDLE',
-            capabilities_json TEXT NOT NULL DEFAULT '{}',
             last_heartbeat TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
@@ -182,18 +258,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             permission_policy TEXT NOT NULL
         );
 
-        -- Authenticated Agent Sessions
-        CREATE TABLE IF NOT EXISTS agent_sessions (
-            id TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL,
-            session_token TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            last_activity_at TEXT NOT NULL,
-            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
-        );
-
-        -- Agent Execution Runs & Subagents
+        -- Agent Execution Runs
         CREATE TABLE IF NOT EXISTS agent_runs (
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
@@ -221,89 +286,6 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             status TEXT NOT NULL DEFAULT 'PENDING',
             requested_at TEXT NOT NULL,
             responded_at TEXT,
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-        );
-
-        -- Scope Leases (Exclusive / Shared File Locks)
-        CREATE TABLE IF NOT EXISTS scope_leases (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            pattern TEXT NOT NULL,
-            access_type TEXT NOT NULL DEFAULT 'EXCLUSIVE_WRITE',
-            expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-        );
-
-        -- Scope Violations
-        CREATE TABLE IF NOT EXISTS scope_violations (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            violation_type TEXT NOT NULL,
-            detected_at TEXT NOT NULL,
-            resolved BOOLEAN NOT NULL DEFAULT 0,
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-        );
-
-        -- Worktrees Registry
-        CREATE TABLE IF NOT EXISTS worktrees (
-            id TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL,
-            task_id TEXT NOT NULL,
-            worktree_path TEXT NOT NULL UNIQUE,
-            branch_name TEXT NOT NULL,
-            base_sha TEXT NOT NULL,
-            is_integration BOOLEAN NOT NULL DEFAULT 0,
-            is_healthy BOOLEAN NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
-        );
-
-        -- Verification Profiles
-        CREATE TABLE IF NOT EXISTS verification_profiles (
-            id TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            checks_json TEXT NOT NULL,
-            is_default BOOLEAN NOT NULL DEFAULT 1,
-            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
-        );
-
-        -- Coordinator-Executed Verification Runs
-        CREATE TABLE IF NOT EXISTS verification_runs (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            run_id TEXT,
-            check_id TEXT NOT NULL,
-            check_name TEXT NOT NULL,
-            commit_sha TEXT NOT NULL,
-            command TEXT NOT NULL,
-            exit_code INTEGER NOT NULL,
-            stdout TEXT NOT NULL,
-            stderr TEXT NOT NULL,
-            duration_ms INTEGER NOT NULL DEFAULT 0,
-            is_passed BOOLEAN NOT NULL,
-            is_stale BOOLEAN NOT NULL DEFAULT 0,
-            executed_at TEXT NOT NULL,
-            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-        );
-
-        -- Proof Bundles
-        CREATE TABLE IF NOT EXISTS proof_bundles (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL UNIQUE,
-            project_id TEXT NOT NULL,
-            agent_id TEXT,
-            prompt TEXT NOT NULL,
-            base_sha TEXT NOT NULL,
-            head_sha TEXT NOT NULL,
-            files_changed_json TEXT NOT NULL,
-            diff_summary TEXT NOT NULL,
-            proof_hash TEXT NOT NULL,
-            generated_at TEXT NOT NULL,
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
 
@@ -337,7 +319,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             FOREIGN KEY(merge_queue_id) REFERENCES merge_queue(id) ON DELETE CASCADE
         );
 
-        -- Ordered Event Sequence Stream (Replaces 4s Full Polling)
+        -- Ordered Event Sequence Stream
         CREATE TABLE IF NOT EXISTS events (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             event_id TEXT NOT NULL UNIQUE,
@@ -405,7 +387,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
 
-        -- Indexes for High Performance Querying
+        -- Base Indexes
         CREATE INDEX IF NOT EXISTS idx_tasks_project_state ON tasks(project_id, state);
         CREATE INDEX IF NOT EXISTS idx_task_deps_task_id ON task_dependencies(task_id);
         CREATE INDEX IF NOT EXISTS idx_task_deps_depends_on ON task_dependencies(depends_on_task_id);
@@ -417,11 +399,155 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_masterplans_project ON masterplans(project_id);
         CREATE INDEX IF NOT EXISTS idx_masterplan_steps_plan_idx ON masterplan_steps(masterplan_id, step_index);
         CREATE INDEX IF NOT EXISTS idx_evidence_records_task ON evidence_records(task_id);
+        "
+    )?;
+
+    Ok(())
+}
+
+fn migration_0002_authoritative_session_security(tx: &Transaction) -> Result<()> {
+    // 1. Inspect existing agent_sessions schema if present
+    let mut check_sessions_stmt = tx.prepare("PRAGMA table_info(agent_sessions)")?;
+    let session_cols = check_sessions_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+
+    if session_cols.is_empty() {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_token TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                last_activity_at TEXT NOT NULL,
+                FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+            );"
+        )?;
+    } else if !session_cols.contains(&"session_token".to_string()) {
+        info!("Upgrading legacy agent_sessions table schema to authoritative session format...");
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS agent_sessions;
+             CREATE TABLE agent_sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_token TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                last_activity_at TEXT NOT NULL,
+                FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+             );"
+        )?;
+    }
+
+    // 2. Ensure agents has session_token
+    let mut check_agents_stmt = tx.prepare("PRAGMA table_info(agents)")?;
+    let agent_cols = check_agents_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+
+    if !agent_cols.contains(&"session_token".to_string()) {
+        tx.execute_batch("ALTER TABLE agents ADD COLUMN session_token TEXT;")?;
+    }
+
+    tx.execute_batch(
+        "
         CREATE INDEX IF NOT EXISTS idx_agent_sessions_token ON agent_sessions(session_token);
         CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent ON agent_sessions(agent_id);
         "
     )?;
 
-    info!("Database schema migrations completed successfully.");
+    Ok(())
+}
+
+fn migration_0003_immutable_proofs_and_revisions(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "
+        -- Immutable Proof Bundles per Task Attempt & Commit HEAD
+        CREATE TABLE IF NOT EXISTS proof_bundles (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            agent_id TEXT,
+            attempt_number INTEGER NOT NULL DEFAULT 1,
+            prompt TEXT NOT NULL,
+            base_sha TEXT NOT NULL,
+            head_sha TEXT NOT NULL,
+            files_changed_json TEXT NOT NULL,
+            diff_summary TEXT NOT NULL,
+            verification_runs_json TEXT NOT NULL,
+            criteria_json TEXT NOT NULL,
+            steps_json TEXT NOT NULL,
+            proof_hash TEXT NOT NULL UNIQUE,
+            generated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        -- Masterplan Historical Revisions (Preserves Plan Edits & Resets)
+        CREATE TABLE IF NOT EXISTS masterplan_revisions (
+            id TEXT PRIMARY KEY,
+            masterplan_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            revision_number INTEGER NOT NULL,
+            raw_text TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            steps_snapshot_json TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            FOREIGN KEY(masterplan_id) REFERENCES masterplans(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_proof_bundles_task_sha ON proof_bundles(task_id, head_sha);
+        CREATE INDEX IF NOT EXISTS idx_masterplan_revisions_plan ON masterplan_revisions(masterplan_id, revision_number);
+        "
+    )?;
+
+    Ok(())
+}
+
+fn migration_0004_claim_and_merge_metadata(tx: &Transaction) -> Result<()> {
+    // Ensure tasks table has attempt_count, risk_score, estimated_scope
+    let mut check_tasks_stmt = tx.prepare("PRAGMA table_info(tasks)")?;
+    let task_cols = check_tasks_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+
+    if !task_cols.contains(&"attempt_count".to_string()) {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !task_cols.contains(&"risk_score".to_string()) {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN risk_score REAL DEFAULT 0.0;")?;
+    }
+    if !task_cols.contains(&"estimated_scope".to_string()) {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN estimated_scope TEXT;")?;
+    }
+
+    // Ensure acceptance_criteria table has is_locked
+    let mut check_crit_stmt = tx.prepare("PRAGMA table_info(acceptance_criteria)")?;
+    let crit_cols = check_crit_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+
+    if !crit_cols.contains(&"is_locked".to_string()) {
+        tx.execute_batch("ALTER TABLE acceptance_criteria ADD COLUMN is_locked BOOLEAN NOT NULL DEFAULT 0;")?;
+    }
+
+    // Ensure merge_queue table has active worker tracking
+    let mut check_mq_stmt = tx.prepare("PRAGMA table_info(merge_queue)")?;
+    let mq_cols = check_mq_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+
+    if !mq_cols.contains(&"claimed_by_worker".to_string()) {
+        tx.execute_batch("ALTER TABLE merge_queue ADD COLUMN claimed_by_worker TEXT;")?;
+    }
+    if !mq_cols.contains(&"worker_heartbeat".to_string()) {
+        tx.execute_batch("ALTER TABLE merge_queue ADD COLUMN worker_heartbeat TEXT;")?;
+    }
+
     Ok(())
 }

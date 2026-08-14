@@ -201,6 +201,15 @@ fn enqueue_task_for_merge(
 }
 
 #[tauri::command]
+fn enqueue_task_by_id(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    task_id: String,
+) -> Result<MergeQueueItem, String> {
+    state.coordinator.enqueue_task_by_id(&project_id, &task_id)
+}
+
+#[tauri::command]
 fn satisfy_acceptance_criterion(
     state: State<'_, Arc<AppState>>,
     task_id: String,
@@ -377,6 +386,7 @@ pub fn run() {
             get_task_dependencies,
             list_merge_queue,
             enqueue_task_for_merge,
+            enqueue_task_by_id,
             process_merge_candidate,
             process_merge_by_id,
             get_events_after,

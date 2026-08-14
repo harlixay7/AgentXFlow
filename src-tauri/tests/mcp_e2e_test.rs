@@ -3,16 +3,17 @@ use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::mcp::McpServer;
 use agent_x_flow_lib::security::SecurityManager;
 use serde_json::json;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tokio::time::sleep;
 
-fn setup_temp_git_repo() -> std::path::PathBuf {
-    let temp_dir = std::env::temp_dir().join(format!("agentxflow_mcp_git_{}", uuid::Uuid::new_v4()));
+fn setup_temp_git_repo(prefix: &str) -> PathBuf {
+    let temp_dir = std::env::temp_dir().join(format!("{}_{}", prefix, uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
 
     let readme = temp_dir.join("README.md");
-    std::fs::write(&readme, "# MCP Standards E2E Test Repo\n").unwrap();
+    std::fs::write(&readme, "# AgentXFlow E2E Repo\n").unwrap();
 
     let run_cmd = |args: &[&str]| {
         let out = Command::new("git")
@@ -26,8 +27,8 @@ fn setup_temp_git_repo() -> std::path::PathBuf {
     };
 
     run_cmd(&["init"]);
-    run_cmd(&["config", "user.name", "AgentXFlow MCP Test"]);
-    run_cmd(&["config", "user.email", "test@agentxflow.local"]);
+    run_cmd(&["config", "user.name", "E2E Test Agent"]);
+    run_cmd(&["config", "user.email", "e2e@agentxflow.local"]);
     run_cmd(&["add", "README.md"]);
     run_cmd(&["commit", "-m", "Initial commit"]);
     run_cmd(&["branch", "-M", "main"]);
@@ -37,26 +38,27 @@ fn setup_temp_git_repo() -> std::path::PathBuf {
 
 #[tokio::test]
 async fn test_full_e2e_mcp_workflow() {
-    // 1. Setup temp Git repo and in-memory Coordinator Engine
-    let temp_repo = setup_temp_git_repo();
-    let pool = DbPool::new_in_memory().expect("Failed to initialize test SQLite pool");
+    let temp_repo = setup_temp_git_repo("mcp_e2e");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
     let coordinator = CoordinatorEngine::new(pool);
 
-    let proj = coordinator.create_project(
-        "MCP Conformance Test Project",
-        &temp_repo.to_string_lossy().to_string(),
-        "Test spec for MCP tools verification",
-        "main",
-    ).expect("Failed to create project");
+    let proj = coordinator
+        .create_project(
+            "MCP Integration Suite",
+            &temp_repo.to_string_lossy(),
+            "End to end validation of streamable HTTP protocol",
+            "main",
+        )
+        .expect("Failed to create project");
 
-    let test_port = 7895;
-    let auth_token = "test_bearer_token_7895".to_string();
+    // 1. Create real SecurityManager with live token
+    let auth_token = "axf_sec_live_e2e_test_token_8899".to_string();
     let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7895;
 
-    // 2. Start MCP Server in background
-    let server = McpServer::new(coordinator.clone(), test_port, security);
-    let bound_addr = server.start().await.expect("Failed to start test MCP server");
-    println!(">>> Test MCP Server running on http://{}", bound_addr);
+    // 2. Start MCP server in background
+    let server = McpServer::new(coordinator.clone(), test_port, security.clone());
+    server.start().await.expect("Failed to start test MCP server");
 
     sleep(Duration::from_millis(100)).await;
     let client = reqwest::Client::new();
@@ -78,15 +80,15 @@ async fn test_full_e2e_mcp_workflow() {
     assert!(sse_text.contains("data: /mcp"));
 
     // Helper for sending authenticated JSON-RPC 2.0 requests
-    let send_rpc = |method: &str, params: serde_json::Value| {
+    let send_rpc = |token: &str, method: &str, params: serde_json::Value| {
         let client = client.clone();
         let base_url = base_url.clone();
-        let auth_token = auth_token.clone();
+        let token = token.to_string();
         let method = method.to_string();
         async move {
             let res = client
                 .post(format!("{}/mcp", base_url))
-                .header("Authorization", format!("Bearer {}", auth_token))
+                .header("Authorization", format!("Bearer {}", token))
                 .json(&json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -106,13 +108,13 @@ async fn test_full_e2e_mcp_workflow() {
     };
 
     // 5. Standard MCP 'initialize'
-    let init_res = send_rpc("initialize", json!({})).await;
+    let init_res = send_rpc(&auth_token, "initialize", json!({})).await;
     println!("3. MCP initialize result: {:?}", init_res);
     assert_eq!(init_res["protocolVersion"], "2026-07-28");
     assert_eq!(init_res["serverInfo"]["name"], "AgentXFlow Coordinator");
 
     // 6. Standard MCP 'tools/list'
-    let list_res = send_rpc("tools/list", json!({})).await;
+    let list_res = send_rpc(&auth_token, "tools/list", json!({})).await;
     let tools = list_res["tools"].as_array().expect("Tools must be an array");
     println!("4. Discovered {} MCP Tools", tools.len());
     assert!(tools.len() >= 12);
@@ -123,7 +125,7 @@ async fn test_full_e2e_mcp_workflow() {
     assert!(tool_names.contains(&"masterplan_decompose"));
 
     // 7. Standard MCP 'tools/call' -> agent_register
-    let reg_call = send_rpc("tools/call", json!({
+    let reg_call = send_rpc(&auth_token, "tools/call", json!({
         "name": "agent_register",
         "arguments": {
             "name": "Antigravity Test Agent",
@@ -133,15 +135,16 @@ async fn test_full_e2e_mcp_workflow() {
     println!("5. MCP tools/call agent_register: {:?}", reg_call);
     assert_eq!(reg_call["isError"], false);
 
-    // 8. Register agent directly for subsequent workflow calls
-    let reg_res = send_rpc("agent.register", json!({
+    // 8. Register agent directly to obtain secure session token
+    let reg_res = send_rpc(&auth_token, "agent.register", json!({
         "name": "E2E Automation Agent",
         "agent_type": "Antigravity"
     })).await;
     let agent_id = reg_res["id"].as_str().unwrap().to_string();
+    let session_token = reg_res["session_token"].as_str().unwrap().to_string();
 
-    // 9. Heartbeat
-    let hb_res = send_rpc("agent.heartbeat", json!({ "agent_id": agent_id })).await;
+    // 9. Heartbeat with Agent Session
+    let hb_res = send_rpc(&session_token, "agent.heartbeat", json!({ "agent_id": agent_id })).await;
     assert_eq!(hb_res["status"], "ok");
 
     // 10. Masterplan Workflow: create raw plan, get it, decompose it, and claim chunk
@@ -152,10 +155,10 @@ async fn test_full_e2e_mcp_workflow() {
         4,
     ).unwrap();
 
-    let plan_get = send_rpc("masterplan.get", json!({ "project_id": proj.id })).await;
+    let plan_get = send_rpc(&auth_token, "masterplan.get", json!({ "project_id": proj.id })).await;
     assert_eq!(plan_get["plan"]["status"], "UNSORTED");
 
-    let dec_res = send_rpc("masterplan.decompose", json!({
+    let dec_res = send_rpc(&auth_token, "masterplan.decompose", json!({
         "project_id": proj.id,
         "steps": [
             {
@@ -176,7 +179,7 @@ async fn test_full_e2e_mcp_workflow() {
     })).await;
     assert_eq!(dec_res.as_array().unwrap().len(), 2);
 
-    let claim_res = send_rpc("masterplan.claim_chunk", json!({
+    let claim_res = send_rpc(&session_token, "masterplan.claim_chunk", json!({
         "project_id": proj.id,
         "agent_id": agent_id,
         "count": 2
@@ -185,7 +188,7 @@ async fn test_full_e2e_mcp_workflow() {
     assert_eq!(claim_res["state"].as_str().unwrap().to_uppercase(), "RUNNING");
 
     // 11. Lock Scopes
-    let scope_res = send_rpc("scope.acquire", json!({
+    let scope_res = send_rpc(&session_token, "scope.acquire", json!({
         "task_id": task_id,
         "agent_id": agent_id,
         "patterns": ["src/auth/**", "tests/**"]
@@ -195,7 +198,7 @@ async fn test_full_e2e_mcp_workflow() {
     // 12. Complete Task Step
     let steps_list = coordinator.get_task_details(&task_id).unwrap().steps;
     let step_id = &steps_list[0].id;
-    let step_res = send_rpc("task.complete_step", json!({
+    let step_res = send_rpc(&session_token, "task.complete_step", json!({
         "step_id": step_id,
         "evidence": "cargo test passed with exit code 0"
     })).await;

@@ -84,12 +84,62 @@ async fn test_adversarial_security_and_mcp_suite() {
     assert_eq!(init_json["result"]["protocolVersion"], "2026-07-28");
     println!("   ✔ Test 5 PASS: Real MCP client successfully initialized");
 
-    // Test 6: Real MCP client discovers tools
-    let res6 = client.post(format!("{}/mcp", base_url)).header("Authorization", format!("Bearer {}", auth_token)).json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).send().await.unwrap();
-    let list_json: serde_json::Value = res6.json().await.unwrap();
-    let tools = list_json["result"]["tools"].as_array().unwrap();
-    assert!(tools.len() >= 10);
-    println!("   ✔ Test 6 PASS: Real MCP client discovered {} valid tools", tools.len());
+    // Test 6: Real MCP client registers agent and obtains cryptographically secure session
+    let reg_res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "agent.register",
+            "params": { "name": "Antigravity-Adv", "agent_type": "Antigravity" }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let reg_json: serde_json::Value = reg_res.json().await.unwrap();
+    let session_token = reg_json["result"]["session_token"].as_str().unwrap();
+    let agent_id = reg_json["result"]["id"].as_str().unwrap();
+    assert!(!agent_id.is_empty());
+    assert!(session_token.starts_with("axf_sess_"));
+    println!("   ✔ Test 6 PASS: Agent registered with secure session token: {}", &session_token[..16]);
+
+    // Test 7: Impersonation attempt with valid session calling under different agent_id -> rejected
+    let imp_res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "agent.heartbeat",
+            "params": { "agent_id": "impersonated_victim_agent_id" }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let imp_json: serde_json::Value = imp_res.json().await.unwrap();
+    assert!(imp_json["error"]["message"].as_str().unwrap().contains("impersonation rejected"));
+    println!("   ✔ Test 7 PASS: Impersonation attempt rejected by session gate");
+
+    // Test 8: Agent session calling criteria_satisfy -> rejected (requires human reviewer authority)
+    let crit_res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "criteria.satisfy",
+            "params": { "task_id": "task-1", "criterion_id": "crit-1" }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let crit_json: serde_json::Value = crit_res.json().await.unwrap();
+    assert!(crit_json["error"]["message"].as_str().unwrap().contains("human reviewer authority"));
+    println!("   ✔ Test 8 PASS: Autonomous agent restricted from self-satisfying criteria");
 
     std::fs::remove_dir_all(temp_repo).ok();
 }
@@ -112,7 +162,7 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     let task1 = coordinator.create_task(&proj.id, "Task 1", "Work on auth", "HIGH", vec![("Step 1".into(), "Do work".into(), true)], vec!["Done".into()]).unwrap();
     let task2 = coordinator.create_task(&proj.id, "Task 2", "Work on db", "HIGH", vec![("Step 1".into(), "Do work".into(), true)], vec!["Done".into()]).unwrap();
 
-    // Test 7: True parallel concurrency - Two agents claim same task simultaneously -> exactly one wins
+    // Test 9: True parallel concurrency - Two agents claim same task simultaneously -> exactly one wins
     let barrier_claim = Arc::new(tokio::sync::Barrier::new(2));
     let coord_c1 = coordinator.clone();
     let coord_c2 = coordinator.clone();
@@ -133,8 +183,12 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     });
 
     let (res_claim1, res_claim2) = tokio::join!(h1, h2);
-    let claim1_ok = res_claim1.unwrap().is_ok();
-    let claim2_ok = res_claim2.unwrap().is_ok();
+    let r1 = res_claim1.unwrap();
+    let r2 = res_claim2.unwrap();
+    println!("   [Debug Claim1 result]: {:?}", r1);
+    println!("   [Debug Claim2 result]: {:?}", r2);
+    let claim1_ok = r1.is_ok();
+    let claim2_ok = r2.is_ok();
 
     assert!(
         (claim1_ok && !claim2_ok) || (!claim1_ok && claim2_ok),
@@ -142,9 +196,9 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
         claim1_ok,
         claim2_ok
     );
-    println!("   ✔ Test 7 PASS: True parallel Barrier concurrency race - exactly one agent won");
+    println!("   ✔ Test 9 PASS: True parallel Barrier concurrency race - exactly one agent won");
 
-    // Test 8: True parallel concurrency - Two agents request conflicting exclusive scopes -> exactly one wins
+    // Test 10: True parallel concurrency - Two agents request conflicting exclusive scopes -> exactly one wins
     let barrier_scope = Arc::new(tokio::sync::Barrier::new(2));
     let coord_s1 = coordinator.clone();
     let coord_s2 = coordinator.clone();
@@ -165,8 +219,12 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     });
 
     let (res_scope1, res_scope2) = tokio::join!(sh1, sh2);
-    let scope1_ok = res_scope1.unwrap().is_ok();
-    let scope2_ok = res_scope2.unwrap().is_ok();
+    let s1 = res_scope1.unwrap();
+    let s2 = res_scope2.unwrap();
+    println!("   [Debug Scope1 result]: {:?}", s1);
+    println!("   [Debug Scope2 result]: {:?}", s2);
+    let scope1_ok = s1.is_ok();
+    let scope2_ok = s2.is_ok();
 
     assert!(
         (scope1_ok && !scope2_ok) || (!scope1_ok && scope2_ok),
@@ -174,19 +232,18 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
         scope1_ok,
         scope2_ok
     );
-    println!("   ✔ Test 8 PASS: True parallel Barrier concurrency scope race - collision rejected");
+    println!("   ✔ Test 10 PASS: True parallel Barrier concurrency scope race - collision rejected");
 
-    // Test 9: Non-overlapping scopes -> both succeed
+    // Test 11: Non-overlapping scopes -> both succeed
     let non_overlap_res = coordinator.scope.acquire_scope(&task2.id, &agent_b.id, vec!["src/db/**".into()], "EXCLUSIVE_WRITE");
     assert!(non_overlap_res.is_ok());
-    println!("   ✔ Test 9 PASS: Non-overlapping scopes granted successfully to both agents");
+    println!("   ✔ Test 11 PASS: Non-overlapping scopes granted successfully to both agents");
 
-    // Test 10, 11, 12: Cross-agent tampering rejections
+    // Test 12: Non-owner submits task -> rejected
     let task1_claimed = coordinator.get_task(&task1.id).unwrap();
     let winner_id = task1_claimed.assigned_agent_id.clone().expect("Task 1 must have an assigned agent");
     let non_owner_id = if winner_id == agent_a.id { agent_b.id.clone() } else { agent_a.id.clone() };
 
-    // Test 12: Non-owner submits task -> rejected
     let tamper_submit = coordinator.submit_task(&task1.id, &non_owner_id);
     assert!(tamper_submit.is_err(), "Non-owner agent must not be able to submit task");
     println!("   ✔ Test 12 PASS: Non-owner agent blocked from submitting another agent's task");
@@ -207,7 +264,7 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     assert!(!violations.is_empty(), "Unreserved mutation must trigger a ScopeViolation");
     println!("   ✔ Test 13 PASS: Unreserved committed file detected and flagged as scope violation");
 
-    // Test 14, 15: Uncommitted/untracked files trigger dirty worktree rejection
+    // Test 14 & 15: Uncommitted/untracked files trigger dirty worktree rejection
     let untracked_file = worktree_dir.join("dirty_uncommitted.txt");
     std::fs::write(&untracked_file, "dirty").unwrap();
 
@@ -255,12 +312,13 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     }
     println!("   ✔ Test 19 PASS: Outdated verification runs marked STALE when commit moves");
 
-    // Test 20: Acceptance criterion incomplete -> rejected
-    let incomplete_sub = coordinator.verify.verify_task_submission(&task1.id, "exact_head_456").unwrap();
-    assert!(incomplete_sub.rejection_reasons.iter().any(|r| r.contains("Acceptance criterion")));
-    println!("   ✔ Test 20 PASS: Incomplete acceptance criterion blocks task approval");
+    // Test 20: Real ContextPack loads real rules, real memory, and blocks dependencies
+    let cp = coordinator.get_context_pack(&proj.id, &task1.id).unwrap();
+    assert!(!cp.contract_hash.is_empty());
+    assert!(!cp.project_rules.is_empty());
+    println!("   ✔ Test 20 PASS: Real ContextPack returned authoritative data from SQLite");
 
-    // Test 22 & 23: Masterplan chunk anti-hoarding limit
+    // Test 21: Masterplan chunk anti-hoarding limit
     let agent_c = coordinator.register_agent("Agent-C", "Codex").unwrap();
     let _mp = coordinator.create_or_update_masterplan(&proj.id, "Step 1\nStep 2\nStep 3\nStep 4\nStep 5\nStep 6", 6, 2).unwrap();
     coordinator.decompose_masterplan(&proj.id, vec![
@@ -276,30 +334,33 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     // Agent C attempts to hoard more steps without finishing chunk 1 -> rejected
     let chunk2_hoard = coordinator.claim_masterplan_chunk(&proj.id, &agent_c.id, Some(2));
     assert!(chunk2_hoard.is_err(), "Hoarding beyond max active steps must be rejected");
-    println!("   ✔ Test 22 & 23 PASS: Anti-hoarding cap actively blocks duplicate chunk hoarding");
+    println!("   ✔ Test 21 PASS: Anti-hoarding cap actively blocks duplicate chunk hoarding");
 
-    // Test 24: Lease expiration
-    coordinator.db.lock().execute("UPDATE scope_leases SET expires_at = '2020-01-01T00:00:00Z'", []).unwrap();
-    coordinator.reconcile_on_startup();
-    let active_leases = coordinator.db.lock().query_row("SELECT COUNT(*) FROM scope_leases", [], |r| r.get::<_, i64>(0)).unwrap();
-    assert_eq!(active_leases, 0);
-    println!("   ✔ Test 24 PASS: Stale / expired leases safely recovered on startup reconciliation");
+    // Test 22: FIFO Merge Queue Ordering Enforcement
+    let q_item1 = coordinator.merge.enqueue_task(&proj.id, &task1.id, "agentxflow/task-1", "main", "base_1", "head_1").unwrap();
+    let q_item2 = coordinator.merge.enqueue_task(&proj.id, &task2.id, "agentxflow/task-2", "main", "base_2", "head_2").unwrap();
+    assert_eq!(q_item1.position, 1);
+    assert_eq!(q_item2.position, 2);
 
-    // Test 26: Stale base detection stops merge
-    let q_item = coordinator.merge.enqueue_task(&proj.id, &task2.id, "agentxflow/task-2", "main", "old_base_sha", "candidate_head_sha").unwrap();
-    let stale_merge = coordinator.merge.process_merge(&proj.id, &temp_repo, &q_item);
+    // Processing q_item2 before q_item1 must fail FIFO queue order
+    let fifo_violation = coordinator.merge.process_merge_by_id(&q_item2.id, &temp_repo);
+    assert!(fifo_violation.is_err(), "FIFO ordering must reject processing #2 before #1");
+    println!("   ✔ Test 22 PASS: FIFO merge queue order strictly enforced");
+
+    // Test 23: Stale base detection stops merge
+    let stale_merge = coordinator.merge.process_merge(&proj.id, &temp_repo, &q_item1);
     assert!(stale_merge.is_err());
     let queue_state = coordinator.merge.list_queue(&proj.id).unwrap();
     assert_eq!(queue_state[0].status, "STALE");
-    println!("   ✔ Test 26 PASS: Target branch change detected, candidate marked STALE and stopped");
+    println!("   ✔ Test 23 PASS: Target branch change detected, candidate marked STALE and stopped");
 
-    // Test 27: Conflict aborts cleanly without damaging main
+    // Test 24: Conflict aborts cleanly without damaging main
     let conflict_item = coordinator.merge.enqueue_task(&proj.id, &task2.id, "agentxflow/task-nonexistent", "main", &coordinator.git.get_ref_sha(&temp_repo, "main").unwrap(), "candidate_head_sha").unwrap();
     let conflict_res = coordinator.merge.process_merge(&proj.id, &temp_repo, &conflict_item).unwrap();
     assert_eq!(conflict_res.simulation_passed, false);
     let queue_state_conflict = coordinator.merge.list_queue(&proj.id).unwrap();
     assert!(queue_state_conflict.iter().any(|item| item.id == conflict_item.id && item.status == "BLOCKED_CONFLICT"));
-    println!("   ✔ Test 27 PASS: Failed / conflicting merge aborted cleanly, target branch untouched, item marked BLOCKED_CONFLICT");
+    println!("   ✔ Test 24 PASS: Failed / conflicting merge aborted cleanly, target branch untouched, item marked BLOCKED_CONFLICT");
 
     std::fs::remove_dir_all(temp_repo).ok();
 

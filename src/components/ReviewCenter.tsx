@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Task } from '../types';
-import { GitMerge, ShieldCheck, CheckCircle2 } from 'lucide-react';
+import { GitMerge, ShieldCheck, CheckCircle2, AlertCircle, Info } from 'lucide-react';
 import { coordinatorApi } from '../api/coordinator';
 
 interface ReviewCenterProps {
@@ -9,22 +9,23 @@ interface ReviewCenterProps {
 }
 
 export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) => {
+  const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const reviewTasks = tasks.filter((t) => t.state === 'REVIEW' || t.state === 'MERGE_READY');
 
   const handleEnqueue = async (t: Task) => {
+    setFeedback(null);
     try {
-      await coordinatorApi.enqueueTaskForMerge(
-        t.project_id,
-        t.id,
-        t.branch_name || `agentxflow/task-${t.id}`,
-        'main',
-        t.base_sha || 'base-sha',
-        t.head_sha || 'head-sha'
-      );
-      alert(`Task "${t.id}" has been added to the Serialized Merge Queue!`);
+      await coordinatorApi.enqueueTaskById(t.project_id, t.id);
+      setFeedback({
+        message: `Task "${t.id}" has been authoritatively added to the Serialized Merge Queue!`,
+        type: 'success',
+      });
       onRefresh();
     } catch (e: any) {
-      alert(e.toString());
+      setFeedback({
+        message: `Failed to enqueue task: ${e.toString()}`,
+        type: 'error',
+      });
     }
   };
 
@@ -40,6 +41,25 @@ export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) 
           <strong>What happens here?</strong> Tasks listed here have passed all mandatory steps and automated verification tests. Inspect the changes, verify the cryptographic proof bundle, and click <strong>"Enqueue for 3-Way Merge"</strong> to safely integrate into <code>main</code>.
         </p>
       </div>
+
+      {feedback && (
+        <div
+          style={{
+            padding: '10px 14px',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
+            color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+          }}
+        >
+          {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+          <span>{feedback.message}</span>
+        </div>
+      )}
 
       {reviewTasks.length === 0 ? (
         <div style={{ padding: 40, textAlign: 'center', backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)', color: 'var(--text-muted)', fontSize: 12 }}>
@@ -63,33 +83,39 @@ export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) 
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                     <span className={`badge badge-${t.state}`} style={{ marginRight: 4 }}>{t.state}</span>
-                    <span style={{ fontWeight: 700, fontSize: 13, fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)' }}>{t.id}: </span>
-                    <span style={{ fontWeight: 600, fontSize: 13 }}>{t.title}</span>
+                    <span style={{ fontWeight: 700, fontSize: 13, fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', userSelect: 'text' }}>{t.id}: </span>
+                    <span style={{ fontWeight: 600, fontSize: 13, userSelect: 'text' }}>{t.title}</span>
                   </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{t.description}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-secondary)', userSelect: 'text' }}>{t.description}</div>
                 </div>
-                <button
-                  className="btn btn-primary"
-                  onClick={() => handleEnqueue(t)}
-                  title="Move this verified task into the background merge queue"
-                >
-                  <GitMerge size={13} /> Enqueue for 3-Way Merge
-                </button>
+                {t.state === 'REVIEW' ? (
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => handleEnqueue(t)}
+                    title="Move this verified task into the background merge queue"
+                  >
+                    <GitMerge size={13} /> Enqueue for 3-Way Merge
+                  </button>
+                ) : (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--accent-blue)', fontWeight: 600 }}>
+                    <Info size={14} /> Enqueued in Merge Queue
+                  </div>
+                )}
               </div>
 
               {/* Coordinator Proof Checklist Card */}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 10, backgroundColor: 'var(--bg-card)', padding: 12, borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', fontSize: 11 }}>
-                <div style={{ color: 'var(--accent-green)', display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600 }} title="Coordinator verified unit test output inside the worktree">
-                  <ShieldCheck size={14} /> Coordinator Verified
+                <div style={{ color: 'var(--accent-green)', display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600 }} title="Coordinator verified test output against submitted commit HEAD">
+                  <ShieldCheck size={14} /> Verification Passed
                 </div>
-                <div title="Target base commit SHA before task branch was created">
-                  Base Commit: <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)' }}>{t.base_sha?.substring(0, 7) || 'HEAD~1'}</code>
+                <div title="Target base commit SHA before task branch was created" style={{ userSelect: 'text' }}>
+                  Base Commit: <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', userSelect: 'text' }}>{t.base_sha ? t.base_sha.substring(0, 8) : 'RECORDED_AT_CLAIM'}</code>
                 </div>
-                <div title="Head commit SHA of the task branch">
-                  Head Commit: <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-purple)' }}>{t.head_sha?.substring(0, 7) || 'HEAD'}</code>
+                <div title="Head commit SHA of the task branch" style={{ userSelect: 'text' }}>
+                  Head Commit: <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-purple)', userSelect: 'text' }}>{t.head_sha ? t.head_sha.substring(0, 8) : 'AWAITING_COMMIT'}</code>
                 </div>
-                <div title="Audit of changed files vs declared write locks">
-                  Scope Audit: <span style={{ color: 'var(--accent-green)', fontWeight: 600 }}>0 Violations (Clean)</span>
+                <div title="Assigned agent responsible for this task" style={{ userSelect: 'text' }}>
+                  Agent: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-primary)', userSelect: 'text' }}>{t.assigned_agent_id || 'Coordinator'}</span>
                 </div>
               </div>
             </div>

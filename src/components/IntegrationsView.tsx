@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { McpInfo, Agent } from '../types';
 import { coordinatorApi } from '../api/coordinator';
-import { Terminal, Copy, Check, ShieldCheck, Activity, Cpu, Server, FileText, Plus, Bot, Layers } from 'lucide-react';
+import { Terminal, Copy, Check, ShieldCheck, Activity, Cpu, Server, FileText, Plus, Bot, Layers, CheckCircle2, AlertCircle } from 'lucide-react';
 
 interface IntegrationsViewProps {
   agents?: Agent[];
@@ -13,6 +13,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'antigravity' | 'claude' | 'cursor' | 'opencode' | 'generic'>('antigravity');
   const [pingStatus, setPingStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   // Agent Fleet Registration State
   const [agentName, setAgentName] = useState('');
@@ -21,6 +22,13 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
 
   useEffect(() => {
     coordinatorApi.getMcpInfo().then(setMcpInfo).catch(console.error);
+    // Initial health check
+    fetch('http://127.0.0.1:7890/health')
+      .then((res) => {
+        if (res.ok) setPingStatus('success');
+        else setPingStatus('error');
+      })
+      .catch(() => setPingStatus('error'));
   }, []);
 
   const copyText = (text: string, key: string) => {
@@ -38,7 +46,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
       } else {
         setPingStatus('error');
       }
-    } catch (e) {
+    } catch {
       setPingStatus('error');
     }
   };
@@ -47,13 +55,20 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
     e.preventDefault();
     if (!agentName.trim()) return;
     setIsRegistering(true);
+    setFeedback(null);
     try {
-      await coordinatorApi.registerAgent(agentName.trim(), agentType);
+      const registered = await coordinatorApi.registerAgent(agentName.trim(), agentType);
       setAgentName('');
       if (onRefreshAgents) onRefreshAgents();
-      alert(`Successfully registered "${agentName.trim()}" (${agentType}) to your fleet!`);
+      setFeedback({
+        message: `Registered "${registered.name}" (${registered.agent_type}). Session token generated.`,
+        type: 'success',
+      });
     } catch (err: any) {
-      alert(`Registration failed: ${err.message || err}`);
+      setFeedback({
+        message: `Registration failed: ${err.message || err}`,
+        type: 'error',
+      });
     } finally {
       setIsRegistering(false);
     }
@@ -82,8 +97,6 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
         {
           mcpServers: {
             agentxflow: {
-              command: 'node',
-              args: ['scripts/test_mcp_workflow.js'],
               url: mcpInfo.url,
               headers: {
                 Authorization: `Bearer ${mcpInfo.token}`,
@@ -105,17 +118,43 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
           Localhost MCP Gateway & Multi-IDE Fleet Manager
         </h2>
         <p style={{ color: 'var(--text-secondary)', fontSize: 12, maxWidth: 850, lineHeight: 1.5 }}>
-          AgentXFlow runs an authoritative Model Context Protocol (MCP) server on <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)' }}>127.0.0.1:7890</code>. <strong>There is no limit on connected agents or IDEs</strong>: you can connect 6+ IDEs simultaneously (Antigravity, Cursor, Claude Code, Codex, OpenCode, Gemini) with each agent running inside its own isolated Git worktree.
+          AgentXFlow runs an authoritative Model Context Protocol (MCP) server on <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)' }}>127.0.0.1:7890</code>. Connect multiple agents and IDEs (Antigravity, Cursor, Claude Code, Codex, OpenCode) with each agent running in an isolated Git worktree.
         </p>
       </div>
+
+      {feedback && (
+        <div
+          style={{
+            padding: '10px 14px',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
+            color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+          }}
+        >
+          {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+          <span style={{ userSelect: 'text' }}>{feedback.message}</span>
+        </div>
+      )}
 
       {/* Server Status Card */}
       {mcpInfo && (
         <div style={{ padding: 16, backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-md)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
             <div style={{ fontWeight: 600, fontSize: 12, display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)' }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: 'var(--accent-green)' }} />
-              Gateway Status: ONLINE (127.0.0.1:7890)
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  backgroundColor: pingStatus === 'success' ? 'var(--accent-green)' : pingStatus === 'error' ? 'var(--accent-red)' : 'var(--text-muted)',
+                }}
+              />
+              Gateway Status: {pingStatus === 'success' ? 'ONLINE (127.0.0.1:7890)' : pingStatus === 'error' ? 'OFFLINE / UNREACHABLE' : 'CHECKING...'}
             </div>
             <button
               className="btn btn-secondary"
@@ -124,15 +163,15 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
               title="Send an HTTP ping to http://127.0.0.1:7890/health to verify endpoint connectivity"
             >
               <Activity size={12} />
-              {pingStatus === 'testing' ? 'Pinging...' : pingStatus === 'success' ? '200 OK (Gateway Responding)' : pingStatus === 'error' ? 'Connection Error' : 'Test Health Ping'}
+              {pingStatus === 'testing' ? 'Pinging...' : pingStatus === 'success' ? '200 OK (Healthy)' : pingStatus === 'error' ? 'Connection Error' : 'Test Health Ping'}
             </button>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10, fontFamily: 'var(--font-mono)', fontSize: 11 }}>
             <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
               <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>STREAMABLE HTTP ENDPOINT</div>
-              <div style={{ color: 'var(--accent-blue)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>{mcpInfo.url}</span>
+              <div style={{ color: 'var(--accent-blue)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
+                <span style={{ userSelect: 'text' }}>{mcpInfo.url}</span>
                 <button
                   style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
                   onClick={() => copyText(mcpInfo.url, 'url')}
@@ -145,8 +184,8 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
 
             <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
               <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>LEGACY SSE ENDPOINT</div>
-              <div style={{ color: 'var(--accent-purple)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>{mcpInfo.sse_url}</span>
+              <div style={{ color: 'var(--accent-purple)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
+                <span style={{ userSelect: 'text' }}>{mcpInfo.sse_url}</span>
                 <button
                   style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
                   onClick={() => copyText(mcpInfo.sse_url, 'sse')}
@@ -158,13 +197,13 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
             </div>
 
             <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
-              <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>BEARER AUTH TOKEN</div>
-              <div style={{ color: 'var(--text-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>{mcpInfo.token.substring(0, 16)}...</span>
+              <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>BEARER BOOTSTRAP TOKEN</div>
+              <div style={{ color: 'var(--text-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
+                <span style={{ userSelect: 'text' }}>{mcpInfo.token ? mcpInfo.token.substring(0, 16) + '...' : 'SECURE'}</span>
                 <button
                   style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
                   onClick={() => copyText(mcpInfo.token, 'token')}
-                  title="Copy authentication token"
+                  title="Copy bootstrap token"
                 >
                   {copiedKey === 'token' ? <Check size={12} style={{ color: 'var(--accent-green)' }} /> : <Copy size={12} />}
                 </button>
@@ -174,16 +213,16 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
         </div>
       )}
 
-      {/* Agent Fleet Manager Section (Connect unlimited IDEs) */}
+      {/* Agent Fleet Manager Section */}
       <div style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-md)', padding: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
           <div>
             <h3 style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--font-mono)', display: 'flex', alignItems: 'center', gap: 6 }}>
               <Layers size={14} style={{ color: 'var(--accent-blue)' }} />
-              Connected Agent & IDE Fleet ({agents.length} Registered)
+              Registered Agents & IDE Profiles ({agents.length})
             </h3>
             <p style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>
-              Add any number of Antigravity, Cursor, Claude, or Codex instances to collaborate on tasks concurrently.
+              Register agent identities to participate in task claiming and isolated worktree coordination.
             </p>
           </div>
         </div>
@@ -193,7 +232,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
           <input
             type="text"
             className="input-field"
-            placeholder="IDE / Agent Name (e.g. Antigravity-Main, Cursor-Frontend)"
+            placeholder="Agent / IDE Name (e.g. Antigravity-Core, Cursor-Frontend)"
             value={agentName}
             onChange={(e) => setAgentName(e.target.value)}
             style={{ flex: 1, minWidth: 220, height: 30, fontSize: 11 }}
@@ -219,7 +258,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
             disabled={isRegistering || !agentName.trim()}
             style={{ height: 30, fontSize: 11, padding: '0 12px' }}
           >
-            <Plus size={13} /> Register IDE
+            <Plus size={13} /> Register Agent
           </button>
         </form>
 
@@ -254,13 +293,13 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                 <Bot size={15} />
               </div>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <div style={{ fontWeight: 600, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', userSelect: 'text' }}>
                   {ag.name}
                 </div>
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', gap: 6 }}>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', gap: 6, userSelect: 'text' }}>
                   <span>{ag.agent_type}</span>
                   <span>•</span>
-                  <span style={{ color: 'var(--accent-green)' }}>{ag.status}</span>
+                  <span style={{ color: ag.status === 'WORKING' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{ag.status}</span>
                 </div>
               </div>
             </div>
@@ -320,10 +359,10 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                 Antigravity IDE & Subagents Setup
               </h4>
               <p style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 10 }}>
-                Antigravity connects natively via the <code>agentxflow-coordinator</code> skill. You can run multiple Antigravity windows or subagents simultaneously. Each Antigravity instance discovers tasks via <code>task.list</code>, claims its own worktree via <code>task.claim</code>, and locks file patterns via <code>scope.acquire</code>.
+                Antigravity connects via the <code>agentxflow-coordinator</code> skill. Each agent instance discovers tasks via <code>task.list</code>, claims its own worktree via <code>task.claim</code>, and locks file patterns via <code>scope.acquire</code>.
               </p>
-              <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 11, fontFamily: 'var(--font-mono)' }}>
-                Installed Skill: <code>.agents/skills/agentxflow-coordinator/SKILL.md</code>
+              <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 11, fontFamily: 'var(--font-mono)', userSelect: 'text' }}>
+                Installed Skill: <code>SKILL.md</code> (AgentXFlow Coordinator Skill)
               </div>
             </div>
           )}
@@ -352,6 +391,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                   fontSize: 11,
                   color: 'var(--text-primary)',
                   overflowX: 'auto',
+                  userSelect: 'text',
                 }}
               >
                 {cursorMcpConfig}
@@ -362,9 +402,9 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
           {activeTab === 'claude' && (
             <div>
               <h4 style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, fontFamily: 'var(--font-mono)' }}>Claude Code & Codex Setup</h4>
-              <ol style={{ fontSize: 11, color: 'var(--text-secondary)', paddingLeft: 16, lineHeight: 1.8 }}>
-                <li>MCP Gateway URL: <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)' }}>{mcpInfo?.url}</code></li>
-                <li>Authorization Header: <code style={{ fontFamily: 'var(--font-mono)' }}>Authorization: Bearer {mcpInfo?.token}</code></li>
+              <ol style={{ fontSize: 11, color: 'var(--text-secondary)', paddingLeft: 16, lineHeight: 1.8, userSelect: 'text' }}>
+                <li>MCP Gateway URL: <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', userSelect: 'text' }}>{mcpInfo?.url}</code></li>
+                <li>Authorization Header: <code style={{ fontFamily: 'var(--font-mono)', userSelect: 'text' }}>Authorization: Bearer {mcpInfo?.token}</code></li>
                 <li>Agents automatically discover tasks via <code style={{ fontFamily: 'var(--font-mono)' }}>task.list</code> and submit verified changes via <code style={{ fontFamily: 'var(--font-mono)' }}>task.submit</code>.</li>
               </ol>
             </div>
@@ -394,6 +434,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                   fontSize: 11,
                   color: 'var(--text-primary)',
                   overflowX: 'auto',
+                  userSelect: 'text',
                 }}
               >
                 {openCodeConfig}
@@ -405,7 +446,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
             <div>
               <h4 style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, fontFamily: 'var(--font-mono)' }}>Generic MCP Protocol</h4>
               <p style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                Connect any standard MCP client to <code style={{ fontFamily: 'var(--font-mono)' }}>{mcpInfo?.url}</code> using standard JSON-RPC 2.0 tool calls.
+                Connect any standard MCP client to <code style={{ fontFamily: 'var(--font-mono)', userSelect: 'text' }}>{mcpInfo?.url}</code> using standard JSON-RPC 2.0 tool calls.
               </p>
             </div>
           )}

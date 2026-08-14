@@ -123,10 +123,48 @@ impl MergeEngine {
             ).map_err(|e| format!("Queue item '{}' not found: {}", queue_item_id, e))?
         };
 
+        // 1. Strict FIFO Serialization Check: No earlier item may be skipped
+        {
+            let conn = self.db.lock();
+            let older_ready_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merge_queue WHERE project_id = ?1 AND target_branch = ?2 AND status = 'READY' AND position < ?3",
+                    rusqlite::params![item.project_id, item.target_branch, item.position],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            if older_ready_count > 0 {
+                return Err(format!(
+                    "FIFO queue ordering violation: {} earlier candidate(s) are queued ahead of item '{}'. Merges must proceed sequentially.",
+                    older_ready_count, item.id
+                ));
+            }
+
+            // 2. Active integration check: Max 1 active integration per target branch
+            let running_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM merge_queue WHERE project_id = ?1 AND target_branch = ?2 AND status = 'RUNNING_CHECKS' AND id != ?3",
+                    rusqlite::params![item.project_id, item.target_branch, item.id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            if running_count > 0 {
+                return Err(format!(
+                    "Concurrency lock: Target branch '{}' currently has an active merge integration in progress. Please wait for completion.",
+                    item.target_branch
+                ));
+            }
+
+            // Atomically mark RUNNING_CHECKS
+            conn.execute("UPDATE merge_queue SET status = 'RUNNING_CHECKS' WHERE id = ?1", [&item.id]).ok();
+        }
+
         self.process_merge(&item.project_id, repo_path, &item)
     }
 
-    /// Merges candidate using isolated hidden integration worktree without dirtying user root checkout
+    /// Merges candidate using isolated disposable integration worktree without dirtying user root checkout
     pub fn process_merge(
         &self,
         project_id: &str,
@@ -146,7 +184,7 @@ impl MergeEngine {
             return Err(format!("Target branch '{}' has moved (current SHA: {}). Candidate base is STALE. Rebase required.", item.target_branch, target_sha_before));
         }
 
-        // 2. Ensure dedicated hidden integration worktree exists
+        // 2. Ensure dedicated disposable integration worktree exists
         let integration_dir = self.git.ensure_integration_worktree(repo_path, project_id, &item.target_branch)?;
 
         // Reset integration workspace to exact target branch state

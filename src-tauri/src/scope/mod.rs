@@ -88,10 +88,9 @@ impl ScopeManager {
         }
         drop(stmt);
 
-        // 3. Collision check
+        // 3. Conservative collision check
         for req_pat in &normalized_patterns {
             for existing in &active_leases {
-                // If either is EXCLUSIVE_WRITE and patterns overlap, collision!
                 if (access_type == "EXCLUSIVE_WRITE" || existing.access_type == "EXCLUSIVE_WRITE")
                     && self.globs_might_overlap(req_pat, &existing.pattern)
                 {
@@ -266,10 +265,32 @@ impl ScopeManager {
         })
     }
 
+    /// Releases scope leases for a task, verifying owner if specified
     pub fn release_scope(&self, task_id: &str) -> Result<(), String> {
         let conn = self.db.lock();
         conn.execute("DELETE FROM scope_leases WHERE task_id = ?1", [task_id])
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn release_scope_by_agent(&self, task_id: &str, agent_id: &str) -> Result<(), String> {
+        let conn = self.db.lock();
+        let affected = conn.execute(
+            "DELETE FROM scope_leases WHERE task_id = ?1 AND agent_id = ?2",
+            rusqlite::params![task_id, agent_id],
+        ).map_err(|e| e.to_string())?;
+
+        if affected == 0 {
+            // Check if leases existed under another agent
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM scope_leases WHERE task_id = ?1",
+                [task_id],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            if count > 0 {
+                return Err(format!("Scope lease release rejected: Leases for task '{}' belong to another agent.", task_id));
+            }
+        }
         Ok(())
     }
 
@@ -282,12 +303,22 @@ impl ScopeManager {
         Ok(())
     }
 
+    /// Conservative glob overlap detection:
+    /// Any partial, direct, prefix, wildcard, or uncertain relationship blocks collision.
     pub fn globs_might_overlap(&self, pattern_a: &str, pattern_b: &str) -> bool {
         if pattern_a == pattern_b {
             return true;
         }
+        if pattern_a == "**" || pattern_b == "**" || pattern_a == "*" || pattern_b == "*" {
+            return true;
+        }
+
         let clean_a = pattern_a.trim_end_matches('*').trim_end_matches('/');
         let clean_b = pattern_b.trim_end_matches('*').trim_end_matches('/');
+
+        if clean_a.is_empty() || clean_b.is_empty() {
+            return true;
+        }
 
         clean_a.starts_with(clean_b) || clean_b.starts_with(clean_a)
     }

@@ -295,13 +295,7 @@ fn execute_mcp_tool(
             }
             Ok(agent.id.clone())
         } else {
-            if req_id.trim().is_empty() {
-                return Err("Agent registration required: The 'agent_id' parameter is missing. Call 'agent_register' first.".to_string());
-            }
-            if !state.coordinator.is_agent_registered(req_id) {
-                return Err(format!("Agent ID '{}' is not registered. Call 'agent_register' first.", req_id));
-            }
-            Ok(req_id.to_string())
+            Err("Authenticated agent session required for state mutations. Call 'agent_register' with bootstrap auth to obtain a session token.".to_string())
         }
     };
 
@@ -385,10 +379,15 @@ fn execute_mcp_tool(
 
         "scope_release" | "scope.release" => {
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            state.coordinator.scope.release_scope(task_id).map(|_| serde_json::json!({ "status": "released" }))
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.scope.release_scope_by_agent(task_id, &agent_id).map(|_| serde_json::json!({ "status": "released" }))
         }
 
         "criteria_satisfy" | "criteria.satisfy" => {
+            if caller_agent.is_some() {
+                return Err("Authorization rejected: 'criteria_satisfy' requires human reviewer authority. Autonomous agents cannot self-satisfy criteria.".to_string());
+            }
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let criterion_id = params.get("criterion_id").and_then(|v| v.as_str()).unwrap_or("");
             let evidence = params.get("evidence").and_then(|v| v.as_str());
