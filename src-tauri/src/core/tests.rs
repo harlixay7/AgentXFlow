@@ -7,6 +7,28 @@ pub mod tests {
     fn setup_test_engine() -> (CoordinatorEngine, String) {
         let temp_dir = std::env::temp_dir().join(format!("agentxflow_unit_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let readme = temp_dir.join("README.md");
+        std::fs::write(&readme, "# Test Unit Project\n").unwrap();
+
+        let run_cmd = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&temp_dir)
+                .output()
+                .expect("Failed to run git command");
+            if !out.status.success() {
+                eprintln!("Git cmd {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            }
+        };
+
+        run_cmd(&["init"]);
+        run_cmd(&["config", "user.name", "AgentXFlow Unit Test"]);
+        run_cmd(&["config", "user.email", "test@agentxflow.local"]);
+        run_cmd(&["add", "README.md"]);
+        run_cmd(&["commit", "-m", "Initial commit"]);
+        run_cmd(&["branch", "-M", "main"]);
+
         let temp_db = temp_dir.join("test.db");
         let pool = DbPool::new(&temp_db).expect("Failed to initialize test SQLite pool");
         let engine = CoordinatorEngine::new(pool);
