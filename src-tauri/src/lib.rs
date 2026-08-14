@@ -54,7 +54,8 @@ fn get_mcp_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, St
         "url": format!("http://127.0.0.1:{}/mcp", state.mcp_port),
         "sse_url": format!("http://127.0.0.1:{}/mcp/sse", state.mcp_port),
         "token": token,
-        "protocol_version": "2026-07-28",
+        "protocol_version": "2024-11-05",
+        "supported_versions": ["2024-11-05", "2026-07-28"],
     }))
 }
 

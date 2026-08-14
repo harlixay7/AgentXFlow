@@ -32,8 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Stale target base detection stopping merges if `target_branch` advances.
   - Hidden integration worktree (`.agentxflow/integration`) isolated from user working trees.
   - Atomic reference updating via `git update-ref`.
-- **MCP 2026-07-28 Protocol Gateway**:
-  - Standard JSON-RPC 2.0 `initialize`, `tools/list`, and `tools/call` endpoints with full parameter JSON Schemas.
+- **Model Context Protocol (MCP) Gateway**:
+  - Standard JSON-RPC 2.0 `initialize`, `tools/list`, and `tools/call` endpoints with full parameter JSON Schemas (2024-11-05 standard, 2026-07-28 negotiation).
   - Streamable HTTP and SSE ping transports.
 - **Adversarial Test Suite**:
   - 30-scenario hostile test suite verifying security rejections, race conditions, scope violations, dirty worktrees, and merge conflicts.

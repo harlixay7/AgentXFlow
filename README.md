@@ -181,7 +181,7 @@ The coordinator skill specification is located at `SKILL.md`.
 ## Codebase Layout
 
 - `src-tauri/src/core/`: Coordinator engine, state machines, and Tauri IPC commands.
-- `src-tauri/src/mcp/`: Axum HTTP MCP server implementation (2026-07-28 protocol).
+- `src-tauri/src/mcp/`: Axum HTTP Model Context Protocol (MCP) server implementation (2024-11-05 standard, 2026-07-28 compatible).
 - `src-tauri/src/scope/`: Glob pattern collision detection and git diff mutation auditor.
 - `src-tauri/src/verification/`: Server-side test runner and SHA-256 proof bundle generator.
 - `src-tauri/src/merge/`: Serialized 3-way merge engine inside isolated integration worktree.

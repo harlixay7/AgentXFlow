@@ -98,7 +98,8 @@ async fn handle_health() -> impl IntoResponse {
         Json(serde_json::json!({
             "status": "ok",
             "service": "AgentXFlow Authoritative MCP Gateway (Viducia)",
-            "protocol_version": "2026-07-28",
+            "protocol_version": "2024-11-05",
+            "supported_versions": ["2024-11-05", "2026-07-28"],
             "transport": "Streamable HTTP"
         })),
     )
@@ -144,7 +145,7 @@ fn validate_security_headers(headers: &HeaderMap) -> Result<(), (StatusCode, Str
     Ok(())
 }
 
-/// Standards-Compliant MCP 2026-07-28 HTTP Handler
+/// Standards-Compliant Model Context Protocol (MCP) HTTP Handler
 async fn handle_mcp_streamable_http(
     State(state): State<Arc<McpServerState>>,
     headers: HeaderMap,
@@ -203,18 +204,30 @@ async fn handle_mcp_streamable_http(
         );
     }
 
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert("MCP-Protocol-Version", HeaderValue::from_static("2026-07-28"));
-
     let method = req.method.as_str();
     let params = req.params.clone().unwrap_or(serde_json::json!({}));
+
+    // Dynamic protocol version negotiation supporting standard 2024-11-05 and 2026-07-28
+    let requested_version = params
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .or_else(|| headers.get("MCP-Protocol-Version").and_then(|h| h.to_str().ok()))
+        .unwrap_or("2024-11-05");
+
+    let negotiated_version = match requested_version {
+        "2026-07-28" => "2026-07-28",
+        _ => "2024-11-05",
+    };
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("MCP-Protocol-Version", HeaderValue::from_str(negotiated_version).unwrap_or(HeaderValue::from_static("2024-11-05")));
 
     // Standard MCP Protocol Routing
     let response_result = match method {
         // --- 1. Standard MCP Protocol Handlers ---
         "initialize" => {
             Ok(serde_json::json!({
-                "protocolVersion": "2026-07-28",
+                "protocolVersion": negotiated_version,
                 "serverInfo": {
                     "name": "AgentXFlow Coordinator",
                     "version": "0.1.0"
@@ -222,9 +235,47 @@ async fn handle_mcp_streamable_http(
                 "capabilities": {
                     "tools": {
                         "listChanged": false
-                    }
+                    },
+                    "prompts": {
+                        "listChanged": false
+                    },
+                    "resources": {
+                        "subscribe": false,
+                        "listChanged": false
+                    },
+                    "logging": {}
                 }
             }))
+        }
+
+        "notifications/initialized" | "notifications/cancelled" => {
+            Ok(serde_json::json!({}))
+        }
+
+        "ping" => {
+            Ok(serde_json::json!({}))
+        }
+
+        "prompts/list" => {
+            Ok(serde_json::json!({
+                "prompts": []
+            }))
+        }
+
+        "resources/list" => {
+            Ok(serde_json::json!({
+                "resources": []
+            }))
+        }
+
+        "resources/templates/list" => {
+            Ok(serde_json::json!({
+                "resourceTemplates": []
+            }))
+        }
+
+        "logging/setLevel" => {
+            Ok(serde_json::json!({}))
         }
 
         "tools/list" => {

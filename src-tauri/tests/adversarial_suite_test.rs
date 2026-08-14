@@ -81,8 +81,8 @@ async fn test_adversarial_security_and_mcp_suite() {
 
     // Test 5: Real MCP client initializes
     let init_json: serde_json::Value = res4.json().await.unwrap();
-    assert_eq!(init_json["result"]["protocolVersion"], "2026-07-28");
-    println!("   ✔ Test 5 PASS: Real MCP client successfully initialized");
+    assert_eq!(init_json["result"]["protocolVersion"], "2024-11-05");
+    println!("   ✔ Test 5 PASS: Real MCP client successfully initialized (Protocol Version 2024-11-05)");
 
     // Test 6: Real MCP client registers agent and obtains cryptographically secure session
     let reg_res = client

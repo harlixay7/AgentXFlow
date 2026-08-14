@@ -12,7 +12,7 @@ async function sendRpc(method, params = {}) {
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${AUTH_TOKEN}`,
-      'MCP-Protocol-Version': '2026-07-28',
+      'MCP-Protocol-Version': '2024-11-05',
     },
     body: JSON.stringify({
       jsonrpc: '2.0',

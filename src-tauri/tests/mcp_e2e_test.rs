@@ -70,7 +70,7 @@ async fn test_full_e2e_mcp_workflow() {
     let health_json: serde_json::Value = health_res.json().await.unwrap();
     println!("1. Health Check Response: {:?}", health_json);
     assert_eq!(health_json["status"], "ok");
-    assert_eq!(health_json["protocol_version"], "2026-07-28");
+    assert_eq!(health_json["protocol_version"], "2024-11-05");
 
     // 4. Legacy SSE Ping (/mcp/sse)
     let sse_res = client.get(format!("{}/mcp/sse", base_url)).send().await.expect("SSE check failed");
@@ -107,11 +107,23 @@ async fn test_full_e2e_mcp_workflow() {
         }
     };
 
-    // 5. Standard MCP 'initialize'
-    let init_res = send_rpc(&auth_token, "initialize", json!({})).await;
-    println!("3. MCP initialize result: {:?}", init_res);
-    assert_eq!(init_res["protocolVersion"], "2026-07-28");
-    assert_eq!(init_res["serverInfo"]["name"], "AgentXFlow Coordinator");
+    // 5. Standard MCP 'initialize' with version negotiation
+    let init_res_std = send_rpc(&auth_token, "initialize", json!({})).await;
+    println!("3. MCP initialize (default) result: {:?}", init_res_std);
+    assert_eq!(init_res_std["protocolVersion"], "2024-11-05");
+    assert_eq!(init_res_std["serverInfo"]["name"], "AgentXFlow Coordinator");
+
+    let init_res_v2 = send_rpc(&auth_token, "initialize", json!({ "protocolVersion": "2026-07-28" })).await;
+    println!("   MCP initialize (negotiated 2026-07-28) result: {:?}", init_res_v2);
+    assert_eq!(init_res_v2["protocolVersion"], "2026-07-28");
+
+    // Standard lifecycle notifications and probing
+    let _ = send_rpc(&auth_token, "notifications/initialized", json!({})).await;
+    let _ = send_rpc(&auth_token, "ping", json!({})).await;
+    let prompts_res = send_rpc(&auth_token, "prompts/list", json!({})).await;
+    assert!(prompts_res.get("prompts").is_some());
+    let resources_res = send_rpc(&auth_token, "resources/list", json!({})).await;
+    assert!(resources_res.get("resources").is_some());
 
     // 6. Standard MCP 'tools/list'
     let list_res = send_rpc(&auth_token, "tools/list", json!({})).await;

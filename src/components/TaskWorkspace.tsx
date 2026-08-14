@@ -462,7 +462,7 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
               <div>Assigned Agent: <strong>{currentTask.assigned_agent_id || 'None'}</strong></div>
               <div>Base Ref: <code>{currentTask.base_sha || 'HEAD~1'}</code></div>
               <div>Current Head: <code>{currentTask.head_sha || 'Uncommitted'}</code></div>
-              <div>Protocol: <code>MCP 2026-07-28 / Streamable HTTP</code></div>
+              <div>Protocol: <code>MCP 2024-11-05 / Streamable HTTP</code></div>
             </div>
           </div>
         )}

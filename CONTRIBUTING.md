@@ -32,7 +32,7 @@ Thank you for your interest in contributing to AgentXFlow! AgentXFlow is an auth
 
 AgentXFlow follows strict architectural invariants:
 - **Authoritative Control Plane**: All file operations, Git mutations, worktrees, and test executions must happen through coordinator-supervised Rust backend services.
-- **MCP 2026-07-28 Conformance**: Tools exposed over HTTP/SSE must strictly adhere to the MCP JSON-RPC 2.0 specification.
+- **Model Context Protocol (MCP) Conformance**: Tools exposed over HTTP/SSE must strictly adhere to the MCP JSON-RPC 2.0 specification (2024-11-05 standard).
 - **Dynamic Security**: Never hardcode authentication tokens or secrets. Use `SecurityManager` to generate cryptographic tokens stored in local data directories.
 - **Adversarial Resilience**: All state transitions, scope reservations, and merge operations must have unit and hostile adversarial test coverage.
 

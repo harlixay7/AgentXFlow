@@ -79,7 +79,9 @@ async fn test_entire_pipeline_from_a_to_z() {
         .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize" }))
         .send().await.unwrap();
     assert_eq!(init_res.status(), reqwest::StatusCode::OK);
-    println!(" [Step 3] MCP Initialize: Protocol Version 2026-07-28 confirmed");
+    let init_json: serde_json::Value = init_res.json().await.unwrap();
+    assert!(init_json["result"]["protocolVersion"] == "2024-11-05" || init_json["result"]["protocolVersion"] == "2026-07-28");
+    println!(" [Step 3] MCP Initialize: Protocol Version {} confirmed", init_json["result"]["protocolVersion"]);
 
     // ------------------------------------------------------------------------
     // Step 2: Project Creation & Contract Hashes

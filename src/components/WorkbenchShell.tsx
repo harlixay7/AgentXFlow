@@ -186,7 +186,7 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
             <div
               className={`nav-item ${activeTab === 'integrations' ? 'active' : ''}`}
               onClick={() => setActiveTab('integrations')}
-              title="Model Context Protocol (MCP 2026-07-28) setup instructions and 1-click config"
+              title="Model Context Protocol (MCP 2024-11-05) setup instructions and 1-click config"
             >
               <Plug size={13} /> MCP Gateway
             </div>
