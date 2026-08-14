@@ -5,12 +5,13 @@ pub mod tests {
     use crate::models::TaskState;
 
     fn setup_test_engine() -> (CoordinatorEngine, String) {
-        let temp_db = std::env::temp_dir().join(format!("agentxflow_v2_test_{}.db", uuid::Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir().join(format!("agentxflow_unit_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_db = temp_dir.join("test.db");
         let pool = DbPool::new(&temp_db).expect("Failed to initialize test SQLite pool");
         let engine = CoordinatorEngine::new(pool);
-        let projects = engine.list_projects().unwrap();
-        let proj_id = projects[0].id.clone();
-        (engine, proj_id)
+        let proj = engine.create_project("Test Unit Project", &temp_dir.to_string_lossy(), "Spec", "main").unwrap();
+        (engine, proj.id)
     }
 
     #[test]

@@ -74,8 +74,8 @@ impl VerificationEngine {
             commit_sha: commit_sha.to_string(),
             command: command_str.to_string(),
             exit_code,
-            stdout,
-            stderr,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
             duration_ms,
             is_passed,
             is_stale: false,
@@ -94,6 +94,22 @@ impl VerificationEngine {
             ],
         ).map_err(|e| e.to_string())?;
 
+        // Also record as first-class Coordinator-Observed evidence
+        let ev_id = Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "command": command_str,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "passed": is_passed,
+            "commit_sha": commit_sha,
+        });
+
+        conn.execute(
+            "INSERT INTO evidence_records (id, task_id, step_id, evidence_type, source, payload_json, recorded_at)
+             VALUES (?1, ?2, NULL, 'TEST_RESULT', 'COORDINATOR_OBSERVED', ?3, ?4)",
+            rusqlite::params![ev_id, task_id, payload.to_string(), now],
+        ).ok();
+
         Ok(run)
     }
 
@@ -107,7 +123,7 @@ impl VerificationEngine {
         Ok(())
     }
 
-    /// Verifies task submission against mandatory checklist, evidence, and coordinator checks
+    /// Verifies task submission against mandatory checklist, evidence, acceptance criteria, and coordinator checks
     pub fn verify_task_submission(&self, task_id: &str, current_head_sha: &str) -> Result<VerificationResult, String> {
         let conn = self.db.lock();
 
@@ -123,15 +139,33 @@ impl VerificationEngine {
             .map_err(|e| e.to_string())?;
 
         let mut missing_steps = Vec::new();
-        for step in steps_iter {
-            if let Ok((_id, title, is_mandatory, status)) = step {
-                if is_mandatory && status != "COMPLETED" {
-                    missing_steps.push(title);
-                }
+        for step in steps_iter.flatten() {
+            let (_id, title, is_mandatory, status) = step;
+            if is_mandatory && status != "COMPLETED" {
+                missing_steps.push(title);
             }
         }
 
-        // 2. Unresolved Scope Violations Gate
+        // 2. Mandatory Acceptance Criteria Gate
+        let mut stmt_crit = conn
+            .prepare("SELECT criterion, is_satisfied FROM acceptance_criteria WHERE task_id = ?1")
+            .map_err(|e| e.to_string())?;
+
+        let crit_iter = stmt_crit
+            .query_map([task_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut unsatisfied_criteria = Vec::new();
+        for c in crit_iter.flatten() {
+            let (crit_text, is_satisfied) = c;
+            if !is_satisfied {
+                unsatisfied_criteria.push(crit_text);
+            }
+        }
+
+        // 3. Unresolved Scope Violations Gate
         let mut stmt_violations = conn
             .prepare("SELECT file_path FROM scope_violations WHERE task_id = ?1 AND resolved = 0")
             .map_err(|e| e.to_string())?;
@@ -141,13 +175,11 @@ impl VerificationEngine {
             .map_err(|e| e.to_string())?;
 
         let mut unresolved_violations = Vec::new();
-        for v in violations_iter {
-            if let Ok(file_path) = v {
-                unresolved_violations.push(file_path);
-            }
+        for v in violations_iter.flatten() {
+            unresolved_violations.push(v);
         }
 
-        // 3. Coordinator-Executed Verification Runs Gate
+        // 4. Coordinator-Executed Verification Runs Gate
         let mut stmt_runs = conn
             .prepare("SELECT check_name, is_passed, is_stale FROM verification_runs WHERE task_id = ?1 AND commit_sha = ?2")
             .map_err(|e| e.to_string())?;
@@ -159,17 +191,19 @@ impl VerificationEngine {
             .map_err(|e| e.to_string())?;
 
         let mut failed_checks = Vec::new();
-        for r in runs_iter {
-            if let Ok((check_name, is_passed, is_stale)) = r {
-                if !is_passed || is_stale {
-                    failed_checks.push(check_name);
-                }
+        for r in runs_iter.flatten() {
+            let (check_name, is_passed, is_stale) = r;
+            if !is_passed || is_stale {
+                failed_checks.push(check_name);
             }
         }
 
         let mut rejection_reasons = Vec::new();
         for step in &missing_steps {
             rejection_reasons.push(format!("Mandatory step '{}' is not marked COMPLETED", step));
+        }
+        for crit in &unsatisfied_criteria {
+            rejection_reasons.push(format!("Acceptance criterion '{}' is not satisfied", crit));
         }
         for file in &unresolved_violations {
             rejection_reasons.push(format!("Unresolved out-of-scope modification: {}", file));
@@ -190,7 +224,7 @@ impl VerificationEngine {
         })
     }
 
-    /// Generates an immutable Proof-of-Completion bundle with SHA256 digest
+    /// Generates a deterministic Verified Evidence Bundle with canonical SHA-256 digest
     pub fn generate_proof_bundle(
         &self,
         task_id: &str,
@@ -230,17 +264,24 @@ impl VerificationEngine {
             .map_err(|e| e.to_string())?;
 
         let mut verification_runs = Vec::new();
-        for r in runs_iter {
-            if let Ok(run) = r {
-                verification_runs.push(run);
-            }
+        for r in runs_iter.flatten() {
+            verification_runs.push(r);
         }
 
+        // Canonical deterministic SHA256 digest across all verified package attributes
         let mut hasher = Sha256::new();
         hasher.update(task_id.as_bytes());
+        hasher.update(project_id.as_bytes());
         hasher.update(base_sha.as_bytes());
         hasher.update(head_sha.as_bytes());
+        for f in files_changed {
+            hasher.update(f.as_bytes());
+        }
         hasher.update(diff_summary.as_bytes());
+        for run in &verification_runs {
+            hasher.update(run.check_name.as_bytes());
+            hasher.update(run.exit_code.to_string().as_bytes());
+        }
         let proof_hash = hex::encode(hasher.finalize());
 
         let bundle = ProofBundle {

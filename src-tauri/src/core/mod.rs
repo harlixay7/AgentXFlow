@@ -8,12 +8,14 @@ use uuid::Uuid;
 use crate::acp::AcpRuntime;
 use crate::dag::DagEngine;
 use crate::db::DbPool;
+use crate::error::CoordinatorError;
 use crate::git::GitService;
 use crate::merge::MergeEngine;
 use crate::models::{
     AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, DecomposedStepInput, EventItem,
-    Masterplan, MasterplanStep, Project, ScopeLease, Task, TaskState, TaskStep, TaskSubstate,
-    VerificationResult,
+    EvidenceRecord, Masterplan, MasterplanStep, ProofBundle, Project, ScopeLease, ScopeViolation,
+    Task, TaskDependency, TaskDetails, TaskState, TaskStep, TaskSubstate, VerificationResult,
+    VerificationRun,
 };
 use crate::policies::PolicyEngine;
 use crate::scheduler::{SchedulerConfig, SchedulerEngine};
@@ -56,12 +58,11 @@ impl CoordinatorEngine {
             scheduler,
         };
 
-        engine.seed_defaults_if_empty();
         engine.reconcile_on_startup();
         engine
     }
 
-    /// Sequence-numbered event emitter (Replaces 4s polling with live event streaming)
+    /// Sequence-numbered event emitter
     pub fn emit_event(
         &self,
         project_id: Option<&str>,
@@ -104,10 +105,8 @@ impl CoordinatorEngine {
             .map_err(|e| e.to_string())?;
 
         let mut items = Vec::new();
-        for r in rows {
-            if let Ok(item) = r {
-                items.push(item);
-            }
+        for r in rows.flatten() {
+            items.push(r);
         }
         Ok(items)
     }
@@ -118,86 +117,70 @@ impl CoordinatorEngine {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        // Expire stale scope leases
+        // 1. Expire stale scope leases
         conn.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now]).ok();
 
-        // Mark active agent runs whose agents are no longer reachable as interrupted
+        // 2. Mark active agent runs whose agents are no longer reachable as paused
         conn.execute(
             "UPDATE agent_runs SET status = 'PAUSED', finished_at = ?1 WHERE status = 'ACTIVE'",
             [&now],
         ).ok();
 
+        // 3. Mark interrupted merge queue items as STALE
+        conn.execute(
+            "UPDATE merge_queue SET status = 'STALE' WHERE status = 'RUNNING_CHECKS'",
+            [],
+        ).ok();
+
         info!("Crash recovery reconciliation complete.");
     }
 
-    /// Auto-seeds initial default data on brand new databases
-    fn seed_defaults_if_empty(&self) {
-        let conn = self.db.lock();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
-            .unwrap_or(0);
+    /// Canonical state machine transition service
+    pub fn transition_task_state(
+        &self,
+        task_id: &str,
+        next_state: TaskState,
+        next_substate: TaskSubstate,
+        reason: Option<&str>,
+    ) -> Result<Task, CoordinatorError> {
+        let mut task = self.get_task(task_id).map_err(|e| CoordinatorError::TaskNotFound(e))?;
 
-        if count == 0 {
-            info!("Database empty. Auto-seeding AgentXFlow V2 defaults...");
-            let now = Utc::now().to_rfc3339();
-            let proj_id = "proj-agentxflow-v2";
-
-            conn.execute(
-                "INSERT INTO projects (id, name, path, master_spec, target_branch, created_at, updated_at)
-                 VALUES (?1, 'AgentXFlow V2 Engine', 'b:/AgentXFlow', 'Authoritative Multi-Agent Software Engineering Control Plane', 'main', ?2, ?2)",
-                params![proj_id, now],
-            ).ok();
-
-            // Contract
-            conn.execute(
-                "INSERT INTO project_contracts (id, project_id, version, overview, architecture, rules_json, commands_json, testing_json, repo_map, security_constraints, contract_hash, created_at)
-                 VALUES ('contract-1', ?1, 1, 'AgentXFlow V2 Core', 'Tauri 2 + Rust + React 19', '[]', '[]', '[]', 'src-tauri, src', 'Localhost binding, Bearer auth', 'hash-v2', ?2)",
-                params![proj_id, now],
-            ).ok();
-
-            // No hardcoded agents seeded - agents register dynamically via MCP or UI
-            // Clean up any legacy demo agents from previous runs
-            conn.execute("DELETE FROM agents WHERE id IN ('agent-codex', 'agent-opencode', 'agent-claude', 'agent-antigravity')", []).ok();
-
-            // Seed Tasks
-            let tasks = vec![
-                ("AUTH-01", "Streamable HTTP MCP Protocol Gateway", "Implement stateless MCP 2026-07-28 protocol gateway with session headers", "RUNNING", "IMPLEMENTING", "agent-codex", "HIGH", "src-tauri/src/mcp/**"),
-                ("DAG-02", "Task Dependency Graph & Parallel Scheduler", "Implement DAG cycle detection and topological scheduling", "READY", "NONE", "", "CRITICAL", "src-tauri/src/dag/**"),
-                ("MERGE-03", "Serialized Merge Queue in Hidden Worktree", "Implement 3-way branch merge queue inside .agentxflow/integration", "BACKLOG", "NONE", "", "MEDIUM", "src-tauri/src/merge/**"),
-            ];
-
-            for (t_id, title, desc, state, substate, agent, priority, scope_pat) in tasks {
-                let assigned = if agent.is_empty() { None } else { Some(agent) };
-                conn.execute(
-                    "INSERT INTO tasks (id, project_id, title, description, state, substate, assigned_agent_id, priority, risk_score, branch_name, worktree_path, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0.2, ?9, ?10, ?11, ?11)",
-                    params![t_id, proj_id, title, desc, state, substate, assigned, priority, format!("agentxflow/task-{}", t_id), format!("b:/AgentXFlow/.agentxflow/worktrees/task-{}", t_id), now],
-                ).ok();
-
-                conn.execute(
-                    "INSERT INTO task_steps (id, task_id, order_index, title, description, is_mandatory, status)
-                     VALUES (?1, ?2, 1, 'Implement Core Logic', 'Write modular implementation code', 1, 'COMPLETED')",
-                    params![format!("{}-s1", t_id), t_id],
-                ).ok();
-
-                conn.execute(
-                    "INSERT INTO task_steps (id, task_id, order_index, title, description, is_mandatory, status)
-                     VALUES (?1, ?2, 2, 'Execute Automated Unit Tests', 'Run verification test suite', 1, 'PENDING')",
-                    params![format!("{}-s2", t_id), t_id],
-                ).ok();
-
-                if !agent.is_empty() {
-                    conn.execute(
-                        "INSERT INTO scope_leases (id, task_id, agent_id, pattern, access_type, expires_at, created_at)
-                         VALUES (?1, ?2, ?3, ?4, 'EXCLUSIVE_WRITE', ?5, ?6)",
-                        params![format!("{}-lease", t_id), t_id, agent, scope_pat, now, now],
-                    ).ok();
-                }
-            }
-
-            drop(conn);
-            self.emit_event(Some(proj_id), None, None, "SYSTEM_INITIALIZED", json!({ "version": "2.0" }));
+        if !task.state.can_transition_to(&next_state) && task.state != next_state {
+            return Err(CoordinatorError::InvalidStateTransition {
+                from: task.state.as_str().to_string(),
+                to: next_state.as_str().to_string(),
+                reason: reason.unwrap_or("Transition not allowed by state machine rules").to_string(),
+            });
         }
+
+        let prev_state = task.state.as_str().to_string();
+        let next_state_str = next_state.as_str().to_string();
+
+        let now = Utc::now().to_rfc3339();
+        let conn = self.db.lock();
+        conn.execute(
+            "UPDATE tasks SET state = ?1, substate = ?2, updated_at = ?3 WHERE id = ?4",
+            params![next_state.as_str(), next_substate.as_str(), now, task_id],
+        ).map_err(|e| CoordinatorError::Database(e.to_string()))?;
+
+        task.state = next_state;
+        task.substate = next_substate;
+        task.updated_at = now;
+
+        drop(conn);
+        self.emit_event(
+            Some(&task.project_id),
+            Some(task_id),
+            task.assigned_agent_id.as_deref(),
+            "TASK_STATE_TRANSITIONED",
+            json!({
+                "from_state": prev_state,
+                "to_state": next_state_str,
+                "reason": reason.unwrap_or("")
+            }),
+        );
+
+        Ok(task)
     }
 
     // --- Projects ---
@@ -233,6 +216,46 @@ impl CoordinatorEngine {
         Ok(proj)
     }
 
+    pub fn create_example_project(&self, root_dir: &str) -> Result<Project, String> {
+        let example_path = Path::new(root_dir).join("example-repo");
+        std::fs::create_dir_all(&example_path).map_err(|e| e.to_string())?;
+        self.git.init_repo(&example_path)?;
+
+        let proj = self.create_project(
+            "AgentXFlow Example Project",
+            example_path.to_str().unwrap(),
+            "Example project demonstrating multi-agent coordination with worktrees and scope locks",
+            "main",
+        )?;
+
+        // Create sample tasks
+        self.create_task(
+            &proj.id,
+            "Implement User Authentication Service",
+            "Build JWT-based authentication service in src/auth/",
+            "HIGH",
+            vec![
+                ("Implement Token Generation".to_string(), "Generate signed JWT tokens".to_string(), true),
+                ("Add Auth Unit Tests".to_string(), "Run cargo test --test auth_test".to_string(), true),
+            ],
+            vec!["Token signature matches secret".to_string(), "All tests pass".to_string()],
+        )?;
+
+        self.create_task(
+            &proj.id,
+            "Implement SQLite Database Migration Runner",
+            "Build robust migration runner for 24 tables",
+            "MEDIUM",
+            vec![
+                ("Write Migration SQL".to_string(), "Create initial schema".to_string(), true),
+                ("Verify Foreign Keys".to_string(), "Test cascading deletes".to_string(), true),
+            ],
+            vec!["Schema migrations are idempotent".to_string()],
+        )?;
+
+        Ok(proj)
+    }
+
     pub fn list_projects(&self) -> Result<Vec<Project>, String> {
         let conn = self.db.lock();
         let mut stmt = conn
@@ -254,10 +277,8 @@ impl CoordinatorEngine {
             .map_err(|e| e.to_string())?;
 
         let mut res = Vec::new();
-        for r in rows {
-            if let Ok(p) = r {
-                res.push(p);
-            }
+        for r in rows.flatten() {
+            res.push(r);
         }
         Ok(res)
     }
@@ -375,7 +396,6 @@ impl CoordinatorEngine {
         Ok(res)
     }
 
-
     pub fn get_task(&self, task_id: &str) -> Result<Task, String> {
         let conn = self.db.lock();
         conn.query_row(
@@ -406,46 +426,176 @@ impl CoordinatorEngine {
         ).map_err(|e| format!("Task '{}' not found: {}", task_id, e))
     }
 
+    /// Comprehensive task details query for TaskWorkspace
+    pub fn get_task_details(&self, task_id: &str) -> Result<TaskDetails, String> {
+        let task = self.get_task(task_id)?;
+        let conn = self.db.lock();
+
+        let mut stmt_steps = conn.prepare("SELECT id, task_id, order_index, title, description, is_mandatory, status, completed_at FROM task_steps WHERE task_id = ?1 ORDER BY order_index ASC").map_err(|e| e.to_string())?;
+        let steps: Vec<TaskStep> = stmt_steps.query_map([task_id], |r| {
+            Ok(TaskStep { id: r.get(0)?, task_id: r.get(1)?, order_index: r.get(2)?, title: r.get(3)?, description: r.get(4)?, is_mandatory: r.get(5)?, status: r.get(6)?, completed_at: r.get(7)? })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
+        let mut stmt_crit = conn.prepare("SELECT id, task_id, criterion, is_satisfied, is_locked FROM acceptance_criteria WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let criteria: Vec<AcceptanceCriteria> = stmt_crit.query_map([task_id], |r| {
+            Ok(AcceptanceCriteria { id: r.get(0)?, task_id: r.get(1)?, criterion: r.get(2)?, is_satisfied: r.get(3)?, is_locked: r.get(4)? })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
+        let mut stmt_leases = conn.prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let leases: Vec<ScopeLease> = stmt_leases.query_map([task_id], |r| {
+            Ok(ScopeLease { id: r.get(0)?, task_id: r.get(1)?, agent_id: r.get(2)?, pattern: r.get(3)?, access_type: r.get(4)?, expires_at: r.get(5)?, created_at: r.get(6)? })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
+        let mut stmt_deps = conn.prepare("SELECT id, task_id, depends_on_task_id, dependency_type, created_at FROM task_dependencies WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let dependencies: Vec<TaskDependency> = stmt_deps.query_map([task_id], |r| {
+            Ok(TaskDependency { id: r.get(0)?, task_id: r.get(1)?, depends_on_task_id: r.get(2)?, dependency_type: r.get(3)?, created_at: r.get(4)? })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
+        let mut stmt_runs = conn.prepare("SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at FROM verification_runs WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let verification_runs: Vec<VerificationRun> = stmt_runs.query_map([task_id], |r| {
+            Ok(VerificationRun { id: r.get(0)?, task_id: r.get(1)?, run_id: r.get(2)?, check_id: r.get(3)?, check_name: r.get(4)?, commit_sha: r.get(5)?, command: r.get(6)?, exit_code: r.get(7)?, stdout: r.get(8)?, stderr: r.get(9)?, duration_ms: r.get(10)?, is_passed: r.get(11)?, is_stale: r.get(12)?, executed_at: r.get(13)? })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
+        let mut stmt_violations = conn.prepare("SELECT id, task_id, agent_id, file_path, violation_type, detected_at, resolved FROM scope_violations WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let violations: Vec<ScopeViolation> = stmt_violations.query_map([task_id], |r| {
+            Ok(ScopeViolation { id: r.get(0)?, task_id: r.get(1)?, agent_id: r.get(2)?, file_path: r.get(3)?, violation_type: r.get(4)?, detected_at: r.get(5)?, resolved: r.get(6)? })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
+        let mut stmt_evidence = conn.prepare("SELECT id, task_id, step_id, evidence_type, source, payload_json, recorded_at FROM evidence_records WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let evidence_records: Vec<EvidenceRecord> = stmt_evidence.query_map([task_id], |r| {
+            Ok(EvidenceRecord { id: r.get(0)?, task_id: r.get(1)?, step_id: r.get(2)?, evidence_type: r.get(3)?, source: r.get(4)?, payload_json: r.get(5)?, recorded_at: r.get(6)? })
+        }).map_err(|e| e.to_string())?.flatten().collect();
+
+        let proof_bundle = conn.query_row(
+            "SELECT task_id, project_id, agent_id, prompt, base_sha, head_sha, files_changed_json, diff_summary, proof_hash, generated_at FROM proof_bundles WHERE task_id = ?1",
+            [task_id],
+            |r| {
+                let files_json: String = r.get(6)?;
+                let files: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
+                Ok(ProofBundle {
+                    task_id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    prompt: r.get(3)?,
+                    base_sha: r.get(4)?,
+                    head_sha: r.get(5)?,
+                    files_changed: files,
+                    diff_summary: r.get(7)?,
+                    verification_runs: Vec::new(),
+                    scope_violations: Vec::new(),
+                    proof_hash: r.get(8)?,
+                    generated_at: r.get(9)?,
+                })
+            },
+        ).ok();
+
+        let assigned_agent = if let Some(ref aid) = task.assigned_agent_id {
+            conn.query_row(
+                "SELECT id, name, agent_type, profile, status, last_heartbeat, created_at FROM agents WHERE id = ?1",
+                [aid],
+                |r| {
+                    Ok(Agent {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        agent_type: r.get(2)?,
+                        profile: r.get(3)?,
+                        status: r.get(4)?,
+                        capabilities: AgentCapabilitySet::default(),
+                        last_heartbeat: r.get(5)?,
+                        created_at: r.get(6)?,
+                    })
+                },
+            ).ok()
+        } else {
+            None
+        };
+
+        Ok(TaskDetails {
+            task,
+            steps,
+            criteria,
+            leases,
+            dependencies,
+            verification_runs,
+            violations,
+            evidence_records,
+            proof_bundle,
+            assigned_agent,
+        })
+    }
+
+    /// Atomic Task Claiming with Compare-and-Swap & Transactional Lock
     pub fn claim_task(&self, task_id: &str, agent_id: &str) -> Result<Task, String> {
-        let mut task = self.get_task(task_id)?;
+        if !self.is_agent_registered(agent_id) {
+            return Err(format!("Agent registration required: Agent ID '{}' is not registered.", agent_id));
+        }
 
         // Dependency gate check
         if !self.dag.are_dependencies_satisfied(task_id)? {
             return Err(format!("Cannot claim task '{}': Prerequisite dependencies are not yet DONE", task_id));
         }
 
-        let proj: Project = {
-            let conn = self.db.lock();
-            conn.query_row("SELECT id, name, path, master_spec, target_branch, created_at, updated_at FROM projects WHERE id = ?1", [&task.project_id], |r| {
-                Ok(Project { id: r.get(0)?, name: r.get(1)?, path: r.get(2)?, master_spec: r.get(3)?, target_branch: r.get(4)?, created_at: r.get(5)?, updated_at: r.get(6)? })
-            }).map_err(|e| e.to_string())?
-        };
-
-        let repo_path = Path::new(&proj.path);
-        let branch_name = format!("agentxflow/task-{}", task_id);
-        let worktree_dir = repo_path.join(".agentxflow").join("worktrees").join(format!("task-{}", task_id));
-
-        self.git.create_worktree(repo_path, &worktree_dir, &branch_name, &proj.target_branch)?;
-
-        let base_sha = self.git.get_ref_sha(repo_path, &proj.target_branch).ok();
+        let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        let conn = self.db.lock();
-        conn.execute(
+        // 1. Transactional check & claim
+        let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {}", e))?;
+
+        let (project_id, current_state, current_assigned): (String, String, Option<String>) = tx
+            .query_row(
+                "SELECT project_id, state, assigned_agent_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?;
+
+        if current_state != "BACKLOG" && current_state != "READY" {
+            return Err(format!("Cannot claim task '{}': Task is already in state '{}'", task_id, current_state));
+        }
+
+        if let Some(existing_agent) = current_assigned {
+            if !existing_agent.is_empty() && existing_agent != agent_id {
+                return Err(format!("Cannot claim task '{}': Already assigned to agent '{}'", task_id, existing_agent));
+            }
+        }
+
+        let (proj_path, target_branch): (String, String) = tx
+            .query_row(
+                "SELECT path, target_branch FROM projects WHERE id = ?1",
+                [&project_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("Project '{}' not found: {}", project_id, e))?;
+
+        let repo_path = Path::new(&proj_path);
+        let branch_name = format!("agentxflow/task-{}", task_id);
+        let worktree_dir = repo_path.join(".agentxflow").join("worktrees").join(format!("task-{}", task_id));
+        let worktree_path_str = worktree_dir.to_string_lossy().to_string();
+
+        let base_sha = self.git.get_ref_sha(repo_path, &target_branch).ok();
+
+        // Atomically update task to RUNNING and assign agent
+        tx.execute(
             "UPDATE tasks SET state = 'RUNNING', substate = 'ANALYZING', assigned_agent_id = ?1, worktree_path = ?2, branch_name = ?3, base_sha = ?4, updated_at = ?5 WHERE id = ?6",
-            params![agent_id, worktree_dir.to_string_lossy().to_string(), branch_name, base_sha, now, task_id],
-        ).map_err(|e| e.to_string())?;
+            params![agent_id, worktree_path_str, branch_name, base_sha, now, task_id],
+        ).map_err(|e| format!("Failed to claim task in database: {}", e))?;
 
-        task.state = TaskState::Running;
-        task.substate = TaskSubstate::Analyzing;
-        task.assigned_agent_id = Some(agent_id.to_string());
-        task.worktree_path = Some(worktree_dir.to_string_lossy().to_string());
-        task.branch_name = Some(branch_name);
-        task.base_sha = base_sha;
+        // Lock acceptance criteria upon claiming
+        tx.execute("UPDATE acceptance_criteria SET is_locked = 1 WHERE task_id = ?1", [task_id]).ok();
 
+        tx.commit().map_err(|e| format!("Failed to commit claim transaction: {}", e))?;
         drop(conn);
-        self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_CLAIMED", json!({ "agent": agent_id }));
-        Ok(task)
+
+        // 2. Cut Git worktree on disk
+        if let Err(e) = self.git.create_worktree(repo_path, &worktree_dir, &branch_name, &target_branch) {
+            // Revert state if worktree creation failed
+            let conn = self.db.lock();
+            conn.execute("UPDATE tasks SET state = 'BACKLOG', substate = 'NONE', assigned_agent_id = NULL WHERE id = ?1", [task_id]).ok();
+            return Err(format!("Failed to create isolated Git worktree: {}", e));
+        }
+
+        self.emit_event(Some(&project_id), Some(task_id), Some(agent_id), "TASK_CLAIMED", json!({ "agent": agent_id }));
+        self.get_task(task_id)
     }
 
     pub fn complete_step(&self, step_id: &str, evidence_json: Option<&str>) -> Result<TaskStep, String> {
@@ -474,25 +624,65 @@ impl CoordinatorEngine {
             },
         ).map_err(|e| e.to_string())?;
 
+        if let Some(ev) = evidence_json {
+            let ev_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO evidence_records (id, task_id, step_id, evidence_type, source, payload_json, recorded_at)
+                 VALUES (?1, ?2, ?3, 'AGENT_NOTE', 'AGENT_REPORTED', ?4, ?5)",
+                params![ev_id, step.task_id, step_id, ev, now],
+            ).ok();
+        }
+
         drop(conn);
-        self.emit_event(None, Some(&step.task_id), None, "STEP_COMPLETED", json!({ "step_id": step_id, "title": step.title, "evidence": evidence_json }));
+        self.emit_event(None, Some(&step.task_id), None, "STEP_COMPLETED", json!({ "step_id": step_id, "title": step.title }));
         Ok(step)
     }
 
     pub fn submit_task(&self, task_id: &str, agent_id: &str) -> Result<VerificationResult, String> {
         let task = self.get_task(task_id)?;
-        let proj = self.list_projects()?.into_iter().find(|p| p.id == task.project_id).ok_or("Project not found")?;
-        let repo_path = Path::new(&proj.path);
 
-        let head_sha = self.git.get_head_sha(repo_path).unwrap_or_else(|_| "unknown-head".to_string());
-
-        // Perform actual Git mutation audit
-        if let (Some(base), Some(branch)) = (&task.base_sha, &task.branch_name) {
-            if let Ok(changed_files) = self.git.get_changed_files(repo_path, base, branch) {
-                self.scope.audit_actual_mutations(task_id, agent_id, &changed_files).ok();
+        // 1. Ownership enforcement
+        if let Some(ref assigned) = task.assigned_agent_id {
+            if assigned != agent_id {
+                return Err(format!("Task ownership violation: Task '{}' is owned by agent '{}', not '{}'", task_id, assigned, agent_id));
             }
         }
 
+        let proj = self.list_projects()?.into_iter().find(|p| p.id == task.project_id).ok_or("Project not found")?;
+        let repo_path = Path::new(&proj.path);
+
+        let worktree_dir = match task.worktree_path.as_deref() {
+            Some(path) => Path::new(path),
+            None => return Err("Task has no worktree path allocated".to_string()),
+        };
+
+        if !worktree_dir.exists() {
+            return Err(format!("Task worktree does not exist at {:?}", worktree_dir));
+        }
+
+        // 2. Cleanliness check (reject dirty worktree with uncommitted changes)
+        if let Err(dirty_files) = self.git.check_worktree_cleanliness(worktree_dir) {
+            return Ok(VerificationResult {
+                is_valid: false,
+                missing_mandatory_steps: Vec::new(),
+                missing_evidence_step_ids: Vec::new(),
+                unresolved_scope_violations: Vec::new(),
+                failed_coordinator_checks: Vec::new(),
+                rejection_reasons: vec![format!("Worktree has uncommitted modifications. Please commit all changes before submission: {:?}", dirty_files)],
+            });
+        }
+
+        // 3. Exact worktree HEAD SHA is authoritative
+        let head_sha = self.git.get_worktree_head_sha(worktree_dir)?;
+
+        // 4. Perform actual Git mutation audit against held scope leases
+        if let Some(ref base) = task.base_sha {
+            if let Ok(mutations) = self.git.get_worktree_mutations(worktree_dir, base) {
+                self.scope.audit_actual_mutations(task_id, agent_id, &mutations).ok();
+            }
+        }
+
+        // 5. Verification checks gate
         let verify_res = self.verify.verify_task_submission(task_id, &head_sha)?;
 
         if verify_res.is_valid {
@@ -504,6 +694,23 @@ impl CoordinatorEngine {
             ).map_err(|e| e.to_string())?;
 
             drop(conn);
+
+            // Generate deterministic Proof-of-Completion bundle
+            let changed_files = task.base_sha.as_deref().and_then(|base| {
+                self.git.get_worktree_mutations(worktree_dir, base).ok()
+            }).unwrap_or_default();
+
+            self.verify.generate_proof_bundle(
+                task_id,
+                &task.project_id,
+                Some(agent_id),
+                &task.description,
+                task.base_sha.as_deref().unwrap_or(""),
+                &head_sha,
+                &changed_files,
+                "Authoritative Coordinator Verification Passed",
+            ).ok();
+
             self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_SUBMITTED_FOR_REVIEW", json!({ "head_sha": head_sha }));
         }
 
@@ -560,21 +767,16 @@ impl CoordinatorEngine {
             .map_err(|e| e.to_string())?;
 
         let mut res = Vec::new();
-        for r in rows {
-            if let Ok(a) = r {
-                res.push(a);
-            }
+        for r in rows.flatten() {
+            res.push(r);
         }
         Ok(res)
     }
 
     pub fn unregister_agent(&self, agent_id: &str) -> Result<(), String> {
         let conn = self.db.lock();
-        // Clear agent assignment from tasks
         conn.execute("UPDATE tasks SET assigned_agent_id = NULL WHERE assigned_agent_id = ?1", [agent_id]).ok();
-        // Release active scope leases held by agent
         conn.execute("DELETE FROM scope_leases WHERE agent_id = ?1", [agent_id]).ok();
-        // Delete agent record
         conn.execute("DELETE FROM agents WHERE id = ?1", [agent_id]).map_err(|e| e.to_string())?;
         drop(conn);
 
@@ -595,16 +797,21 @@ impl CoordinatorEngine {
 
     pub fn agent_heartbeat(&self, agent_id: &str) -> Result<(), String> {
         let conn = self.db.lock();
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let expires_str = (now + chrono::Duration::hours(4)).to_rfc3339();
 
         let updated = conn.execute(
-            "UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2",
-            params![now, agent_id],
+            "UPDATE agents SET last_heartbeat = ?1, status = 'WORKING' WHERE id = ?2",
+            params![now_str, agent_id],
         ).map_err(|e| e.to_string())?;
 
         if updated == 0 {
             return Err(format!("Agent '{}' not found", agent_id));
         }
+
+        // Transactionally renew active scope leases for this agent
+        conn.execute("UPDATE scope_leases SET expires_at = ?1 WHERE agent_id = ?2", params![expires_str, agent_id]).ok();
 
         Ok(())
     }
@@ -633,7 +840,7 @@ impl CoordinatorEngine {
         Ok(ContextPack {
             project_id: proj.id,
             project_name: proj.name,
-            contract_hash: "hash-v2".to_string(),
+            contract_hash: "contract-v2".to_string(),
             contract_overview: proj.master_spec,
             project_rules: vec!["Execute exclusively inside assigned Git worktree".to_string(), "Reserve scope locks before writing files".to_string()],
             project_memory: Vec::new(),
@@ -672,7 +879,6 @@ impl CoordinatorEngine {
             .ok();
 
         let plan_id = if let Some(id) = existing_id {
-            // Delete old steps and reset status to UNSORTED
             conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&id])
                 .map_err(|e| e.to_string())?;
             conn.execute(
@@ -779,7 +985,6 @@ impl CoordinatorEngine {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        // Clear existing steps if any
         conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan.id])
             .map_err(|e| e.to_string())?;
 
@@ -813,7 +1018,6 @@ impl CoordinatorEngine {
             });
         }
 
-        // Transition masterplan status to RESORTED
         conn.execute(
             "UPDATE masterplans SET status = 'RESORTED', updated_at = ?1 WHERE id = ?2",
             params![now, plan.id],
@@ -846,11 +1050,26 @@ impl CoordinatorEngine {
             return Err("Cannot claim steps from an UNSORTED masterplan. Decompose the plan first via 'masterplan.decompose'.".to_string());
         }
 
-        // Enforce anti-hoarding limit
-        let count = requested_count
-            .unwrap_or(plan.max_steps_per_agent)
-            .min(plan.max_steps_per_agent)
-            .max(1);
+        // Check active anti-hoarding limit across cumulative active claims
+        let conn = self.db.lock();
+        let currently_active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE claimed_agent_id = ?1 AND status = 'CLAIMED'",
+                [agent_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        drop(conn);
+
+        if currently_active >= plan.max_steps_per_agent as i64 {
+            return Err(format!(
+                "Anti-hoarding cap reached: Agent '{}' already has {} active claimed steps. Submit or complete your current chunk before claiming more.",
+                agent_id, currently_active
+            ));
+        }
+
+        let allowed = (plan.max_steps_per_agent as i64 - currently_active).max(1) as i32;
+        let count = requested_count.unwrap_or(allowed).min(allowed).max(1);
 
         let all_steps = self.list_masterplan_steps(project_id)?;
         let pending_steps: Vec<MasterplanStep> = all_steps
@@ -883,13 +1102,20 @@ impl CoordinatorEngine {
             .map(|s| s.acceptance_criteria.clone())
             .collect();
 
-        // Create Task in Backlog
+        // 1. Create Task in Backlog
         let task = self.create_task(project_id, &task_title, &task_desc, "HIGH", task_steps, criteria)?;
 
-        // Claim Task (cuts Git worktree)
-        let claimed_task = self.claim_task(&task.id, agent_id)?;
+        // 2. Claim Task (cuts Git worktree)
+        let claimed_task = match self.claim_task(&task.id, agent_id) {
+            Ok(t) => t,
+            Err(e) => {
+                let conn = self.db.lock();
+                conn.execute("DELETE FROM tasks WHERE id = ?1", [&task.id]).ok();
+                return Err(e);
+            }
+        };
 
-        // Lock Scopes automatically for all scopes in chunk
+        // 3. Lock Scopes automatically for all scopes in chunk
         let mut all_patterns = Vec::new();
         for s in &pending_steps {
             for pat in s.suggested_scope.split(',') {
@@ -902,9 +1128,15 @@ impl CoordinatorEngine {
         if all_patterns.is_empty() {
             all_patterns.push("src/**".to_string());
         }
-        self.scope.acquire_scope(&task.id, agent_id, all_patterns, "EXCLUSIVE_WRITE").ok();
 
-        // Update masterplan steps to CLAIMED
+        if let Err(scope_err) = self.scope.acquire_scope(&task.id, agent_id, all_patterns, "EXCLUSIVE_WRITE") {
+            // Roll back claimed task on scope collision
+            let conn = self.db.lock();
+            conn.execute("DELETE FROM tasks WHERE id = ?1", [&task.id]).ok();
+            return Err(format!("Chunk claim aborted due to scope collision: {}", scope_err));
+        }
+
+        // 4. Update masterplan steps to CLAIMED
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
         for s in &pending_steps {
@@ -914,7 +1146,6 @@ impl CoordinatorEngine {
             ).ok();
         }
 
-        // Update masterplan status to EXECUTING
         conn.execute(
             "UPDATE masterplans SET status = 'EXECUTING', updated_at = ?1 WHERE id = ?2",
             params![now, plan.id],
@@ -946,4 +1177,3 @@ impl CoordinatorEngine {
 
 #[cfg(test)]
 pub mod tests;
-

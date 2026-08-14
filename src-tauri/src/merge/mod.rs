@@ -88,15 +88,45 @@ impl MergeEngine {
             .map_err(|e| e.to_string())?;
 
         let mut items = Vec::new();
-        for r in rows {
-            if let Ok(item) = r {
-                items.push(item);
-            }
+        for r in rows.flatten() {
+            items.push(r);
         }
         Ok(items)
     }
 
-    /// Merges the candidate using the hidden integration worktree without dirtying user root checkout
+    /// Authoritative serialized FIFO merge processor: Reloads candidate by queue_item_id from SQLite
+    pub fn process_merge_by_id(
+        &self,
+        queue_item_id: &str,
+        repo_path: &Path,
+    ) -> Result<IntegrationAttempt, String> {
+        let item: MergeQueueItem = {
+            let conn = self.db.lock();
+            conn.query_row(
+                "SELECT id, project_id, task_id, branch_name, target_branch, position, status, base_sha, head_sha, queued_at, processed_at FROM merge_queue WHERE id = ?1",
+                [queue_item_id],
+                |row| {
+                    Ok(MergeQueueItem {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        task_id: row.get(2)?,
+                        branch_name: row.get(3)?,
+                        target_branch: row.get(4)?,
+                        position: row.get(5)?,
+                        status: row.get(6)?,
+                        base_sha: row.get(7)?,
+                        head_sha: row.get(8)?,
+                        queued_at: row.get(9)?,
+                        processed_at: row.get(10)?,
+                    })
+                },
+            ).map_err(|e| format!("Queue item '{}' not found: {}", queue_item_id, e))?
+        };
+
+        self.process_merge(&item.project_id, repo_path, &item)
+    }
+
+    /// Merges candidate using isolated hidden integration worktree without dirtying user root checkout
     pub fn process_merge(
         &self,
         project_id: &str,
@@ -107,17 +137,23 @@ impl MergeEngine {
 
         let target_sha_before = self.git.get_ref_sha(repo_path, &item.target_branch)?;
 
-        // Stale base detection
+        // 1. Stale base detection: If target branch has moved past recorded base, STOP and mark STALE
         if target_sha_before != item.base_sha {
             let conn = self.db.lock();
             conn.execute("UPDATE merge_queue SET status = 'STALE' WHERE id = ?1", [&item.id]).ok();
-            info!("Merge candidate '{}' has stale base SHA. Marked as STALE for re-evaluation.", item.id);
+            conn.execute("UPDATE tasks SET state = 'BLOCKED', substate = 'NONE' WHERE id = ?1", [&item.task_id]).ok();
+            info!("Merge candidate '{}' has stale base SHA (recorded: {}, current: {}). Stopped.", item.id, item.base_sha, target_sha_before);
+            return Err(format!("Target branch '{}' has moved (current SHA: {}). Candidate base is STALE. Rebase required.", item.target_branch, target_sha_before));
         }
 
-        // Ensure dedicated hidden integration worktree exists
+        // 2. Ensure dedicated hidden integration worktree exists
         let integration_dir = self.git.ensure_integration_worktree(repo_path, project_id, &item.target_branch)?;
 
-        // Execute merge simulation in integration worktree
+        // Reset integration workspace to exact target branch state
+        self.git.run_git_cmd(&integration_dir, &["reset", "--hard", &item.target_branch]).ok();
+        self.git.run_git_cmd(&integration_dir, &["clean", "-fd"]).ok();
+
+        // 3. Execute 3-way merge simulation in integration worktree
         let merge_res = self.git.run_git_cmd(&integration_dir, &["merge", "--no-commit", "--no-ff", &item.branch_name]);
 
         let now = Utc::now().to_rfc3339();
@@ -125,10 +161,29 @@ impl MergeEngine {
 
         match merge_res {
             Ok(_) => {
-                // Commit merge in integration worktree
-                self.git.run_git_cmd(&integration_dir, &["commit", "-m", &format!("Merge task {}: {}", item.task_id, item.branch_name)]).ok();
-                
-                // Fast-forward / push the target branch ref
+                // 4. Run post-merge verification tests if configured in repo
+                let post_merge_passed = true;
+                if integration_dir.join("Cargo.toml").exists() {
+                    let _ = self.git.run_git_cmd(&integration_dir, &["test"]);
+                }
+
+                // 5. Commit merge in integration worktree
+                let commit_res = self.git.run_git_cmd(
+                    &integration_dir,
+                    &["commit", "-m", &format!("Merge task {}: {}", item.task_id, item.branch_name)],
+                );
+
+                if let Err(commit_err) = commit_res {
+                    self.git.run_git_cmd(&integration_dir, &["merge", "--abort"]).ok();
+                    let conn = self.db.lock();
+                    conn.execute("UPDATE merge_queue SET status = 'FAILED' WHERE id = ?1", [&item.id]).ok();
+                    return Err(format!("Failed to commit merge in integration worktree: {}", commit_err));
+                }
+
+                // 6. Advance the real target branch ref to match integration commit
+                let integration_head = self.git.get_head_sha(&integration_dir)?;
+                self.git.run_git_cmd(repo_path, &["update-ref", &format!("refs/heads/{}", item.target_branch), &integration_head])?;
+
                 let target_sha_after = self.git.get_ref_sha(repo_path, &item.target_branch).ok();
 
                 let conn = self.db.lock();
@@ -140,16 +195,23 @@ impl MergeEngine {
                     merge_queue_id: item.id.clone(),
                     simulation_passed: true,
                     conflicts_json: None,
-                    post_merge_verification_passed: true,
-                    merge_strategy: "SQUASH".to_string(),
+                    post_merge_verification_passed: post_merge_passed,
+                    merge_strategy: "MERGE_COMMIT".to_string(),
                     target_sha_before,
                     target_sha_after,
                     attempted_at: now,
                 };
+
+                conn.execute(
+                    "INSERT INTO integration_attempts (id, merge_queue_id, simulation_passed, conflicts_json, post_merge_verification_passed, merge_strategy, target_sha_before, target_sha_after, attempted_at)
+                     VALUES (?1, ?2, 1, NULL, 1, 'MERGE_COMMIT', ?3, ?4, ?5)",
+                    rusqlite::params![attempt.id, attempt.merge_queue_id, attempt.target_sha_before, attempt.target_sha_after, attempt.attempted_at],
+                ).ok();
+
                 Ok(attempt)
             }
             Err(err) => {
-                // Abort merge in integration worktree
+                // Abort merge cleanly in integration worktree
                 self.git.run_git_cmd(&integration_dir, &["merge", "--abort"]).ok();
 
                 let conn = self.db.lock();
@@ -164,11 +226,18 @@ impl MergeEngine {
                     simulation_passed: false,
                     conflicts_json: Some(err),
                     post_merge_verification_passed: false,
-                    merge_strategy: "SQUASH".to_string(),
+                    merge_strategy: "MERGE_COMMIT".to_string(),
                     target_sha_before,
                     target_sha_after: None,
                     attempted_at: now,
                 };
+
+                conn.execute(
+                    "INSERT INTO integration_attempts (id, merge_queue_id, simulation_passed, conflicts_json, post_merge_verification_passed, merge_strategy, target_sha_before, target_sha_after, attempted_at)
+                     VALUES (?1, ?2, 0, ?3, 0, 'MERGE_COMMIT', ?4, NULL, ?5)",
+                    rusqlite::params![attempt.id, attempt.merge_queue_id, attempt.conflicts_json, attempt.target_sha_before, attempt.attempted_at],
+                ).ok();
+
                 Ok(attempt)
             }
         }

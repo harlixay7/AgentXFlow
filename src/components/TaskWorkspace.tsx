@@ -1,14 +1,11 @@
-import React, { useState } from 'react';
-import { Task, Agent, TaskStep, AcceptanceCriteria, ScopeLease, VerificationResult } from '../types';
-import { X, Play, Shield, Send, CheckCircle, AlertTriangle, Bot, ArrowRight } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Task, Agent, TaskDetails, VerificationResult } from '../types';
+import { X, Play, Shield, Send, CheckCircle, AlertTriangle, Bot, ArrowRight, RefreshCw, CheckSquare, Terminal } from 'lucide-react';
 import { coordinatorApi } from '../api/coordinator';
 
 interface TaskWorkspaceProps {
   task: Task;
   agents: Agent[];
-  steps: TaskStep[];
-  criteria: AcceptanceCriteria[];
-  leases: ScopeLease[];
   onClose: () => void;
   onRefresh: () => void;
 }
@@ -16,23 +13,47 @@ interface TaskWorkspaceProps {
 export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
   task,
   agents,
-  steps,
   onClose,
   onRefresh,
 }) => {
-  const [activeTab, setActiveTab] = useState<'overview' | 'plan' | 'verification' | 'agent'>('overview');
-  const [activeAgentId, setActiveAgentId] = useState<string>(agents[0]?.id || '');
+  const [activeTab, setActiveTab] = useState<'overview' | 'plan' | 'verification' | 'leases' | 'agent'>('overview');
+  const [activeAgentId, setActiveAgentId] = useState<string>(task.assigned_agent_id || agents[0]?.id || '');
   const [scopePattern, setScopePattern] = useState('src/**');
   const [verificationResult, setVerificationResult] = useState<VerificationResult | null>(null);
+  const [taskDetails, setTaskDetails] = useState<TaskDetails | null>(null);
   const [loading, setLoading] = useState(false);
+  const [completingStepId, setCompletingStepId] = useState<string | null>(null);
+  const [stepEvidenceInput, setStepEvidenceInput] = useState<string>('cargo test --exit-code 0');
 
-  const assignedAgent = agents.find((a) => a.id === task.assigned_agent_id);
+  const fetchDetails = async () => {
+    try {
+      const details = await coordinatorApi.getTaskDetails(task.id);
+      setTaskDetails(details);
+      if (details.task.assigned_agent_id) {
+        setActiveAgentId(details.task.assigned_agent_id);
+      }
+    } catch (e) {
+      console.error('Failed to load task details:', e);
+    }
+  };
+
+  useEffect(() => {
+    fetchDetails();
+  }, [task.id]);
+
+  const assignedAgent = agents.find((a) => a.id === (taskDetails?.task.assigned_agent_id || task.assigned_agent_id));
+  const currentTask = taskDetails?.task || task;
+  const steps = taskDetails?.steps || [];
+  const criteria = taskDetails?.criteria || [];
+  const leases = taskDetails?.leases || [];
+  const runs = taskDetails?.verification_runs || [];
 
   const handleClaim = async () => {
     if (!activeAgentId) return;
     setLoading(true);
     try {
-      await coordinatorApi.claimTask(task.id, activeAgentId);
+      await coordinatorApi.claimTask(currentTask.id, activeAgentId);
+      await fetchDetails();
       onRefresh();
     } catch (e: any) {
       alert(e.toString());
@@ -42,11 +63,26 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
   };
 
   const handleScope = async () => {
-    if (!task.assigned_agent_id) return;
+    const agentId = currentTask.assigned_agent_id || activeAgentId;
+    if (!agentId) return;
     setLoading(true);
     try {
-      await coordinatorApi.requestScope(task.id, task.assigned_agent_id, [scopePattern]);
-      alert(`Exclusive write lock acquired for pattern: "${scopePattern}"`);
+      await coordinatorApi.requestScope(currentTask.id, agentId, [scopePattern]);
+      await fetchDetails();
+      onRefresh();
+    } catch (e: any) {
+      alert(e.toString());
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCompleteStep = async (stepId: string) => {
+    setLoading(true);
+    try {
+      await coordinatorApi.completeStep(stepId, JSON.stringify({ stdout: stepEvidenceInput, exit_code: 0 }));
+      setCompletingStepId(null);
+      await fetchDetails();
       onRefresh();
     } catch (e: any) {
       alert(e.toString());
@@ -56,16 +92,13 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
   };
 
   const handleSubmit = async () => {
-    if (!task.assigned_agent_id) return;
+    const agentId = currentTask.assigned_agent_id || activeAgentId;
+    if (!agentId) return;
     setLoading(true);
     try {
-      const res = await coordinatorApi.submitTask(task.id, task.assigned_agent_id);
+      const res = await coordinatorApi.submitTask(currentTask.id, agentId);
       setVerificationResult(res);
-      if (res.is_valid) {
-        alert('Verification checks passed! Task moved to REVIEW.');
-      } else {
-        alert(`Verification rejected:\n${res.rejection_reasons.join('\n')}`);
-      }
+      await fetchDetails();
       onRefresh();
     } catch (e: any) {
       alert(e.toString());
@@ -77,7 +110,7 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
   return (
     <div
       style={{
-        width: 540,
+        width: 560,
         backgroundColor: 'var(--bg-surface)',
         borderLeft: '1px solid var(--border-medium)',
         display: 'flex',
@@ -90,38 +123,47 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
       <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border-medium)', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', backgroundColor: 'var(--bg-input)' }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-            <span className={`badge badge-${task.state}`} title={`Current State: ${task.state}`}>{task.state}</span>
-            <span className="badge badge-MEDIUM" title={`Execution Substate: ${task.substate}`}>{task.substate}</span>
-            <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: 12, color: 'var(--accent-blue)' }}>{task.id}</span>
+            <span className={`badge badge-${currentTask.state}`} title={`Current State: ${currentTask.state}`}>{currentTask.state}</span>
+            <span className="badge badge-MEDIUM" title={`Execution Substate: ${currentTask.substate}`}>{currentTask.substate}</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: 12, color: 'var(--accent-blue)' }}>{currentTask.id}</span>
           </div>
-          <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>{task.title}</div>
+          <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>{currentTask.title}</div>
         </div>
-        <button
-          onClick={onClose}
-          style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: 4 }}
-          title="Close Task Workspace drawer"
-        >
-          <X size={16} />
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <button
+            onClick={fetchDetails}
+            style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: 4 }}
+            title="Refresh Task State"
+          >
+            <RefreshCw size={14} />
+          </button>
+          <button
+            onClick={onClose}
+            style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: 4 }}
+            title="Close Task Workspace drawer"
+          >
+            <X size={16} />
+          </button>
+        </div>
       </div>
 
       {/* Guided Next Step Progress Bar */}
       <div style={{ padding: '8px 16px', backgroundColor: 'var(--bg-card)', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11 }}>
         <span style={{ color: 'var(--text-muted)' }}>Workflow Progression:</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 10 }}>
-          <span style={{ color: task.assigned_agent_id ? 'var(--accent-green)' : 'var(--accent-yellow)', fontWeight: 600 }}>1. Claim</span>
+          <span style={{ color: currentTask.assigned_agent_id ? 'var(--accent-green)' : 'var(--accent-yellow)', fontWeight: 600 }}>1. Claim</span>
           <ArrowRight size={10} style={{ color: 'var(--text-dim)' }} />
-          <span style={{ color: task.worktree_path ? 'var(--accent-green)' : 'var(--text-muted)', fontWeight: 600 }}>2. Worktree</span>
+          <span style={{ color: currentTask.worktree_path ? 'var(--accent-green)' : 'var(--text-muted)', fontWeight: 600 }}>2. Worktree</span>
           <ArrowRight size={10} style={{ color: 'var(--text-dim)' }} />
-          <span style={{ color: task.state === 'REVIEW' || task.state === 'DONE' ? 'var(--accent-green)' : 'var(--text-muted)', fontWeight: 600 }}>3. Verify</span>
+          <span style={{ color: currentTask.state === 'REVIEW' || currentTask.state === 'DONE' ? 'var(--accent-green)' : 'var(--text-muted)', fontWeight: 600 }}>3. Verify</span>
           <ArrowRight size={10} style={{ color: 'var(--text-dim)' }} />
-          <span style={{ color: task.state === 'DONE' ? 'var(--accent-green)' : 'var(--text-muted)', fontWeight: 600 }}>4. Merge</span>
+          <span style={{ color: currentTask.state === 'DONE' ? 'var(--accent-green)' : 'var(--text-muted)', fontWeight: 600 }}>4. Merge</span>
         </div>
       </div>
 
       {/* Tabs */}
       <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-input)' }}>
-        {(['overview', 'plan', 'verification', 'agent'] as const).map((tab) => (
+        {(['overview', 'plan', 'verification', 'leases', 'agent'] as const).map((tab) => (
           <div
             key={tab}
             className={`nav-item ${activeTab === tab ? 'active' : ''}`}
@@ -129,7 +171,7 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
             onClick={() => setActiveTab(tab)}
             title={`View ${tab} details and controls`}
           >
-            {tab}
+            {tab === 'plan' ? `Steps (${steps.length})` : tab === 'leases' ? `Scopes (${leases.length})` : tab}
           </div>
         ))}
       </div>
@@ -140,10 +182,26 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
           <>
             <div>
               <div className="section-label" title="Instructions given to the AI agent">Task Description / Prompt</div>
-              <div style={{ padding: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 11, lineHeight: 1.5 }}>
-                {task.description}
+              <div style={{ padding: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 11, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
+                {currentTask.description}
               </div>
             </div>
+
+            {/* Acceptance Criteria */}
+            {criteria.length > 0 && (
+              <div>
+                <div className="section-label" title="Authoritative acceptance criteria that must pass">Acceptance Criteria ({criteria.length})</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {criteria.map((c) => (
+                    <div key={c.id} style={{ padding: '8px 10px', backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
+                      <CheckSquare size={13} style={{ color: c.is_satisfied ? 'var(--accent-green)' : 'var(--text-muted)' }} />
+                      <span style={{ flex: 1, color: c.is_satisfied ? 'var(--text-primary)' : 'var(--text-secondary)' }}>{c.criterion}</span>
+                      <span className={`badge ${c.is_satisfied ? 'badge-DONE' : 'badge-BACKLOG'}`}>{c.is_satisfied ? 'Satisfied' : 'Pending'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Agent Assignment & Worktree Allocation */}
             <div>
@@ -190,14 +248,14 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
               )}
             </div>
 
-            {task.worktree_path && (
+            {currentTask.worktree_path && (
               <div>
                 <div className="section-label" title="Isolated directory on disk where this agent writes code">Isolated Git Worktree Path</div>
                 <div style={{ padding: 8, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontFamily: 'var(--font-mono)', fontSize: 10, wordBreak: 'break-all', color: 'var(--accent-blue)' }}>
-                  {task.worktree_path}
+                  {currentTask.worktree_path}
                 </div>
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
-                  Branch: <code style={{ color: 'var(--accent-purple)' }}>{task.branch_name}</code>
+                  Branch: <code style={{ color: 'var(--accent-purple)' }}>{currentTask.branch_name}</code>
                 </div>
               </div>
             )}
@@ -218,7 +276,7 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
                   className="btn btn-secondary"
                   style={{ height: 26 }}
                   onClick={handleScope}
-                  disabled={!task.assigned_agent_id || loading}
+                  disabled={!currentTask.assigned_agent_id || loading}
                   title="Acquire exclusive write lock so other agents cannot edit matching files"
                 >
                   <Shield size={12} /> Lock Scope
@@ -231,18 +289,65 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
         {activeTab === 'plan' && (
           <div>
             <div className="section-label" title="Mandatory steps that must be marked COMPLETED before task submission">
-              Required Execution Steps
+              Required Execution Steps ({steps.length})
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {steps.map((s) => (
-                <div key={s.id} style={{ padding: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <div>
-                    <div style={{ fontWeight: 600, fontSize: 11 }}>{s.order_index}. {s.title}</div>
-                    {s.description && <div style={{ color: 'var(--text-muted)', fontSize: 10 }}>{s.description}</div>}
-                  </div>
-                  <span className={`badge ${s.status === 'COMPLETED' ? 'badge-DONE' : 'badge-BACKLOG'}`}>{s.status}</span>
+              {steps.length === 0 ? (
+                <div style={{ padding: 12, textAlign: 'center', color: 'var(--text-muted)', fontSize: 11 }}>
+                  No execution steps specified.
                 </div>
-              ))}
+              ) : (
+                steps.map((s) => (
+                  <div key={s.id} style={{ padding: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div style={{ fontWeight: 600, fontSize: 11 }}>{s.order_index}. {s.title}</div>
+                      <span className={`badge ${s.status === 'COMPLETED' ? 'badge-DONE' : 'badge-BACKLOG'}`}>{s.status}</span>
+                    </div>
+                    {s.description && <div style={{ color: 'var(--text-muted)', fontSize: 10 }}>{s.description}</div>}
+
+                    {s.status !== 'COMPLETED' && (
+                      <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: 6, marginTop: 4 }}>
+                        {completingStepId === s.id ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                            <input
+                              className="input-field"
+                              style={{ height: 24, fontSize: 10, fontFamily: 'var(--font-mono)' }}
+                              value={stepEvidenceInput}
+                              onChange={(e) => setStepEvidenceInput(e.target.value)}
+                              placeholder="Test evidence or execution log"
+                            />
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <button
+                                className="btn btn-primary"
+                                style={{ height: 22, fontSize: 10 }}
+                                onClick={() => handleCompleteStep(s.id)}
+                                disabled={loading}
+                              >
+                                Submit Step Evidence
+                              </button>
+                              <button
+                                className="btn btn-secondary"
+                                style={{ height: 22, fontSize: 10 }}
+                                onClick={() => setCompletingStepId(null)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            className="btn btn-secondary"
+                            style={{ height: 22, fontSize: 10 }}
+                            onClick={() => setCompletingStepId(s.id)}
+                          >
+                            <Terminal size={11} /> Mark Complete with Evidence
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
             </div>
           </div>
         )}
@@ -253,21 +358,21 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
               Authoritative Verification Gate
             </div>
             <p style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10, lineHeight: 1.5 }}>
-              The coordinator runs configured test scripts (e.g. <code>cargo test</code>, <code>npm test</code>) directly inside the task worktree.
+              The coordinator runs configured test suites and checks directly inside the isolated worktree.
             </p>
 
             <button
               className="btn btn-primary"
               style={{ width: '100%', marginBottom: 12, height: 32 }}
               onClick={handleSubmit}
-              disabled={!task.assigned_agent_id || loading}
+              disabled={!currentTask.assigned_agent_id || loading}
               title="Run authoritative coordinator checks and submit task for human review"
             >
               <Send size={13} /> Run Verification & Submit For Review
             </button>
 
             {verificationResult && (
-              <div style={{ padding: 12, backgroundColor: verificationResult.is_valid ? 'rgba(63, 185, 80, 0.1)' : 'rgba(248, 81, 73, 0.1)', border: `1px solid ${verificationResult.is_valid ? 'var(--accent-green)' : 'var(--accent-red)'}`, borderRadius: 'var(--radius-sm)' }}>
+              <div style={{ padding: 12, marginBottom: 12, backgroundColor: verificationResult.is_valid ? 'rgba(63, 185, 80, 0.1)' : 'rgba(248, 81, 73, 0.1)', border: `1px solid ${verificationResult.is_valid ? 'var(--accent-green)' : 'var(--accent-red)'}`, borderRadius: 'var(--radius-sm)' }}>
                 <div style={{ fontWeight: 600, fontSize: 11, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
                   {verificationResult.is_valid ? <CheckCircle size={14} style={{ color: 'var(--accent-green)' }} /> : <AlertTriangle size={14} style={{ color: 'var(--accent-red)' }} />}
                   {verificationResult.is_valid ? 'Verification Passed & Sealed' : 'Verification Checks Failed'}
@@ -277,6 +382,49 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
                 ))}
               </div>
             )}
+
+            {/* Historical Verification Runs */}
+            <div className="section-label" style={{ marginTop: 8 }}>Test Runs & Proofs ({runs.length})</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {runs.length === 0 ? (
+                <div style={{ padding: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', color: 'var(--text-muted)', fontSize: 10, textAlign: 'center' }}>
+                  No coordinator test runs recorded yet.
+                </div>
+              ) : (
+                runs.map((r) => (
+                  <div key={r.id} style={{ padding: 8, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 10, fontFamily: 'var(--font-mono)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                      <span style={{ fontWeight: 600, color: r.is_passed ? 'var(--accent-green)' : 'var(--accent-red)' }}>{r.check_name}</span>
+                      <span>Exit {r.exit_code} ({r.duration_ms}ms)</span>
+                    </div>
+                    <div style={{ color: 'var(--text-muted)' }}>Commit: {r.commit_sha} {r.is_stale ? '(STALE)' : ''}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'leases' && (
+          <div>
+            <div className="section-label">Active Scope Leases ({leases.length})</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {leases.length === 0 ? (
+                <div style={{ padding: 12, textAlign: 'center', color: 'var(--text-muted)', fontSize: 11 }}>
+                  No active scope locks held on this task.
+                </div>
+              ) : (
+                leases.map((l) => (
+                  <div key={l.id} style={{ padding: 10, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, fontSize: 11, color: 'var(--accent-blue)' }}>{l.pattern}</div>
+                      <div style={{ color: 'var(--text-muted)', fontSize: 10 }}>Agent: {l.agent_id} • Type: {l.access_type}</div>
+                    </div>
+                    <span className="badge badge-RUNNING">Locked</span>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         )}
 
@@ -284,9 +432,9 @@ export const TaskWorkspace: React.FC<TaskWorkspaceProps> = ({
           <div>
             <div className="section-label">Agent Session Diagnostics</div>
             <div style={{ padding: 12, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 11, display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <div>Assigned: <strong>{task.assigned_agent_id || 'None'}</strong></div>
-              <div>Base Ref: <code>{task.base_sha || 'HEAD~1'}</code></div>
-              <div>Current Head: <code>{task.head_sha || 'Uncommitted'}</code></div>
+              <div>Assigned Agent: <strong>{currentTask.assigned_agent_id || 'None'}</strong></div>
+              <div>Base Ref: <code>{currentTask.base_sha || 'HEAD~1'}</code></div>
+              <div>Current Head: <code>{currentTask.head_sha || 'Uncommitted'}</code></div>
               <div>Protocol: <code>MCP 2026-07-28 / Streamable HTTP</code></div>
             </div>
           </div>

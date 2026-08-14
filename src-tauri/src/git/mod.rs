@@ -164,6 +164,59 @@ impl GitService {
         Ok(files)
     }
 
+    pub fn get_worktree_head_sha(&self, worktree_dir: &Path) -> Result<String, String> {
+        self.run_git_cmd(worktree_dir, &["rev-parse", "HEAD"])
+    }
+
+    pub fn check_worktree_cleanliness(&self, worktree_dir: &Path) -> Result<(), Vec<String>> {
+        match self.run_git_cmd(worktree_dir, &["status", "--porcelain"]) {
+            Ok(output) => {
+                let lines: Vec<String> = output
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if lines.is_empty() {
+                    Ok(())
+                } else {
+                    Err(lines)
+                }
+            }
+            Err(e) => Err(vec![format!("Failed to query worktree status: {}", e)]),
+        }
+    }
+
+    pub fn get_worktree_mutations(&self, worktree_dir: &Path, base_sha: &str) -> Result<Vec<String>, String> {
+        let mut changed_set = std::collections::HashSet::new();
+
+        // 1. Committed diff between base_sha and worktree HEAD
+        if let Ok(committed_output) = self.run_git_cmd(worktree_dir, &["diff", "--name-only", base_sha, "HEAD"]) {
+            for line in committed_output.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    changed_set.insert(trimmed.to_string());
+                }
+            }
+        }
+
+        // 2. Uncommitted staged and unstaged changes
+        if let Ok(status_output) = self.run_git_cmd(worktree_dir, &["status", "--porcelain"]) {
+            for line in status_output.lines() {
+                let trimmed = line.trim();
+                if trimmed.len() > 3 {
+                    let file_path = trimmed[3..].trim();
+                    if !file_path.is_empty() {
+                        changed_set.insert(file_path.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut list: Vec<String> = changed_set.into_iter().collect();
+        list.sort();
+        Ok(list)
+    }
+
     pub fn check_worktree_health(&self, worktree_dir: &Path) -> bool {
         if !worktree_dir.exists() {
             return false;

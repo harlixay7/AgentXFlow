@@ -15,7 +15,24 @@ impl ScopeManager {
         Self { db }
     }
 
-    /// Layer 1: Requests exclusive or shared scope leases for a task
+    /// Normalizes pattern path and ensures no traversal outside repository root
+    pub fn normalize_pattern(raw: &str) -> Result<String, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("Empty scope pattern is not allowed".to_string());
+        }
+
+        let normalized = trimmed.replace('\\', "/");
+        let without_leading = normalized.trim_start_matches("./").trim_start_matches('/');
+
+        if without_leading.contains("..") {
+            return Err(format!("Path traversal ('..') is not permitted in scope pattern: {}", raw));
+        }
+
+        Ok(without_leading.to_string())
+    }
+
+    /// Layer 1: Atomically checks for collisions and acquires exclusive or shared scope leases
     pub fn acquire_scope(
         &self,
         task_id: &str,
@@ -23,30 +40,91 @@ impl ScopeManager {
         patterns: Vec<String>,
         access_type: &str,
     ) -> Result<Vec<ScopeLease>, String> {
-        let conn = self.db.lock();
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Normalize all requested patterns
+        let mut normalized_patterns = Vec::new();
+        for p in &patterns {
+            let norm = Self::normalize_pattern(p)?;
+            normalized_patterns.push(norm);
+        }
+
+        let mut conn = self.db.lock();
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
         let expires_at = (now + Duration::hours(4)).to_rfc3339();
 
+        // Use transaction for atomic check & lease reservation
+        let tx = conn.transaction().map_err(|e| format!("Failed to start scope transaction: {}", e))?;
+
+        // 1. Clean up expired leases
+        tx.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now_str])
+            .map_err(|e| e.to_string())?;
+
+        // 2. Query all currently active incompatible leases
+        let mut stmt = tx
+            .prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id != ?1 AND expires_at > ?2")
+            .map_err(|e| e.to_string())?;
+
+        let active_leases_iter = stmt
+            .query_map(rusqlite::params![task_id, now_str], |row| {
+                Ok(ScopeLease {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    pattern: row.get(3)?,
+                    access_type: row.get(4)?,
+                    expires_at: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut active_leases = Vec::new();
+        for l in active_leases_iter.flatten() {
+            active_leases.push(l);
+        }
+        drop(stmt);
+
+        // 3. Collision check
+        for req_pat in &normalized_patterns {
+            for existing in &active_leases {
+                // If either is EXCLUSIVE_WRITE and patterns overlap, collision!
+                if (access_type == "EXCLUSIVE_WRITE" || existing.access_type == "EXCLUSIVE_WRITE")
+                    && self.globs_might_overlap(req_pat, &existing.pattern)
+                {
+                    return Err(format!(
+                        "Scope collision: Pattern '{}' overlaps with active lease '{}' held by agent '{}' for task '{}'",
+                        req_pat, existing.pattern, existing.agent_id, existing.task_id
+                    ));
+                }
+            }
+        }
+
+        // 4. Insert all requested leases atomically
         let mut granted = Vec::new();
-        for pattern in patterns {
+        for norm_pat in normalized_patterns {
             let id = Uuid::new_v4().to_string();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO scope_leases (id, task_id, agent_id, pattern, access_type, expires_at, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, task_id, agent_id, pattern, access_type, expires_at, now.to_rfc3339()],
-            ).map_err(|e| format!("Failed to acquire scope lease: {}", e))?;
+                rusqlite::params![id, task_id, agent_id, norm_pat, access_type, expires_at, now_str],
+            ).map_err(|e| format!("Failed to insert scope lease: {}", e))?;
 
             granted.push(ScopeLease {
                 id,
                 task_id: task_id.to_string(),
                 agent_id: agent_id.to_string(),
-                pattern,
+                pattern: norm_pat,
                 access_type: access_type.to_string(),
                 expires_at: expires_at.clone(),
-                created_at: now.to_rfc3339(),
+                created_at: now_str.clone(),
             });
         }
 
+        tx.commit().map_err(|e| format!("Failed to commit scope transaction: {}", e))?;
         Ok(granted)
     }
 
@@ -78,13 +156,12 @@ impl ScopeManager {
             .map_err(|e| e.to_string())?;
 
         let mut overlapping = Vec::new();
-        for lease_res in leases_iter {
-            if let Ok(lease) = lease_res {
-                for requested in patterns {
-                    if self.globs_might_overlap(requested, &lease.pattern) {
-                        overlapping.push(lease.clone());
-                        break;
-                    }
+        for lease_res in leases_iter.flatten() {
+            for requested in patterns {
+                let norm = Self::normalize_pattern(requested).unwrap_or_else(|_| requested.clone());
+                if self.globs_might_overlap(&norm, &lease_res.pattern) {
+                    overlapping.push(lease_res.clone());
+                    break;
                 }
             }
         }
@@ -122,19 +199,20 @@ impl ScopeManager {
 
         for file in changed_files {
             let normalized = file.replace('\\', "/");
-            if !globset.is_match(&normalized) {
+            let clean = normalized.trim_start_matches("./").trim_start_matches('/');
+            if !globset.is_match(clean) {
                 let v_id = Uuid::new_v4().to_string();
                 conn.execute(
                     "INSERT INTO scope_violations (id, task_id, agent_id, file_path, violation_type, detected_at, resolved)
                      VALUES (?1, ?2, ?3, ?4, 'UNRESERVED_WRITE', ?5, 0)",
-                    rusqlite::params![v_id, task_id, agent_id, normalized, now],
+                    rusqlite::params![v_id, task_id, agent_id, clean, now],
                 ).ok();
 
                 violations.push(ScopeViolation {
                     id: v_id,
                     task_id: task_id.to_string(),
                     agent_id: agent_id.to_string(),
-                    file_path: normalized,
+                    file_path: clean.to_string(),
                     violation_type: "UNRESERVED_WRITE".to_string(),
                     detected_at: now.clone(),
                     resolved: false,
@@ -195,7 +273,16 @@ impl ScopeManager {
         Ok(())
     }
 
-    fn globs_might_overlap(&self, pattern_a: &str, pattern_b: &str) -> bool {
+    pub fn renew_task_leases(&self, task_id: &str) -> Result<(), String> {
+        let conn = self.db.lock();
+        let now = Utc::now();
+        let expires_at = (now + Duration::hours(4)).to_rfc3339();
+        conn.execute("UPDATE scope_leases SET expires_at = ?1 WHERE task_id = ?2", rusqlite::params![expires_at, task_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn globs_might_overlap(&self, pattern_a: &str, pattern_b: &str) -> bool {
         if pattern_a == pattern_b {
             return true;
         }

@@ -2,6 +2,7 @@ pub mod acp;
 pub mod core;
 pub mod dag;
 pub mod db;
+pub mod error;
 pub mod git;
 pub mod mcp;
 pub mod merge;
@@ -9,6 +10,7 @@ pub mod models;
 pub mod policies;
 pub mod scheduler;
 pub mod scope;
+pub mod security;
 pub mod verification;
 
 use std::path::Path;
@@ -21,14 +23,15 @@ use crate::git::RepoInspectionResult;
 use crate::mcp::McpServer;
 use crate::models::{
     Agent, CollisionRisk, ContextPack, EventItem, IntegrationAttempt, Masterplan,
-    MasterplanStep, MergeQueueItem, Project, ScopeLease, Task, TaskDependency, TaskStep,
-    VerificationResult,
+    MasterplanStep, MergeQueueItem, Project, ScopeLease, Task, TaskDependency, TaskDetails,
+    TaskStep, VerificationResult,
 };
+use crate::security::SecurityManager;
 
 pub struct AppState {
     pub coordinator: CoordinatorEngine,
+    pub security: SecurityManager,
     pub mcp_port: u16,
-    pub mcp_token: String,
 }
 
 #[tauri::command]
@@ -46,12 +49,18 @@ fn inspect_repository(state: State<'_, Arc<AppState>>, path: String) -> RepoInsp
 
 #[tauri::command]
 fn get_mcp_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let token = state.security.get_token();
     Ok(serde_json::json!({
         "url": format!("http://127.0.0.1:{}/mcp", state.mcp_port),
         "sse_url": format!("http://127.0.0.1:{}/mcp/sse", state.mcp_port),
-        "token": state.mcp_token,
+        "token": token,
         "protocol_version": "2026-07-28",
     }))
+}
+
+#[tauri::command]
+fn rotate_mcp_token(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    state.security.rotate_token().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -63,6 +72,14 @@ fn create_project(
     target_branch: String,
 ) -> Result<Project, String> {
     state.coordinator.create_project(&name, &path, &master_spec, &target_branch)
+}
+
+#[tauri::command]
+fn create_example_project(
+    state: State<'_, Arc<AppState>>,
+    root_dir: String,
+) -> Result<Project, String> {
+    state.coordinator.create_example_project(&root_dir)
 }
 
 #[tauri::command]
@@ -86,6 +103,11 @@ fn create_task(
 #[tauri::command]
 fn get_task(state: State<'_, Arc<AppState>>, task_id: String) -> Result<Task, String> {
     state.coordinator.get_task(&task_id)
+}
+
+#[tauri::command]
+fn get_task_details(state: State<'_, Arc<AppState>>, task_id: String) -> Result<TaskDetails, String> {
+    state.coordinator.get_task_details(&task_id)
 }
 
 #[tauri::command]
@@ -189,6 +211,16 @@ fn process_merge_candidate(
 }
 
 #[tauri::command]
+fn process_merge_by_id(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    queue_item_id: String,
+) -> Result<IntegrationAttempt, String> {
+    let proj = state.coordinator.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
+    state.coordinator.merge.process_merge_by_id(&queue_item_id, Path::new(&proj.path))
+}
+
+#[tauri::command]
 fn get_events_after(
     state: State<'_, Arc<AppState>>,
     last_sequence: i64,
@@ -283,21 +315,20 @@ fn reset_masterplan(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db_path = dirs_next::data_dir()
-        .map(|p| p.join("AgentXFlow").join("agentxflow_v2.db"))
-        .unwrap_or_else(|| std::path::PathBuf::from("agentxflow_v2.db"));
+    let data_dir = dirs_next::data_dir()
+        .map(|p| p.join("AgentXFlow"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
+    std::fs::create_dir_all(&data_dir).ok();
+    let db_path = data_dir.join("agentxflow_v2.db");
 
     let db_pool = DbPool::new(&db_path).expect("Failed to initialize SQLite connection pool");
     let coordinator = CoordinatorEngine::new(db_pool);
 
+    let security = SecurityManager::init_or_load(&data_dir).expect("Failed to initialize security manager");
     let mcp_port = 7890;
-    let mcp_token = "axf_sec_v2_live_token_7890".to_string();
 
-    let mcp_server = McpServer::new(coordinator.clone(), mcp_port, mcp_token.clone());
+    let mcp_server = McpServer::new(coordinator.clone(), mcp_port, security.clone());
 
     tauri::async_runtime::spawn(async move {
         if let Err(e) = mcp_server.start().await {
@@ -307,8 +338,8 @@ pub fn run() {
 
     let app_state = Arc::new(AppState {
         coordinator,
+        security,
         mcp_port,
-        mcp_token,
     });
 
     tauri::Builder::default()
@@ -318,10 +349,13 @@ pub fn run() {
             pick_folder,
             inspect_repository,
             get_mcp_info,
+            rotate_mcp_token,
             create_project,
+            create_example_project,
             list_projects,
             create_task,
             get_task,
+            get_task_details,
             list_tasks,
             claim_task,
             complete_step,
@@ -333,6 +367,7 @@ pub fn run() {
             list_merge_queue,
             enqueue_task_for_merge,
             process_merge_candidate,
+            process_merge_by_id,
             get_events_after,
             get_context_pack,
             register_agent,

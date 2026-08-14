@@ -269,9 +269,6 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
               <TaskWorkspace
                 task={selectedTask}
                 agents={agents}
-                steps={[]}
-                criteria={[]}
-                leases={[]}
                 onClose={() => onSelectTask(null)}
                 onRefresh={onRefresh}
               />

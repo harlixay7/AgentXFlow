@@ -309,5 +309,23 @@ export interface DecomposedStepInput {
   acceptance_criteria?: string;
 }
 
+export interface EvidenceRecord {
+  id: string;
+  task_id: string;
+  step_id: string | null;
+  evidence_type: string;
+  source: string;
+  payload_json: string;
+  recorded_at: string;
+}
 
-
+export interface TaskDetails {
+  task: Task;
+  steps: TaskStep[];
+  criteria: AcceptanceCriteria[];
+  leases: ScopeLease[];
+  verification_runs: VerificationRun[];
+  violations: ScopeViolation[];
+  proof_bundle: ProofBundle | null;
+  evidence_records: EvidenceRecord[];
+}

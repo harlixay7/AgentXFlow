@@ -529,3 +529,28 @@ pub struct DecomposedStepInput {
     pub acceptance_criteria: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceRecord {
+    pub id: String,
+    pub task_id: String,
+    pub step_id: Option<String>,
+    pub evidence_type: String, // COMMAND_EXECUTION, TEST_RESULT, BUILD_RESULT, GIT_DIFF, FILE_CHANGE, USER_APPROVAL, AGENT_NOTE
+    pub source: String,        // COORDINATOR_OBSERVED, AGENT_REPORTED
+    pub payload_json: String,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDetails {
+    pub task: Task,
+    pub steps: Vec<TaskStep>,
+    pub criteria: Vec<AcceptanceCriteria>,
+    pub leases: Vec<ScopeLease>,
+    pub dependencies: Vec<TaskDependency>,
+    pub verification_runs: Vec<VerificationRun>,
+    pub violations: Vec<ScopeViolation>,
+    pub evidence_records: Vec<EvidenceRecord>,
+    pub proof_bundle: Option<ProofBundle>,
+    pub assigned_agent: Option<Agent>,
+}
+

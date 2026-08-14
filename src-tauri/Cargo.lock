@@ -28,6 +28,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "thiserror 2.0.20",
  "tokio",
  "tower-http 0.5.2",
  "tracing",

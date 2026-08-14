@@ -369,6 +369,18 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             FOREIGN KEY(claimed_task_id) REFERENCES tasks(id) ON DELETE SET NULL
         );
 
+        -- First-Class Step & Coordinator Evidence Records
+        CREATE TABLE IF NOT EXISTS evidence_records (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            step_id TEXT,
+            evidence_type TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'AGENT_REPORTED',
+            payload_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
         -- Indexes for High Performance Querying
         CREATE INDEX IF NOT EXISTS idx_tasks_project_state ON tasks(project_id, state);
         CREATE INDEX IF NOT EXISTS idx_task_deps_task_id ON task_dependencies(task_id);
@@ -380,6 +392,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_events_sequence ON events(sequence);
         CREATE INDEX IF NOT EXISTS idx_masterplans_project ON masterplans(project_id);
         CREATE INDEX IF NOT EXISTS idx_masterplan_steps_plan_idx ON masterplan_steps(masterplan_id, step_index);
+        CREATE INDEX IF NOT EXISTS idx_evidence_records_task ON evidence_records(task_id);
         "
     )?;
 

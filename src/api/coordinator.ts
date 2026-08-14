@@ -172,6 +172,22 @@ export const coordinatorApi = {
     return await invoke('register_agent', { name, agentType });
   },
 
+  async getTaskDetails(taskId: string): Promise<import('../types').TaskDetails> {
+    return await invoke('get_task_details', { taskId });
+  },
+
+  async rotateMcpToken(): Promise<string> {
+    return await invoke('rotate_mcp_token');
+  },
+
+  async createExampleProject(rootDir: string): Promise<Project> {
+    return await invoke('create_example_project', { rootDir });
+  },
+
+  async processMergeById(projectId: string, queueItemId: string): Promise<IntegrationAttempt> {
+    return await invoke('process_merge_by_id', { projectId, queueItemId });
+  },
+
   async listAgents(): Promise<Agent[]> {
     if (!isTauri) return [];
     return await invoke('list_agents');
