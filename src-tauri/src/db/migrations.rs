@@ -80,6 +80,11 @@ fn get_all_migrations() -> Vec<Migration> {
             name: "task_attempts_and_machine_evaluators",
             run: migration_0005_task_attempts_and_machine_evaluators,
         },
+        Migration {
+            version: 6,
+            name: "task_masterplan_lifecycle_and_stale_invalidation",
+            run: migration_0006_task_masterplan_lifecycle_and_stale_invalidation,
+        },
     ]
 }
 
@@ -762,6 +767,36 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
         CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, attempt_number);
         CREATE INDEX IF NOT EXISTS idx_evaluator_results_attempt ON evaluator_results(attempt_id, passed);
         CREATE INDEX IF NOT EXISTS idx_evaluator_results_task ON evaluator_results(task_id, criterion_id);
+        "
+    )?;
+
+    Ok(())
+}
+
+fn migration_0006_task_masterplan_lifecycle_and_stale_invalidation(tx: &Transaction) -> Result<()> {
+    // 1. Defensively inspect and upgrade tasks table
+    let mut check_tasks_stmt = tx.prepare("PRAGMA table_info(tasks)")?;
+    let task_cols = check_tasks_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_tasks_stmt);
+
+    if !task_cols.contains(&"masterplan_id".to_string()) {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN masterplan_id TEXT;")?;
+    }
+    if !task_cols.contains(&"masterplan_revision_id".to_string()) {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN masterplan_revision_id TEXT;")?;
+    }
+    if !task_cols.contains(&"is_stale".to_string()) {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN is_stale BOOLEAN NOT NULL DEFAULT 0;")?;
+    }
+
+    // 2. Safe index creation
+    tx.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_tasks_project_masterplan ON tasks(project_id, masterplan_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_state_stale ON tasks(state, is_stale);
         "
     )?;
 

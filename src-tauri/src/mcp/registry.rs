@@ -53,6 +53,20 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         json!({
+            "name": "prepare_masterplan",
+            "description": "Atomically save, parse, structure, and prepare a masterplan for agents.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Target project ID" },
+                    "raw_text": { "type": "string", "description": "Masterplan specification text" },
+                    "target_step_count": { "type": "integer", "description": "Desired number of execution steps" },
+                    "max_steps_per_agent": { "type": "integer", "description": "Maximum steps claimable by one agent" }
+                },
+                "required": ["project_id", "raw_text"]
+            }
+        }),
+        json!({
             "name": "masterplan_status",
             "description": "Query plan progress stats, total steps, and step statuses.",
             "inputSchema": {
@@ -221,6 +235,31 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
                     "agent_id": { "type": "string", "description": "Agent identifier" }
                 },
                 "required": ["task_id", "agent_id"]
+            }
+        }),
+        json!({
+            "name": "task_cancel",
+            "description": "Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" },
+                    "agent_id": { "type": "string", "description": "Optional claiming agent identifier" },
+                    "reason": { "type": "string", "description": "Optional cancellation rationale" }
+                },
+                "required": ["task_id"]
+            }
+        }),
+        json!({
+            "name": "task_requeue",
+            "description": "Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" },
+                    "agent_id": { "type": "string", "description": "Optional claiming agent identifier" }
+                },
+                "required": ["task_id"]
             }
         }),
         json!({

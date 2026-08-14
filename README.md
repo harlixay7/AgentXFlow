@@ -149,6 +149,8 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 | `task_complete_step` | `step_id`, `agent_id?`, `evidence?` | Mark a required task step complete with test output (verifies caller task ownership). |
 | `dag_dependencies` | `task_id` | List blocker tasks that must finish before this task starts. |
 | `task_submit` | `task_id`, `agent_id` | Submit task; coordinator automatically executes verification profiles, machine evaluators, and git diff mutation audit. |
+| `task_cancel` | `task_id`, `agent_id?`, `reason?` | Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING. |
+| `task_requeue` | `task_id`, `agent_id?` | Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases. |
 | `merge_queue_status` | `project_id` | Check queue position and status for serialized branch merges. |
 
 ---
@@ -181,7 +183,7 @@ npm run build
 - `src-tauri/src/scope/`: Glob pattern collision detection, pattern normalization, and attempt-scoped mutation auditor.
 - `src-tauri/src/verification/`: Verification profiles, automated machine evaluators, and SHA-256 proof bundle generator.
 - `src-tauri/src/merge/`: Serialized FIFO merge engine with disposable integration worktrees and CAS ref updates.
-- `src-tauri/src/db/`: Versioned SQLite migrations (1–5), connection pooling, and single-instance file lock.
+- `src-tauri/src/db/`: Versioned SQLite migrations (1–6), connection pooling, and single-instance file lock.
 - `src/`: React 19 / TypeScript workbench UI.
 
 ---

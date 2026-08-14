@@ -145,6 +145,25 @@ fn submit_task(
 }
 
 #[tauri::command]
+fn cancel_task(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+    agent_id: Option<String>,
+    reason: Option<String>,
+) -> Result<Task, String> {
+    state.coordinator.cancel_task(&task_id, agent_id.as_deref(), reason.as_deref())
+}
+
+#[tauri::command]
+fn requeue_task(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+    agent_id: Option<String>,
+) -> Result<(), String> {
+    state.coordinator.requeue_task(&task_id, agent_id.as_deref())
+}
+
+#[tauri::command]
 fn request_scope(
     state: State<'_, Arc<AppState>>,
     task_id: String,
@@ -405,6 +424,8 @@ pub fn run() {
             get_task_details,
             list_tasks,
             claim_task,
+            cancel_task,
+            requeue_task,
             complete_step,
             satisfy_acceptance_criterion,
             submit_task,

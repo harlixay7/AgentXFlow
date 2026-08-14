@@ -51,6 +51,8 @@ The coordinator enforces task integrity on the server with deterministic, machin
 | `task_complete_step` | `step_id`, `agent_id?`, `evidence?` | Mark a required task step complete with test output (verifies caller task ownership). |
 | `dag_dependencies` | `task_id` | List blocker tasks that must finish before this task starts. |
 | `task_submit` | `task_id`, `agent_id` | Submit task; coordinator automatically executes verification profiles, machine evaluators, and git diff mutation audit. |
+| `task_cancel` | `task_id`, `agent_id?`, `reason?` | Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING. |
+| `task_requeue` | `task_id`, `agent_id?` | Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases. |
 | `merge_queue_status` | `project_id` | Check queue position and status for serialized branch merges. |
 
 ---

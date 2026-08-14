@@ -88,6 +88,14 @@ export const coordinatorApi = {
     return await invoke('submit_task', { taskId, agentId });
   },
 
+  async cancelTask(taskId: string, agentId?: string, reason?: string): Promise<Task> {
+    return await invoke('cancel_task', { taskId, agentId, reason });
+  },
+
+  async requeueTask(taskId: string, agentId?: string): Promise<void> {
+    return await invoke('requeue_task', { taskId, agentId });
+  },
+
   async requestScope(taskId: string, agentId: string, patterns: string[]): Promise<ScopeLease[]> {
     return await invoke('request_scope', { taskId, agentId, patterns });
   },

@@ -180,6 +180,9 @@ pub struct Task {
     pub branch_name: Option<String>,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    pub masterplan_id: Option<String>,
+    pub masterplan_revision_id: Option<String>,
+    pub is_stale: bool,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -403,7 +403,15 @@ fn execute_mcp_tool(
             if project_id.trim().is_empty() {
                 return Err("Missing required parameter 'project_id'. Query 'project_list' or 'agentxflow_current_context' to obtain valid project IDs.".to_string());
             }
-            state.coordinator.list_tasks(project_id).map(|tasks| serde_json::to_value(tasks).unwrap())
+            let include_stale = params.get("include_stale").and_then(|v| v.as_bool()).unwrap_or(false);
+            state.coordinator.list_tasks(project_id).map(|tasks| {
+                if include_stale {
+                    serde_json::to_value(tasks).unwrap()
+                } else {
+                    let active_tasks: Vec<_> = tasks.into_iter().filter(|t| !t.is_stale).collect();
+                    serde_json::to_value(active_tasks).unwrap()
+                }
+            })
         }
 
         "task_get" | "task.get" => {
@@ -472,6 +480,30 @@ fn execute_mcp_tool(
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id = resolve_agent_id(raw_agent_id)?;
             state.coordinator.submit_task(task_id, &agent_id).map(|res| serde_json::to_value(res).unwrap())
+        }
+
+        "task_cancel" | "task.cancel" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
+            let reason = params.get("reason").and_then(|v| v.as_str());
+            state.coordinator.cancel_task(task_id, agent_id_opt.as_deref(), reason).map(|task| serde_json::json!({
+                "success": true,
+                "task_id": task.id,
+                "state": task.state.as_str(),
+                "message": "Task cancelled and scope leases released."
+            }))
+        }
+
+        "task_requeue" | "task.requeue" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id_opt = resolve_agent_id(raw_agent_id).ok();
+            state.coordinator.requeue_task(task_id, agent_id_opt.as_deref()).map(|_| serde_json::json!({
+                "success": true,
+                "task_id": task_id,
+                "message": "Task chunk requeued to masterplan pending steps and scope leases released."
+            }))
         }
 
         "scope_acquire" | "scope.acquire" | "scope.propose" => {
@@ -582,7 +614,21 @@ fn execute_mcp_tool(
                 .or_else(|| params.get("count"))
                 .and_then(|v| v.as_i64())
                 .map(|n| n as i32);
-            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count).map(|chunk| serde_json::to_value(chunk).unwrap())
+            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count).map(|chunk| {
+                serde_json::json!({
+                    "id": chunk.id,
+                    "task_id": chunk.id,
+                    "task": chunk,
+                    "project_id": chunk.project_id,
+                    "title": chunk.title,
+                    "description": chunk.description,
+                    "state": chunk.state.as_str(),
+                    "worktree_path": chunk.worktree_path,
+                    "branch_name": chunk.branch_name,
+                    "base_sha": chunk.base_sha,
+                    "message": "Chunk claimed successfully with exclusive write scope leases."
+                })
+            })
         }
 
         "masterplan_decompose" | "masterplan.decompose" => {

@@ -61,9 +61,9 @@ impl SchedulerEngine {
             return Ok(Vec::new());
         }
 
-        // 2. Fetch all READY tasks
+        // 2. Fetch all READY tasks (filtering out stale tasks)
         let mut stmt = conn
-            .prepare("SELECT id, project_id, parent_id, epic_id, title, description, state, substate, assigned_agent_id, priority, risk_score, estimated_scope, worktree_path, branch_name, base_sha, head_sha, created_at, updated_at FROM tasks WHERE project_id = ?1 AND state = 'READY' ORDER BY priority DESC, created_at ASC")
+            .prepare("SELECT id, project_id, parent_id, epic_id, title, description, state, substate, assigned_agent_id, priority, risk_score, estimated_scope, worktree_path, branch_name, base_sha, head_sha, masterplan_id, masterplan_revision_id, is_stale, created_at, updated_at FROM tasks WHERE project_id = ?1 AND state = 'READY' AND is_stale = 0 ORDER BY priority DESC, created_at ASC")
             .map_err(|e| e.to_string())?;
 
         let tasks_iter = stmt
@@ -85,8 +85,11 @@ impl SchedulerEngine {
                     branch_name: row.get(13)?,
                     base_sha: row.get(14)?,
                     head_sha: row.get(15)?,
-                    created_at: row.get(16)?,
-                    updated_at: row.get(17)?,
+                    masterplan_id: row.get(16)?,
+                    masterplan_revision_id: row.get(17)?,
+                    is_stale: row.get(18)?,
+                    created_at: row.get(19)?,
+                    updated_at: row.get(20)?,
                 })
             })
             .map_err(|e| e.to_string())?;

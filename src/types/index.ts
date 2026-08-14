@@ -60,6 +60,9 @@ export interface Task {
   branch_name: string | null;
   base_sha: string | null;
   head_sha: string | null;
+  masterplan_id?: string | null;
+  masterplan_revision_id?: string | null;
+  is_stale?: boolean;
   created_at: string;
   updated_at: string;
 }
