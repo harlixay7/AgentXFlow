@@ -171,6 +171,8 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 - **Isolated Worktrees**: All code edits must occur inside `.agentxflow/worktrees/task-<id>` or the assigned AppData worktree path. Never edit the primary repository root directly.
 - **Attempt-Scoped Auditing**: Scope violations are bound to your active `attempt_id`. Acquiring missing scope leases cleanly clears violations on subsequent re-runs and submissions.
 - **Hybrid Milestone Handoff**: When `require_milestone_approval` is enabled in the UI (Interactive Milestone Mode), agents pause after each chunk, report back in IDE chat, and await user instructions. In Continuous Autonomous Swarm Mode, agents claim subsequent chunks immediately.
+- **Transparent Activity Heartbeats**: Incoming MCP tool calls automatically refresh your agent session liveness timestamp. No background timer loops are needed.
+- **Parallel Swarm Multi-Agent Execution**: Agents can work simultaneously on separate chunks in independent Git worktrees.
 
 ---
 
@@ -185,7 +187,7 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 | `masterplan_get` | `project_id` | Inspect masterplan state, raw specification text, project identity, and architect decomposition instructions. |
 | `masterplan_status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
 | `prepare_masterplan` | `project_id`, `raw_text`, `target_step_count?`, `max_steps_per_agent?` | Atomically save, parse, structure, and prepare a masterplan for agents. |
-| `masterplan_decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured, non-overlapping execution steps. |
+| `masterplan_decompose` | `project_id`, `steps`, `idempotency_key?`, `compact?` | Normalize raw masterplan text into structured, non-overlapping execution steps. |
 | `masterplan_claim_chunk`| `project_id`, `agent_id`, `count?` | Claim next batch of steps (strictly capped by limit) and allocate an isolated Git worktree. |
 | `agent_register` | `name`, `agent_type` | Idempotently register agent session with a canonical IDE identity and get an authoritative session token. |
 | `agent_heartbeat` | `agent_id` | Refresh your session heartbeat and active lease timers. |
@@ -200,6 +202,8 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 | `task_submit` | `task_id`, `agent_id` | Submit task; coordinator automatically executes verification profiles, machine evaluators, and git diff mutation audit. Returns milestone handoff instructions on completion. |
 | `task_cancel` | `task_id`, `agent_id?`, `reason?` | Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING. |
 | `task_requeue` | `task_id`, `agent_id?` | Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases. |
+| `unclaim_agent_tasks` | `agent_id` | Safely unclaim all active tasks for an agent, reverting masterplan steps to PENDING and releasing locks. |
+| `force_agent_idle` | `agent_id` | Forces an agent status to IDLE, unclaiming active tasks and resetting session heartbeat. |
 | `task_reconcile` | `task_id` | Reconcile task state, task attempt, proof bundle, and merge queue status. |
 | `merge_queue_status` | `project_id` | Check queue position and status for serialized branch merges. |
 | `merge_enqueue` | `project_id`, `task_id` | Enqueue a verified or MERGE_READY task into the serialized merge queue. |

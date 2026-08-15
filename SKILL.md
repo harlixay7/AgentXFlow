@@ -92,6 +92,8 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 | `task_submit` | `task_id`, `agent_id` | Submit task; coordinator automatically executes verification profiles, machine evaluators, and git diff mutation audit. Returns milestone handoff instructions on completion. |
 | `task_cancel` | `task_id`, `agent_id?`, `reason?` | Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING. |
 | `task_requeue` | `task_id`, `agent_id?` | Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases. |
+| `unclaim_agent_tasks` | `agent_id` | Safely unclaim all active tasks for an agent, reverting masterplan steps to PENDING and releasing locks. |
+| `force_agent_idle` | `agent_id` | Forces an agent status to IDLE, unclaiming active tasks and resetting session heartbeat. |
 | `task_reconcile` | `task_id` | Reconcile task state, task attempt, proof bundle, and merge queue status. |
 | `merge_queue_status` | `project_id` | Check queue position and status for serialized branch merges. |
 | `merge_enqueue` | `project_id`, `task_id` | Enqueue a verified or MERGE_READY task into the serialized merge queue. |
@@ -115,3 +117,5 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
    - If `next_action == 'masterplan_claim_chunk'`: Autonomous swarm mode is enabled; proceed to claim your next chunk immediately without waiting.
 11. **Automated Machine Verification**: Criteria satisfaction is derived strictly from passing automated machine evaluators and verification profiles.
 12. **Fix Submission Rejections**: If `task_submit` returns validation errors, inspect `rejection_reasons`, address them inside your worktree, and call `task_submit` again.
+13. **Transparent Activity Heartbeats**: Every inbound MCP tool call automatically refreshes your agent heartbeat and active session lease. You do NOT need to run background heartbeat timers.
+14. **Parallel Swarm Collaboration**: Multiple agents can claim distinct chunks and work simultaneously in parallel Git worktrees without lock contention.
