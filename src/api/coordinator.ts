@@ -213,6 +213,64 @@ export const coordinatorApi = {
     return await invoke('get_current_context', { agentId, projectId });
   },
 
+  async listMasterplansForProject(projectId: string): Promise<import('../types').Masterplan[]> {
+    if (!isTauri) return [];
+    return await invoke('list_masterplans_for_project', { projectId });
+  },
+
+  async getMasterplanById(masterplanId: string): Promise<import('../types').Masterplan | null> {
+    if (!isTauri) return null;
+    return await invoke('get_masterplan_by_id', { masterplanId });
+  },
+
+  async createMasterplan(
+    projectId: string,
+    title?: string,
+    rawText: string = '',
+    targetStepCount: number = 20,
+    maxStepsPerAgent: number = 4,
+    activate: boolean = false
+  ): Promise<import('../types').Masterplan> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('create_masterplan', {
+      projectId,
+      title,
+      rawText,
+      targetStepCount,
+      maxStepsPerAgent,
+      activate,
+    });
+  },
+
+  async setMasterplanActiveToggle(
+    masterplanId: string,
+    isActive: boolean,
+    force: boolean = false
+  ): Promise<import('../types').Masterplan> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('set_masterplan_active_toggle', {
+      masterplanId,
+      isActive,
+      force,
+    });
+  },
+
+  async deleteMasterplan(masterplanId: string): Promise<void> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('delete_masterplan', { masterplanId });
+  },
+
+  async listMasterplanStepsByPlanId(masterplanId: string): Promise<import('../types').MasterplanStep[]> {
+    if (!isTauri) return [];
+    return await invoke('list_masterplan_steps_by_plan_id', { masterplanId });
+  },
+
   async setMasterplanMilestoneApproval(projectId: string, requireApproval: boolean): Promise<boolean> {
     if (!isTauri) {
       throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');

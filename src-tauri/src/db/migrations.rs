@@ -113,6 +113,11 @@ fn get_all_migrations() -> Vec<Migration> {
             name: "masterplan_milestone_approval_toggle",
             run: migration_0010_masterplan_milestone_approval_toggle,
         },
+        Migration {
+            version: 11,
+            name: "multiple_masterplans_and_active_toggle",
+            run: migration_0011_multiple_masterplans_and_active_toggle,
+        },
     ]
 }
 
@@ -1129,6 +1134,63 @@ fn migration_0010_masterplan_milestone_approval_toggle(tx: &Transaction) -> Resu
     if !mp_cols.contains(&"require_milestone_approval".to_string()) {
         tx.execute_batch("ALTER TABLE masterplans ADD COLUMN require_milestone_approval BOOLEAN NOT NULL DEFAULT 1;")?;
     }
+
+    Ok(())
+}
+
+/// Adds title, is_active toggle, and indexes to masterplans for multi-masterplan cataloging
+fn migration_0011_multiple_masterplans_and_active_toggle(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS masterplans (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT 'Masterplan',
+            raw_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'UNSORTED',
+            target_step_count INTEGER NOT NULL DEFAULT 20,
+            max_steps_per_agent INTEGER NOT NULL DEFAULT 4,
+            require_milestone_approval BOOLEAN NOT NULL DEFAULT 1,
+            is_active BOOLEAN NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        "
+    )?;
+
+    let mut check_mp_stmt = tx.prepare("PRAGMA table_info(masterplans)")?;
+    let mp_cols = check_mp_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_mp_stmt);
+
+    if !mp_cols.contains(&"title".to_string()) {
+        tx.execute_batch("ALTER TABLE masterplans ADD COLUMN title TEXT NOT NULL DEFAULT 'Masterplan';")?;
+    }
+
+    if !mp_cols.contains(&"is_active".to_string()) {
+        tx.execute_batch("ALTER TABLE masterplans ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 0;")?;
+        // Set the latest masterplan for each project to is_active = 1
+        tx.execute_batch(
+            "
+            UPDATE masterplans
+            SET is_active = 1
+            WHERE id IN (
+                SELECT m1.id
+                FROM masterplans m1
+                WHERE m1.updated_at = (
+                    SELECT MAX(m2.updated_at)
+                    FROM masterplans m2
+                    WHERE m2.project_id = m1.project_id
+                )
+            );
+            "
+        )?;
+    }
+
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_masterplans_project_active ON masterplans(project_id, is_active);")?;
 
     Ok(())
 }

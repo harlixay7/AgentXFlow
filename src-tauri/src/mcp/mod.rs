@@ -694,7 +694,7 @@ fn execute_mcp_tool(
                         "architectural_guidelines": architectural_guidelines
                     }))
                 }
-                Ok(None) => Err(format!("No masterplan found for project '{}'", project_id)),
+                Ok(None) => Err(format!("No active masterplan is currently published for project '{}'. In Masterplan Hub, toggle ON a masterplan to make it visible and actionable for AI agents.", project_id)),
                 Err(e) => Err(e),
             }
         }
@@ -712,6 +712,9 @@ fn execute_mcp_tool(
                     let completed = steps.iter().filter(|s| s.status == "COMPLETED").count();
                     Ok(serde_json::json!({
                         "status": plan.status,
+                        "masterplan_id": plan.id,
+                        "title": plan.title,
+                        "is_active": plan.is_active,
                         "total_steps": steps.len(),
                         "pending_steps": pending,
                         "claimed_steps": claimed,
@@ -720,7 +723,7 @@ fn execute_mcp_tool(
                         "steps": steps,
                     }))
                 }
-                Ok(None) => Err(format!("No masterplan found for project '{}'", project_id)),
+                Ok(None) => Err(format!("No active masterplan is currently published for project '{}'. In Masterplan Hub, toggle ON a masterplan to enable it for AI agents.", project_id)),
                 Err(e) => Err(e),
             }
         }

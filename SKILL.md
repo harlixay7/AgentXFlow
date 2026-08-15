@@ -17,8 +17,8 @@ The coordinator enforces task integrity on the server with deterministic, machin
 1. Context        -> Call agentxflow_current_context to discover active project, assigned task, and next action.
 2. Register       -> Call agent_register(name="<Your_IDE>") with your canonical IDE platform (e.g. "Antigravity", "Claude Code", "Cursor").
 3. Contract       -> Call project_context with project_id to fetch architectural rules and conventions.
-4. Masterplan     -> Call masterplan_get. If UNSORTED, act as Master Architect: decompose raw specification into high-fidelity steps via masterplan_decompose.
-5. Claim Chunk    -> Call masterplan_claim_chunk to allocate an isolated Git worktree (strictly capped by max_steps_per_agent).
+4. Masterplan     -> Call masterplan_get. Only the currently active/published plan is visible over MCP. If UNSORTED, act as Master Architect: decompose raw specification into high-fidelity steps via masterplan_decompose.
+5. Claim Chunk    -> Call masterplan_claim_chunk to allocate an isolated Git worktree (strictly capped by max_steps_per_agent, up to 8 steps).
 6. Scope          -> Call scope_acquire with specific file globs before modifying code.
 7. Implement      -> Make changes strictly inside your allocated worktree path and verify locally.
 8. Step Evidence  -> Call task_complete_step with step_id and command verification evidence.
@@ -53,15 +53,16 @@ Registration is completely idempotent—calling with your canonical name always 
 
 When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Architect**. You must generate a production-grade, multi-agent plan with the following strict criteria:
 
-1. **Project-Tailored Folder Structure**: Design a clean, modular directory tree matching the project's actual tech stack (e.g. React/Vite/Tauri/Rust/Node).
-2. **Exhaustive Step Specifications (Zero Toy Demos)**:
+1. **Multi-Masterplan Catalog & Active Plan Isolation**: Projects can contain multiple masterplans (drafts, milestones, epics). Only the masterplan toggled **ON** (`is_active = true`) in the Masterplan Hub is exposed to AI agents via MCP tools (`masterplan_get`, `masterplan_claim_chunk`). If no active masterplan is toggled on, MCP calls return an informative guidance message.
+2. **Project-Tailored Folder Structure**: Design a clean, modular directory tree matching the project's actual tech stack (e.g. React/Vite/Tauri/Rust/Node).
+3. **Exhaustive Step Specifications (Zero Toy Demos)**:
    - **Target Files**: Explicit relative file paths to create or modify (e.g. `src/components/Navigation/Sidebar.tsx`, `src/types/navigation.ts`).
    - **Concrete Exports & Interfaces**: Specific type definitions, function signatures, state hooks, and API routes to implement.
    - **Professional UX Standard**: Require responsive flex/grid layouts, clean glassmorphism/modern palettes, robust state management, dark/light themes, keyboard shortcuts, and zero placeholder stubs.
    - **Zero Cliché Tropes**: Avoid excessive purple glows or generic vibe fluff; prioritize crisp contrast, high density, and functional excellence.
    - **Non-Overlapping Scopes**: Assign distinct file globs per step (e.g. `src/components/Navigation/**`, `src-tauri/src/db/**`) so multiple agents can work in parallel without lock contention.
    - **Automated Verification Criteria**: Exact machine commands (e.g. `npm run build`, `cargo test --test auth_test`).
-3. **Target Step Count**: Decompose into the target step count (default 20 steps) to allow maximum parallelization across agents.
+4. **Target Step Count**: Decompose into the target step count (configurable up to 100 steps; default 20 steps) to allow maximum parallelization across agents. Anti-hoarding chunk caps support up to 8 steps per agent.
 
 ---
 

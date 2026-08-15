@@ -509,7 +509,7 @@ impl CoordinatorEngine {
                         let _ = self.git.remove_worktree(Path::new(&proj.path), p);
                     }
                 }
-                let _ = std::fs::remove_dir_all(p);
+                let _ = crate::git::GitService::safe_remove_dir_all(p);
             }
         }
 
@@ -1389,11 +1389,18 @@ impl CoordinatorEngine {
         let existing: Option<(String, String)> = {
             let conn = self.db.lock();
             conn.query_row(
-                "SELECT id, raw_text FROM masterplans WHERE project_id = ?1",
+                "SELECT id, raw_text FROM masterplans WHERE project_id = ?1 AND is_active = 1 LIMIT 1",
                 [project_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok()
+            .or_else(|| {
+                conn.query_row(
+                    "SELECT id, raw_text FROM masterplans WHERE project_id = ?1 ORDER BY updated_at DESC LIMIT 1",
+                    [project_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ).ok()
+            })
         };
 
         // Cancel all unmerged in-flight tasks and release scopes for the project
@@ -1413,9 +1420,8 @@ impl CoordinatorEngine {
             let _ = self.cancel_task(tid, None, Some("Masterplan created/updated with new specification text"));
         }
 
-        let (plan_id, require_approval) = if let Some((id, old_text)) = existing {
+        let (plan_id, plan_title, require_approval, is_active) = if let Some((id, old_text)) = existing {
             let conn = self.db.lock();
-            // Archive existing plan into masterplan_revisions before updating
             let rev_id = Uuid::new_v4().to_string();
             let rev_num: i32 = conn.query_row(
                 "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM masterplan_revisions WHERE masterplan_id = ?1",
@@ -1423,11 +1429,11 @@ impl CoordinatorEngine {
                 |r| r.get(0),
             ).unwrap_or(1);
 
-            let existing_approval: bool = conn.query_row(
-                "SELECT COALESCE(require_milestone_approval, 1) FROM masterplans WHERE id = ?1",
+            let (existing_title, existing_approval, existing_active): (String, bool, bool) = conn.query_row(
+                "SELECT COALESCE(title, 'Masterplan'), COALESCE(require_milestone_approval, 1), COALESCE(is_active, 1) FROM masterplans WHERE id = ?1",
                 [&id],
-                |r| r.get(0),
-            ).unwrap_or(true);
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)? != 0)),
+            ).unwrap_or(("Masterplan".to_string(), true, true));
 
             conn.execute(
                 "INSERT INTO masterplan_revisions (id, masterplan_id, project_id, revision_number, raw_text, reason, steps_snapshot_json, archived_at)
@@ -1439,19 +1445,20 @@ impl CoordinatorEngine {
                 .map_err(|e| e.to_string())?;
 
             conn.execute(
-                "UPDATE masterplans SET raw_text = ?1, status = 'UNSORTED', target_step_count = ?2, max_steps_per_agent = ?3, updated_at = ?4 WHERE id = ?5",
-                params![raw_text, target_step_count, max_steps_per_agent, now, id],
+                "UPDATE masterplans SET raw_text = ?1, status = 'UNSORTED', target_step_count = ?2, max_steps_per_agent = ?3, is_active = ?4, updated_at = ?5 WHERE id = ?6",
+                params![raw_text, target_step_count, max_steps_per_agent, if existing_active { 1 } else { 0 }, now, id],
             ).map_err(|e| e.to_string())?;
-            (id, existing_approval)
+            (id, existing_title, existing_approval, existing_active)
         } else {
             let id = Uuid::new_v4().to_string();
+            let title = "Primary Masterplan".to_string();
             let conn = self.db.lock();
             conn.execute(
-                "INSERT INTO masterplans (id, project_id, raw_text, status, target_step_count, max_steps_per_agent, require_milestone_approval, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'UNSORTED', ?4, ?5, 1, ?6, ?6)",
-                params![id, project_id, raw_text, target_step_count, max_steps_per_agent, now],
+                "INSERT INTO masterplans (id, project_id, title, raw_text, status, target_step_count, max_steps_per_agent, require_milestone_approval, is_active, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'UNSORTED', ?5, ?6, 1, 1, ?7, ?7)",
+                params![id, project_id, title, raw_text, target_step_count, max_steps_per_agent, now],
             ).map_err(|e| e.to_string())?;
-            (id, true)
+            (id, title, true, true)
         };
 
         self.emit_event(Some(project_id), None, None, "MASTERPLAN_UPDATED", json!({ "status": "UNSORTED", "plan_id": plan_id }));
@@ -1459,23 +1466,215 @@ impl CoordinatorEngine {
         Ok(Masterplan {
             id: plan_id,
             project_id: project_id.to_string(),
+            title: plan_title,
             raw_text: raw_text.to_string(),
             status: "UNSORTED".to_string(),
             target_step_count,
             max_steps_per_agent,
             require_milestone_approval: require_approval,
+            is_active,
             created_at: now.clone(),
             updated_at: now,
         })
+    }
+
+    pub fn create_masterplan(
+        &self,
+        project_id: &str,
+        title: Option<&str>,
+        raw_text: &str,
+        target_step_count: i32,
+        max_steps_per_agent: i32,
+        activate: bool,
+    ) -> Result<Masterplan, String> {
+        let now = Utc::now().to_rfc3339();
+        let plan_id = Uuid::new_v4().to_string();
+        let plan_title = title.filter(|t| !t.trim().is_empty()).unwrap_or("Masterplan");
+
+        let mut conn = self.db.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        if activate {
+            tx.execute(
+                "UPDATE masterplans SET is_active = 0, updated_at = ?1 WHERE project_id = ?2",
+                params![now, project_id],
+            ).map_err(|e| e.to_string())?;
+        }
+
+        let is_act = if activate { 1 } else { 0 };
+        tx.execute(
+            "INSERT INTO masterplans (id, project_id, title, raw_text, status, target_step_count, max_steps_per_agent, require_milestone_approval, is_active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'UNSORTED', ?5, ?6, 1, ?7, ?8, ?8)",
+            params![plan_id, project_id, plan_title, raw_text, target_step_count, max_steps_per_agent, is_act, now],
+        ).map_err(|e| e.to_string())?;
+
+        tx.commit().map_err(|e| e.to_string())?;
+        drop(conn);
+
+        self.emit_event(Some(project_id), None, None, "MASTERPLAN_CREATED", json!({ "plan_id": plan_id, "title": plan_title, "is_active": activate }));
+
+        Ok(Masterplan {
+            id: plan_id,
+            project_id: project_id.to_string(),
+            title: plan_title.to_string(),
+            raw_text: raw_text.to_string(),
+            status: "UNSORTED".to_string(),
+            target_step_count,
+            max_steps_per_agent,
+            require_milestone_approval: true,
+            is_active: activate,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    pub fn list_masterplans_for_project(&self, project_id: &str) -> Result<Vec<Masterplan>, String> {
+        let conn = self.db.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, COALESCE(title, 'Masterplan'), raw_text, status, target_step_count, max_steps_per_agent, COALESCE(require_milestone_approval, 1), COALESCE(is_active, 0), created_at, updated_at
+             FROM masterplans WHERE project_id = ?1
+             ORDER BY is_active DESC, updated_at DESC",
+        ).map_err(|e| e.to_string())?;
+
+        let rows = stmt.query_map([project_id], |r| {
+            Ok(Masterplan {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                title: r.get(2)?,
+                raw_text: r.get(3)?,
+                status: r.get(4)?,
+                target_step_count: r.get(5)?,
+                max_steps_per_agent: r.get(6)?,
+                require_milestone_approval: r.get::<_, i64>(7)? != 0,
+                is_active: r.get::<_, i64>(8)? != 0,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
+            })
+        }).map_err(|e| e.to_string())?;
+
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn get_masterplan_by_id(&self, masterplan_id: &str) -> Result<Option<Masterplan>, String> {
+        let conn = self.db.lock();
+        let plan = conn.query_row(
+            "SELECT id, project_id, COALESCE(title, 'Masterplan'), raw_text, status, target_step_count, max_steps_per_agent, COALESCE(require_milestone_approval, 1), COALESCE(is_active, 0), created_at, updated_at
+             FROM masterplans WHERE id = ?1",
+            [masterplan_id],
+            |r| {
+                Ok(Masterplan {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    title: r.get(2)?,
+                    raw_text: r.get(3)?,
+                    status: r.get(4)?,
+                    target_step_count: r.get(5)?,
+                    max_steps_per_agent: r.get(6)?,
+                    require_milestone_approval: r.get::<_, i64>(7)? != 0,
+                    is_active: r.get::<_, i64>(8)? != 0,
+                    created_at: r.get(9)?,
+                    updated_at: r.get(10)?,
+                })
+            },
+        ).ok();
+        Ok(plan)
+    }
+
+    pub fn set_masterplan_active_toggle(
+        &self,
+        masterplan_id: &str,
+        is_active: bool,
+        force: bool,
+    ) -> Result<Masterplan, String> {
+        let plan = self
+            .get_masterplan_by_id(masterplan_id)?
+            .ok_or_else(|| format!("Masterplan '{}' not found", masterplan_id))?;
+
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.db.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        if is_active {
+            let active_other: Option<(String, String)> = tx.query_row(
+                "SELECT id, title FROM masterplans WHERE project_id = ?1 AND is_active = 1 AND id != ?2 LIMIT 1",
+                [&plan.project_id, masterplan_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).ok();
+
+            if let Some((other_id, other_title)) = active_other {
+                if !force {
+                    return Err(format!(
+                        "CONFLICT: Masterplan '{}' (ID: {}) is currently active for this project. Only one masterplan can be active at a time.",
+                        other_title, other_id
+                    ));
+                }
+                tx.execute(
+                    "UPDATE masterplans SET is_active = 0, updated_at = ?1 WHERE project_id = ?2",
+                    rusqlite::params![now, plan.project_id],
+                ).map_err(|e| e.to_string())?;
+            }
+
+            tx.execute(
+                "UPDATE masterplans SET is_active = 1, updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, masterplan_id],
+            ).map_err(|e| e.to_string())?;
+        } else {
+            tx.execute(
+                "UPDATE masterplans SET is_active = 0, updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, masterplan_id],
+            ).map_err(|e| e.to_string())?;
+        }
+
+        tx.commit().map_err(|e| e.to_string())?;
+        drop(conn);
+
+        self.emit_event(
+            Some(&plan.project_id),
+            None,
+            None,
+            "MASTERPLAN_ACTIVATION_CHANGED",
+            json!({ "plan_id": masterplan_id, "is_active": is_active }),
+        );
+
+        self.get_masterplan_by_id(masterplan_id)?
+            .ok_or_else(|| "Masterplan not found after update".to_string())
+    }
+
+    pub fn delete_masterplan(&self, masterplan_id: &str) -> Result<(), String> {
+        let plan = self
+            .get_masterplan_by_id(masterplan_id)?
+            .ok_or_else(|| format!("Masterplan '{}' not found", masterplan_id))?;
+
+        let conn = self.db.lock();
+        conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [masterplan_id]).ok();
+        conn.execute("DELETE FROM masterplan_revisions WHERE masterplan_id = ?1", [masterplan_id]).ok();
+        conn.execute("DELETE FROM masterplans WHERE id = ?1", [masterplan_id])
+            .map_err(|e| format!("Failed to delete masterplan: {}", e))?;
+        drop(conn);
+
+        self.emit_event(
+            Some(&plan.project_id),
+            None,
+            None,
+            "MASTERPLAN_DELETED",
+            json!({ "plan_id": masterplan_id }),
+        );
+
+        Ok(())
     }
 
     pub fn set_masterplan_milestone_approval(&self, project_id: &str, require_approval: bool) -> Result<bool, String> {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE masterplans SET require_milestone_approval = ?1, updated_at = ?2 WHERE project_id = ?3",
+            "UPDATE masterplans SET require_milestone_approval = ?1, updated_at = ?2 WHERE project_id = ?3 AND is_active = 1",
             rusqlite::params![require_approval, now, project_id],
-        ).map_err(|e| format!("Failed to update milestone approval mode: {}", e))?;
+        ).or_else(|_| {
+            conn.execute(
+                "UPDATE masterplans SET require_milestone_approval = ?1, updated_at = ?2 WHERE project_id = ?3",
+                rusqlite::params![require_approval, now, project_id],
+            )
+        }).map_err(|e| format!("Failed to update milestone approval mode: {}", e))?;
         drop(conn);
         self.emit_event(Some(project_id), None, None, "MASTERPLAN_UPDATED", json!({ "require_milestone_approval": require_approval }));
         Ok(require_approval)
@@ -1485,19 +1684,22 @@ impl CoordinatorEngine {
         let conn = self.db.lock();
         let plan = conn
             .query_row(
-                "SELECT id, project_id, raw_text, status, target_step_count, max_steps_per_agent, COALESCE(require_milestone_approval, 1), created_at, updated_at FROM masterplans WHERE project_id = ?1",
+                "SELECT id, project_id, COALESCE(title, 'Masterplan'), raw_text, status, target_step_count, max_steps_per_agent, COALESCE(require_milestone_approval, 1), COALESCE(is_active, 0), created_at, updated_at
+                 FROM masterplans WHERE project_id = ?1 AND is_active = 1 LIMIT 1",
                 [project_id],
                 |r| {
                     Ok(Masterplan {
                         id: r.get(0)?,
                         project_id: r.get(1)?,
-                        raw_text: r.get(2)?,
-                        status: r.get(3)?,
-                        target_step_count: r.get(4)?,
-                        max_steps_per_agent: r.get(5)?,
-                        require_milestone_approval: r.get::<_, i64>(6)? != 0,
-                        created_at: r.get(7)?,
-                        updated_at: r.get(8)?,
+                        title: r.get(2)?,
+                        raw_text: r.get(3)?,
+                        status: r.get(4)?,
+                        target_step_count: r.get(5)?,
+                        max_steps_per_agent: r.get(6)?,
+                        require_milestone_approval: r.get::<_, i64>(7)? != 0,
+                        is_active: r.get::<_, i64>(8)? != 0,
+                        created_at: r.get(9)?,
+                        updated_at: r.get(10)?,
                     })
                 },
             )
@@ -1512,13 +1714,56 @@ impl CoordinatorEngine {
                 "SELECT ms.id, ms.masterplan_id, ms.step_index, ms.title, ms.description, ms.suggested_scope, ms.acceptance_criteria, ms.status, ms.claimed_agent_id, ms.claimed_task_id, ms.completed_at, ms.created_at, ms.updated_at
                  FROM masterplan_steps ms
                  JOIN masterplans m ON ms.masterplan_id = m.id
-                 WHERE m.project_id = ?1
+                 WHERE m.project_id = ?1 AND m.is_active = 1
                  ORDER BY ms.step_index ASC",
             )
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
             .query_map([project_id], |r| {
+                Ok(MasterplanStep {
+                    id: r.get(0)?,
+                    masterplan_id: r.get(1)?,
+                    step_index: r.get(2)?,
+                    title: r.get(3)?,
+                    description: r.get(4)?,
+                    suggested_scope: r.get(5)?,
+                    acceptance_criteria: r.get(6)?,
+                    status: r.get(7)?,
+                    claimed_agent_id: r.get(8)?,
+                    claimed_task_id: r.get(9)?,
+                    completed_at: r.get(10)?,
+                    created_at: r.get(11)?,
+                    updated_at: r.get(12)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let res: Vec<MasterplanStep> = rows.flatten().collect();
+        drop(stmt);
+        drop(conn);
+
+        if !res.is_empty() {
+            return Ok(res);
+        }
+
+        // Fallback to querying by direct masterplan_id
+        self.list_masterplan_steps_by_plan_id(project_id)
+    }
+
+    pub fn list_masterplan_steps_by_plan_id(&self, masterplan_id: &str) -> Result<Vec<MasterplanStep>, String> {
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT ms.id, ms.masterplan_id, ms.step_index, ms.title, ms.description, ms.suggested_scope, ms.acceptance_criteria, ms.status, ms.claimed_agent_id, ms.claimed_task_id, ms.completed_at, ms.created_at, ms.updated_at
+                 FROM masterplan_steps ms
+                 WHERE ms.masterplan_id = ?1
+                 ORDER BY ms.step_index ASC",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let rows = stmt
+            .query_map([masterplan_id], |r| {
                 Ok(MasterplanStep {
                     id: r.get(0)?,
                     masterplan_id: r.get(1)?,
@@ -1870,18 +2115,36 @@ impl CoordinatorEngine {
         let mut summaries = Vec::new();
 
         for proj in projects {
-            let plan_res = conn.query_row(
-                "SELECT id, status, target_step_count, max_steps_per_agent, updated_at FROM masterplans WHERE project_id = ?1",
-                [&proj.id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?, r.get::<_, i32>(3)?, r.get::<_, String>(4)?)),
-            ).ok();
+            let mut stmt = match conn.prepare(
+                "SELECT id, COALESCE(title, 'Masterplan'), status, target_step_count, max_steps_per_agent, COALESCE(is_active, 0), updated_at
+                 FROM masterplans WHERE project_id = ?1
+                 ORDER BY is_active DESC, updated_at DESC",
+            ) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
-            if let Some((plan_id, status, target_step_count, max_steps_per_agent, updated_at)) = plan_res {
-                let mut stmt = match conn.prepare("SELECT status FROM masterplan_steps WHERE masterplan_id = ?1") {
+            let plans: Vec<(String, String, String, i32, i32, bool, String)> = stmt
+                .query_map([&proj.id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get::<_, i64>(5)? != 0,
+                        r.get(6)?,
+                    ))
+                })
+                .map(|iter| iter.flatten().collect())
+                .unwrap_or_default();
+
+            for (plan_id, title, status, target_step_count, max_steps_per_agent, is_active, updated_at) in plans {
+                let mut step_stmt = match conn.prepare("SELECT status FROM masterplan_steps WHERE masterplan_id = ?1") {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                let step_statuses: Vec<String> = stmt
+                let step_statuses: Vec<String> = step_stmt
                     .query_map([&plan_id], |r| r.get(0))
                     .map(|iter| iter.flatten().collect())
                     .unwrap_or_default();
@@ -1900,16 +2163,18 @@ impl CoordinatorEngine {
                 };
 
                 let handoff_prompt = if status == "UNSORTED" {
-                    format!("Decompose masterplan for project '{}' (ID: {}) located at '{}' using tool 'masterplan_decompose'.", proj.name, proj.id, proj.path)
+                    format!("Decompose masterplan '{}' for project '{}' (ID: {}) located at '{}' using tool 'masterplan_decompose'.", title, proj.name, proj.id, proj.path)
                 } else {
-                    format!("Claim next available chunk for project '{}' (ID: {}) located at '{}' using tool 'masterplan_claim_chunk'.", proj.name, proj.id, proj.path)
+                    format!("Claim next available chunk for masterplan '{}' for project '{}' (ID: {}) located at '{}' using tool 'masterplan_claim_chunk'.", title, proj.name, proj.id, proj.path)
                 };
 
                 summaries.push(MasterplanSummary {
-                    project_id: proj.id,
-                    project_name: proj.name,
-                    repository_path: proj.path,
+                    project_id: proj.id.clone(),
+                    project_name: proj.name.clone(),
+                    repository_path: proj.path.clone(),
                     masterplan_id: plan_id,
+                    title,
+                    is_active,
                     status,
                     target_step_count,
                     max_steps_per_agent,

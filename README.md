@@ -14,6 +14,8 @@ Developed by **[harlixay7](https://github.com/harlixay7)** • **AgentXFlow by V
 - **Automated Machine Verification Gates**: The coordinator automatically executes verification profiles and machine evaluators (e.g. cargo test, npm test, type checks, lint checks) directly in the worktree. Criteria satisfaction is derived strictly from passing evaluator results (zero autonomous self-certification).
 - **Cryptographic Proof Bundles**: Verified submissions generate an immutable `ProofBundle` sealed with a SHA-256 digest over task metadata, file diffs, and test outputs.
 - **Serialized FIFO Merge Queue**: Verified candidate branches are integrated sequentially inside disposable integration worktrees, validated with post-merge tests, and advanced via atomic Compare-and-Swap (CAS) `git update-ref` operations.
+- **Multi-Masterplan Catalog & Single-Active Toggle**: Manage multiple architecture specifications per project with an active/inactive toggle switch. Strictly enforces single-active mutual exclusion with conflict resolution modals, ensuring AI agents only see, decompose, and claim from the currently published masterplan.
+- **Expanded Capacity Limits**: Scalable masterplan decomposition supporting up to **100 structured steps** and anti-hoarding chunk caps up to **8 steps per agent**.
 - **Masterplan Hub**: Single atomic preparation operation (`prepare_masterplan`) saves revisions, parses specification text, structures steps, and normalizes scopes with anti-hoarding active claim limits.
 
 ---

@@ -3,19 +3,22 @@ import { Masterplan, MasterplanStep, Agent, Project } from '../types';
 import {
   Sparkles,
   Layers,
-  CheckCircle2,
-  Clock,
   Play,
   RotateCcw,
   Copy,
   Check,
   FileText,
-  ShieldCheck,
-  Cpu,
-  FolderGit2,
   AlertCircle,
   Edit3,
   Bot,
+  Plus,
+  Trash2,
+  ArrowLeft,
+  Eye,
+  EyeOff,
+  Radio,
+  AlertTriangle,
+  Zap,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { coordinatorApi } from '../api/coordinator';
@@ -33,9 +36,34 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   agents,
   onRefreshTasks,
 }) => {
-  const [masterplan, setMasterplan] = useState<Masterplan | null>(null);
+  // Masterplans catalog state
+  const [masterplans, setMasterplans] = useState<Masterplan[]>([]);
+  const [activePlanId, setActivePlanId] = useState<string | null>(null);
+  const [selectedPlan, setSelectedPlan] = useState<Masterplan | null>(null);
   const [steps, setSteps] = useState<MasterplanStep[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // New Masterplan Modal State
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [newTitle, setNewTitle] = useState('');
+  const [newRawText, setNewRawText] = useState('');
+  const [newTargetSteps, setNewTargetSteps] = useState(20);
+  const [newMaxStepsPerAgent, setNewMaxStepsPerAgent] = useState(4);
+  const [newActivate, setNewActivate] = useState(true);
+  const [isCreating, setIsCreating] = useState(false);
+
+  // Conflict Modal State
+  const [conflictModal, setConflictModal] = useState<{
+    show: boolean;
+    targetPlan: Masterplan | null;
+    currentActivePlan: Masterplan | null;
+  }>({
+    show: false,
+    targetPlan: null,
+    currentActivePlan: null,
+  });
+
+  // Detailed Plan Inspection State
   const [rawText, setRawText] = useState('');
   const [targetStepCount, setTargetStepCount] = useState(20);
   const [maxStepsPerAgent, setMaxStepsPerAgent] = useState(4);
@@ -43,7 +71,6 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   const [isClaiming, setIsClaiming] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
-  const [copiedId, setCopiedId] = useState(false);
   const [filter, setFilter] = useState<'ALL' | 'PENDING' | 'CLAIMED' | 'COMPLETED'>('ALL');
   const [selectedAgentId, setSelectedAgentId] = useState<string>('');
   const [customChunkSize, setCustomChunkSize] = useState<number>(4);
@@ -53,37 +80,148 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
 
   const lastSeqRef = useRef<number>(0);
 
-  const fetchPlan = async () => {
+  // Fetch all masterplans for this project
+  const fetchAllPlans = async () => {
     if (!projectId) return;
     try {
-      const plan = await invoke<Masterplan | null>('get_masterplan', { projectId });
-      setMasterplan(plan);
-      if (plan) {
-        setRawText(plan.raw_text);
-        setTargetStepCount(plan.target_step_count);
-        setMaxStepsPerAgent(plan.max_steps_per_agent);
-        setCustomChunkSize(plan.max_steps_per_agent);
-        setRequireMilestoneApproval(plan.require_milestone_approval ?? true);
-        const fetchedSteps = await invoke<MasterplanStep[]>('list_masterplan_steps', { projectId });
-        setSteps(fetchedSteps);
-      } else {
-        setSteps([]);
+      const plans = await coordinatorApi.listMasterplansForProject(projectId);
+      setMasterplans(plans);
+
+      // If we are currently inspecting a plan, refresh its data
+      if (activePlanId) {
+        const current = plans.find((p) => p.id === activePlanId) || null;
+        setSelectedPlan(current);
+        if (current) {
+          setRawText(current.raw_text);
+          setTargetStepCount(current.target_step_count);
+          setMaxStepsPerAgent(current.max_steps_per_agent);
+          setCustomChunkSize(current.max_steps_per_agent);
+          setRequireMilestoneApproval(current.require_milestone_approval ?? true);
+          const fetchedSteps = await coordinatorApi.listMasterplanStepsByPlanId(current.id);
+          setSteps(fetchedSteps);
+        } else {
+          setSteps([]);
+        }
       }
     } catch (err) {
-      console.error('Failed to fetch masterplan:', err);
+      console.error('Failed to fetch masterplans:', err);
     } finally {
       setLoading(false);
     }
   };
 
+  // Inspect a specific plan
+  const handleOpenPlan = async (plan: Masterplan) => {
+    setActivePlanId(plan.id);
+    setSelectedPlan(plan);
+    setRawText(plan.raw_text);
+    setTargetStepCount(plan.target_step_count);
+    setMaxStepsPerAgent(plan.max_steps_per_agent);
+    setCustomChunkSize(plan.max_steps_per_agent);
+    setRequireMilestoneApproval(plan.require_milestone_approval ?? true);
+    setIsEditing(false);
+    try {
+      const fetchedSteps = await coordinatorApi.listMasterplanStepsByPlanId(plan.id);
+      setSteps(fetchedSteps);
+    } catch (err) {
+      console.error('Failed to fetch steps for plan:', err);
+      setSteps([]);
+    }
+  };
+
+  const handleBackToCatalog = () => {
+    setActivePlanId(null);
+    setSelectedPlan(null);
+    setSteps([]);
+    fetchAllPlans();
+  };
+
+  // Toggle active status for a plan
+  const handleToggleActive = async (plan: Masterplan, force: boolean = false) => {
+    if (!plan.is_active) {
+      // Trying to activate. Check if another plan is already active
+      const currentlyActive = masterplans.find((p) => p.is_active && p.id !== plan.id);
+      if (currentlyActive && !force) {
+        // Show conflict modal
+        setConflictModal({
+          show: true,
+          targetPlan: plan,
+          currentActivePlan: currentlyActive,
+        });
+        return;
+      }
+    }
+
+    try {
+      await coordinatorApi.setMasterplanActiveToggle(plan.id, !plan.is_active, force);
+      setConflictModal({ show: false, targetPlan: null, currentActivePlan: null });
+      await fetchAllPlans();
+      onRefreshTasks();
+    } catch (err) {
+      alert(`Failed to update activation toggle: ${err}`);
+    }
+  };
+
+  const handleConfirmSwitchActive = async () => {
+    if (!conflictModal.targetPlan) return;
+    await handleToggleActive(conflictModal.targetPlan, true);
+  };
+
+  const handleCreatePlan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!projectId) return;
+    setIsCreating(true);
+    try {
+      const plan = await coordinatorApi.createMasterplan(
+        projectId,
+        newTitle.trim() || 'Masterplan',
+        newRawText.trim(),
+        Number(newTargetSteps),
+        Number(newMaxStepsPerAgent),
+        newActivate
+      );
+      setShowCreateModal(false);
+      setNewTitle('');
+      setNewRawText('');
+      setNewTargetSteps(20);
+      setNewMaxStepsPerAgent(4);
+      setNewActivate(true);
+      await fetchAllPlans();
+      onRefreshTasks();
+      handleOpenPlan(plan);
+    } catch (err) {
+      alert(`Failed to create masterplan: ${err}`);
+    } finally {
+      setIsCreating(false);
+    }
+  };
+
+  const handleDeletePlan = async (plan: Masterplan) => {
+    if (!window.confirm(`Are you sure you want to delete masterplan "${plan.title}"? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      await coordinatorApi.deleteMasterplan(plan.id);
+      if (activePlanId === plan.id) {
+        handleBackToCatalog();
+      } else {
+        await fetchAllPlans();
+      }
+      onRefreshTasks();
+    } catch (err) {
+      alert(`Failed to delete masterplan: ${err}`);
+    }
+  };
+
   const handleToggleMilestoneApproval = async (enabled: boolean) => {
+    if (!projectId) return;
     setIsUpdatingMode(true);
     setRequireMilestoneApproval(enabled);
     try {
       await coordinatorApi.setMasterplanMilestoneApproval(projectId, enabled);
+      await fetchAllPlans();
     } catch (err) {
       console.error('Failed to update milestone mode:', err);
-      // revert on error
       setRequireMilestoneApproval(!enabled);
     } finally {
       setIsUpdatingMode(false);
@@ -91,10 +229,10 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   };
 
   useEffect(() => {
-    fetchPlan();
+    fetchAllPlans();
   }, [projectId]);
 
-  // Real-time event polling for automatic updates
+  // Real-time event polling
   useEffect(() => {
     let isMounted = true;
 
@@ -116,12 +254,12 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
               e.event_type.startsWith('AGENT_')
           );
           if (hasRelevantEvent) {
-            await fetchPlan();
+            await fetchAllPlans();
             onRefreshTasks();
           }
         }
       } catch (err) {
-        // Polling failure gracefully ignored
+        // Ignored
       }
     };
 
@@ -130,7 +268,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
       isMounted = false;
       clearInterval(interval);
     };
-  }, [projectId]);
+  }, [projectId, activePlanId]);
 
   useEffect(() => {
     if (agents.length > 0 && !selectedAgentId) {
@@ -139,7 +277,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   }, [agents, selectedAgentId]);
 
   const handleSavePlan = async () => {
-    if (!rawText.trim()) return;
+    if (!rawText.trim() || !projectId) return;
     setIsSaving(true);
     try {
       const saved = await coordinatorApi.saveMasterplan(
@@ -148,10 +286,10 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         Number(targetStepCount),
         Number(maxStepsPerAgent)
       );
-      setMasterplan(saved);
+      setSelectedPlan(saved);
       setSteps([]);
       setIsEditing(false);
-      await fetchPlan();
+      await fetchAllPlans();
       onRefreshTasks();
     } catch (err) {
       alert(`Error saving masterplan: ${err}`);
@@ -166,10 +304,10 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
     }
     try {
       await invoke('reset_masterplan', { projectId });
-      setMasterplan(null);
+      setSelectedPlan(null);
       setSteps([]);
       setIsEditing(true);
-      await fetchPlan();
+      await fetchAllPlans();
       onRefreshTasks();
     } catch (err) {
       alert(`Error resetting plan: ${err}`);
@@ -188,7 +326,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         agentId: selectedAgentId,
         count: Number(customChunkSize),
       });
-      await fetchPlan();
+      await fetchAllPlans();
       onRefreshTasks();
     } catch (err) {
       alert(`Error claiming chunk: ${err}`);
@@ -223,7 +361,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         steps: generatedSteps,
       });
       setIsEditing(false);
-      await fetchPlan();
+      await fetchAllPlans();
       onRefreshTasks();
     } catch (err) {
       alert(`Failed to decompose: ${err}`);
@@ -243,12 +381,6 @@ Instructions:
     navigator.clipboard.writeText(prompt);
     setCopiedPrompt(true);
     setTimeout(() => setCopiedPrompt(false), 2500);
-  };
-
-  const handleCopyProjectId = () => {
-    navigator.clipboard.writeText(projectId);
-    setCopiedId(true);
-    setTimeout(() => setCopiedId(false), 2000);
   };
 
   const totalSteps = steps.length;
@@ -301,802 +433,996 @@ Instructions:
     }
   };
 
+  // Step options up to 100
+  const stepCountOptions = [5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100];
+  // Max steps per agent options up to 8
+  const maxStepsOptions = [1, 2, 3, 4, 5, 6, 7, 8];
+
+  const activeMasterplan = masterplans.find((p) => p.is_active);
+
+  // Render Loading
   if (loading) {
     return (
-      <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>
-        Loading Masterplan Hub...
+      <div className="view-content animate-fade-in" style={{ padding: '3rem', textAlign: 'center' }}>
+        <div style={{ color: 'var(--text-muted)' }}>Loading Masterplans...</div>
       </div>
     );
   }
 
-  return (
-    <div style={{ flex: 1, padding: 20, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* Header Banner */}
-      <div
-        style={{
-          borderBottom: '1px solid var(--border-medium)',
-          paddingBottom: 16,
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          gap: 16,
-          flexWrap: 'wrap',
-        }}
-      >
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
-            <h2 style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--font-mono)', margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Sparkles size={16} style={{ color: 'var(--accent-blue)' }} /> Masterplan Hub
-            </h2>
-            {masterplan && getStatusBadge(masterplan.status)}
-          </div>
-          <p style={{ color: 'var(--text-secondary)', fontSize: 11, margin: 0 }}>
-            Unified masterplan orchestration for multi-agent workflows. Decompose raw specifications into structured step chunks with anti-hoarding limits.
-          </p>
-        </div>
-
-        {/* Global Action Controls */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button
-            className="btn btn-secondary"
-            style={{ fontSize: 11, height: 28 }}
-            onClick={handleCopyMcpPrompt}
-            title="Copy autonomous prompt instructions for AI coding agents"
-          >
-            {copiedPrompt ? <Check size={12} style={{ color: 'var(--accent-green)' }} /> : <Copy size={12} />}
-            {copiedPrompt ? 'Copied Prompt' : 'Copy Handoff Prompt'}
-          </button>
-
-          {masterplan && !isEditing && (
-            <button
-              className="btn btn-secondary"
-              style={{ fontSize: 11, height: 28 }}
-              onClick={() => setIsEditing(true)}
-              title="Edit raw masterplan specification text"
-            >
-              <Edit3 size={12} /> Edit Specification
-            </button>
-          )}
-
-          {masterplan && masterplan.status !== 'UNSORTED' && (
-            <button
-              className="btn btn-secondary"
-              style={{ fontSize: 11, height: 28, color: 'var(--accent-red)' }}
-              onClick={handleResetPlan}
-              title="Reset plan back to UNSORTED raw text mode"
-            >
-              <RotateCcw size={12} /> Reset Plan
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Milestone Handoff Execution Policy Control */}
-      {masterplan && (
+  // ==========================================
+  // VIEW 1: Masterplans Catalog & Selection Grid
+  // ==========================================
+  if (!activePlanId || !selectedPlan) {
+    return (
+      <div className="view-content animate-fade-in" style={{ padding: '1.5rem 2rem', maxWidth: '1400px', margin: '0 auto' }}>
+        {/* Top Header */}
         <div
           style={{
-            backgroundColor: 'var(--bg-surface)',
-            border: '1px solid var(--border-medium)',
-            borderRadius: 'var(--radius-md)',
-            padding: '12px 16px',
             display: 'flex',
-            alignItems: 'center',
             justifyContent: 'space-between',
-            gap: 16,
-            flexWrap: 'wrap',
+            alignItems: 'center',
+            marginBottom: '1.75rem',
+            paddingBottom: '1.25rem',
+            borderBottom: '1px solid var(--border-color)',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div
-              style={{
-                width: 32,
-                height: 32,
-                borderRadius: 6,
-                backgroundColor: requireMilestoneApproval ? 'rgba(56, 139, 253, 0.15)' : 'rgba(46, 160, 67, 0.15)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: requireMilestoneApproval ? 'var(--accent-blue)' : 'var(--accent-green)',
-                flexShrink: 0,
-              }}
-            >
-              {requireMilestoneApproval ? <ShieldCheck size={18} /> : <Bot size={18} />}
-            </div>
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span>{requireMilestoneApproval ? 'Interactive Milestone Checkpoints' : 'Continuous Autonomous Swarm Mode'}</span>
-                <span
-                  className="badge"
-                  style={{
-                    fontSize: 10,
-                    padding: '1px 6px',
-                    backgroundColor: requireMilestoneApproval ? 'rgba(56, 139, 253, 0.2)' : 'rgba(46, 160, 67, 0.2)',
-                    color: requireMilestoneApproval ? 'var(--accent-blue)' : 'var(--accent-green)',
-                    border: `1px solid ${requireMilestoneApproval ? 'rgba(56, 139, 253, 0.4)' : 'rgba(46, 160, 67, 0.4)'}`,
-                  }}
-                >
-                  {requireMilestoneApproval ? 'PAUSE & REPORT' : 'UNINTERRUPTED SWARM'}
-                </span>
-              </div>
-              <p style={{ margin: '2px 0 0', fontSize: 11, color: 'var(--text-secondary)' }}>
-                {requireMilestoneApproval
-                  ? 'Agents pause after submitting their chunk (e.g. 5 steps), report a full walkthrough in chat, and wait for your confirmation.'
-                  : 'Agents automatically claim and execute subsequent chunks in background until all masterplan steps are completed.'}
-              </p>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            className={`btn ${requireMilestoneApproval ? 'btn-secondary' : 'btn-primary'}`}
-            style={{ fontSize: 11, height: 28, minWidth: 170 }}
-            disabled={isUpdatingMode}
-            onClick={() => handleToggleMilestoneApproval(!requireMilestoneApproval)}
-          >
-            {requireMilestoneApproval ? 'Switch to Autonomous Swarm' : 'Switch to Interactive Milestones'}
-          </button>
-        </div>
-      )}
-
-      {/* Progress & Stats Bar (when organized) */}
-      {masterplan && masterplan.status !== 'UNSORTED' && totalSteps > 0 && !isEditing && (
-        <div
-          style={{
-            backgroundColor: 'var(--bg-surface)',
-            border: '1px solid var(--border-medium)',
-            borderRadius: 'var(--radius-md)',
-            padding: 14,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 10,
-          }}
-        >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <div style={{ fontSize: 12, fontWeight: 600 }}>
-              Progress: <span style={{ color: 'var(--accent-blue)', fontFamily: 'var(--font-mono)' }}>{completedSteps} / {totalSteps}</span> Steps Merged ({progressPercent}%)
-            </div>
-            <div style={{ display: 'flex', gap: 12, fontSize: 11 }}>
-              <span style={{ color: 'var(--text-secondary)' }}>
-                <Clock size={11} style={{ display: 'inline', marginRight: 4 }} /> Pending: <b>{pendingSteps}</b>
-              </span>
-              <span style={{ color: 'var(--accent-yellow)' }}>
-                <Layers size={11} style={{ display: 'inline', marginRight: 4 }} /> In Progress: <b>{claimedSteps}</b>
-              </span>
-              <span style={{ color: 'var(--accent-green)' }}>
-                <CheckCircle2 size={11} style={{ display: 'inline', marginRight: 4 }} /> Completed: <b>{completedSteps}</b>
-              </span>
-            </div>
-          </div>
-
-          {/* Progress bar line */}
-          <div style={{ width: '100%', height: 6, backgroundColor: 'var(--bg-input)', borderRadius: 3, overflow: 'hidden' }}>
-            <div
-              style={{
-                width: `${progressPercent}%`,
-                height: '100%',
-                backgroundColor: progressPercent === 100 ? 'var(--accent-green)' : 'var(--accent-blue)',
-                transition: 'width 0.3s ease',
-              }}
-            />
-          </div>
-        </div>
-      )}
-
-      {/* VIEW MODE 1: RAW TEXT EDITOR (When creating or editing) */}
-      {(!masterplan || isEditing) && (
-        <div
-          style={{
-            backgroundColor: 'var(--bg-surface)',
-            border: '1px solid var(--border-medium)',
-            borderRadius: 'var(--radius-lg)',
-            padding: 20,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 16,
-          }}
-        >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <FileText size={16} style={{ color: 'var(--accent-blue)' }} />
-              <h3 style={{ fontSize: 13, fontWeight: 700, margin: 0 }}>Input Masterplan Specification</h3>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 11 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <label style={{ color: 'var(--text-secondary)' }} title="Target total step count the AI should decompose your plan into">
-                  Target Steps:
-                </label>
-                <select
-                  className="input-field"
-                  style={{ height: 26, fontSize: 11, padding: '0 6px' }}
-                  value={targetStepCount}
-                  onChange={(e) => setTargetStepCount(Number(e.target.value))}
-                >
-                  <option value={10}>10 Steps</option>
-                  <option value={20}>20 Steps</option>
-                  <option value={30}>30 Steps</option>
-                  <option value={50}>50 Steps</option>
-                </select>
-              </div>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <label style={{ color: 'var(--text-secondary)' }} title="Anti-hoarding cap: max sequential steps any single agent can claim at once">
-                  Max Steps / Agent:
-                </label>
-                <select
-                  className="input-field"
-                  style={{ height: 26, fontSize: 11, padding: '0 6px' }}
-                  value={maxStepsPerAgent}
-                  onChange={(e) => setMaxStepsPerAgent(Number(e.target.value))}
-                >
-                  <option value={2}>2 Steps</option>
-                  <option value={3}>3 Steps</option>
-                  <option value={4}>4 Steps (Default)</option>
-                  <option value={5}>5 Steps</option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          {/* Raw Text Editor */}
-          <div style={{ position: 'relative' }}>
-            <textarea
-              className="input-field"
-              style={{
-                width: '100%',
-                minHeight: 240,
-                fontFamily: 'var(--font-mono)',
-                fontSize: 12,
-                lineHeight: 1.6,
-                padding: 14,
-                resize: 'vertical',
-              }}
-              placeholder={`Paste your master plan here in any format (paragraphs, bullet points, PRD, or free text)...
-
-Example:
-1. Setup SQLite database schemas for user auth, session tokens, and password hashing.
-2. Implement REST API endpoints for login, signup, and logout.
-3. Write automated unit tests for password hashing and token expiration.
-4. Implement frontend login and registration modal with error validation.
-5. Setup Twilio webhook parser for incoming SMS notifications.
-...`}
-              value={rawText}
-              onChange={(e) => setRawText(e.target.value)}
-            />
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, color: 'var(--text-muted)', fontSize: 10 }}>
-              <span>
-                {rawText.length} characters • {rawText.split(/\s+/).filter(Boolean).length} words
-              </span>
-              <span>
-                Status: <b style={{ color: 'var(--accent-yellow)' }}>UNSORTED</b>
-              </span>
-            </div>
-          </div>
-
-          {/* Actions */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid var(--border-subtle)', paddingTop: 14 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--text-muted)' }}>
-              <AlertCircle size={13} style={{ color: 'var(--accent-yellow)' }} />
-              After saving, AgentXFlow prepares a structured handoff for connected AI agents.
-            </div>
-
-            <div style={{ display: 'flex', gap: 8 }}>
-              {masterplan && (
-                <button
-                  className="btn btn-secondary"
-                  style={{ fontSize: 11, height: 30 }}
-                  onClick={() => setIsEditing(false)}
-                >
-                  Cancel
-                </button>
-              )}
-
-              <button
-                className="btn btn-secondary"
-                style={{ fontSize: 11, height: 30 }}
-                onClick={handleParseStructuredSteps}
-                disabled={!rawText.trim()}
-                title="Parse masterplan lines into structured steps directly in UI"
-              >
-                <Sparkles size={12} /> Parse Steps Manually
-              </button>
-
-              <button
-                className="btn btn-primary"
-                style={{ fontSize: 11, height: 30 }}
-                onClick={handleSavePlan}
-                disabled={isSaving || !rawText.trim()}
-                title="Save masterplan and generate agent handoff"
-              >
-                {isSaving ? 'Saving...' : 'Save & Prepare for Agents'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VIEW MODE 2: AGENT HANDOFF VIEW (When UNSORTED and saved) */}
-      {masterplan && masterplan.status === 'UNSORTED' && !isEditing && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {/* Handoff Status Card */}
-          <div
-            style={{
-              backgroundColor: 'var(--bg-surface)',
-              border: '1px solid var(--border-medium)',
-              borderRadius: 'var(--radius-lg)',
-              padding: 20,
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 16,
-            }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <Bot size={18} style={{ color: 'var(--accent-yellow)' }} />
-                  <h3 style={{ fontSize: 14, fontWeight: 700, margin: 0 }}>Agent Handoff Prepared</h3>
-                  <span className="badge" style={{ backgroundColor: 'rgba(210, 153, 34, 0.2)', color: 'var(--accent-yellow)' }}>
-                    UNSORTED
-                  </span>
-                </div>
-                <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4 }}>
-                  The masterplan specification is saved and waiting for an AI agent to perform decomposition into structured steps.
-                </p>
-              </div>
-
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button
-                  className="btn btn-secondary"
-                  style={{ fontSize: 11, height: 28 }}
-                  onClick={() => setIsEditing(true)}
-                >
-                  <Edit3 size={11} /> Edit Text
-                </button>
-                <button
-                  className="btn btn-primary"
-                  style={{ fontSize: 11, height: 28 }}
-                  onClick={handleCopyMcpPrompt}
-                >
-                  {copiedPrompt ? <Check size={11} /> : <Copy size={11} />}
-                  {copiedPrompt ? 'Copied Prompt' : 'Copy Handoff Prompt'}
-                </button>
-              </div>
-            </div>
-
-            {/* Project & Handoff Identity Grid */}
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-                gap: 12,
-                backgroundColor: 'var(--bg-input)',
-                border: '1px solid var(--border-subtle)',
-                borderRadius: 'var(--radius-md)',
-                padding: 14,
-                fontSize: 11,
-              }}
-            >
-              <div>
-                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Project Name</div>
-                <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{project?.name || 'Active Project'}</div>
-              </div>
-
-              <div>
-                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Repository Path</div>
-                <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)', wordBreak: 'break-all' }}>
-                  {project?.path || 'N/A'}
-                </div>
-              </div>
-
-              <div>
-                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Project ID</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-purple)' }}>
-                    {projectId}
-                  </code>
-                  <button
-                    onClick={handleCopyProjectId}
-                    style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0 }}
-                    title="Copy Project ID"
-                  >
-                    {copiedId ? <Check size={11} style={{ color: 'var(--accent-green)' }} /> : <Copy size={11} />}
-                  </button>
-                </div>
-              </div>
-
-              <div>
-                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Next Required Action</div>
-                <div style={{ fontWeight: 600, color: 'var(--accent-yellow)' }}>
-                  <code>masterplan_decompose</code>
-                </div>
-              </div>
-
-              <div>
-                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Masterplan ID</div>
-                <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
-                  {masterplan.id.substring(0, 12)}...
-                </div>
-              </div>
-
-              <div>
-                <div style={{ color: 'var(--text-muted)', marginBottom: 2 }}>Last Updated</div>
-                <div style={{ color: 'var(--text-secondary)' }}>
-                  {new Date(masterplan.updated_at).toLocaleTimeString()} ({masterplan.target_step_count} Target Steps)
-                </div>
-              </div>
-            </div>
-
-            {/* Copyable Prompt Box */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)' }}>
-                MCP Agent Handoff Prompt:
-              </div>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
               <div
                 style={{
-                  backgroundColor: 'var(--bg-app)',
-                  border: '1px solid var(--border-medium)',
-                  borderRadius: 'var(--radius-md)',
-                  padding: 12,
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 11,
-                  color: 'var(--text-primary)',
-                  lineHeight: 1.5,
-                  position: 'relative',
-                  whiteSpace: 'pre-wrap',
-                }}
-              >
-                {`Decompose masterplan for project ${projectId} (${project?.name || 'Project'}) at ${project?.path || 'repository'} using MCP tool masterplan_decompose.
-
-Standard Agent Execution Sequence:
-1. Call agentxflow_current_context()
-2. Call project_context(project_id="${projectId}")
-3. Call masterplan_get(project_id="${projectId}")
-4. Call masterplan_decompose(project_id="${projectId}", steps=[...])`}
-              </div>
-            </div>
-          </div>
-
-          {/* Empty Decomposition Preview & Agent Status Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
-            {/* Step Decomposition Placeholder Card */}
-            <div
-              style={{
-                backgroundColor: 'var(--bg-surface)',
-                border: '1px solid var(--border-medium)',
-                borderRadius: 'var(--radius-md)',
-                padding: 24,
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                justifyContent: 'center',
-                textAlign: 'center',
-                minHeight: 200,
-                gap: 12,
-              }}
-            >
-              <div
-                style={{
-                  width: 44,
-                  height: 44,
-                  borderRadius: '50%',
-                  backgroundColor: 'rgba(210, 153, 34, 0.1)',
+                  width: '32px',
+                  height: '32px',
+                  borderRadius: '6px',
+                  background: 'rgba(56, 139, 253, 0.15)',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  color: 'var(--accent-yellow)',
+                  color: 'var(--accent-blue)',
                 }}
               >
-                <Layers size={22} />
+                <Layers size={18} />
               </div>
-              <div>
-                <h4 style={{ fontSize: 13, fontWeight: 600, margin: 0 }}>Waiting for Agent Decomposition</h4>
-                <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4, maxWidth: 420 }}>
-                  Once an AI agent executes <code>masterplan_decompose</code> over MCP, this view will automatically update in real time with the generated step checklist and chunk claim launchers.
-                </p>
-              </div>
-              <button
-                className="btn btn-secondary"
-                style={{ fontSize: 11, height: 26 }}
-                onClick={handleParseStructuredSteps}
-              >
-                <Sparkles size={11} /> Parse Steps Manually Instead
-              </button>
+              <h2 style={{ margin: 0, fontSize: '1.4rem', fontWeight: 600 }}>Masterplan Catalog & Swarm Control</h2>
             </div>
-
-            {/* Agent Fleet Activity Panel */}
-            <div
-              style={{
-                backgroundColor: 'var(--bg-surface)',
-                border: '1px solid var(--border-medium)',
-                borderRadius: 'var(--radius-md)',
-                padding: 16,
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 12,
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 600 }}>
-                  <Cpu size={13} style={{ color: 'var(--accent-blue)' }} /> Connected Agents
-                </div>
-                <span className="badge" style={{ fontSize: 10 }}>{agents.length} Active</span>
-              </div>
-
-              {agents.length === 0 ? (
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, padding: '10px 0' }}>
-                  No agents connected yet. Connect Claude Code, Cursor, Codex, or Antigravity to <code>http://127.0.0.1:7890/mcp</code>.
-                </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+              <span>
+                Project: <strong style={{ color: 'var(--text-normal)' }}>{project?.name || projectId}</strong>
+              </span>
+              <span>•</span>
+              <span>{masterplans.length} Masterplan{masterplans.length === 1 ? '' : 's'}</span>
+              <span>•</span>
+              {activeMasterplan ? (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', color: 'var(--accent-green)' }}>
+                  <Radio size={13} className="animate-pulse" /> Active Plan: <strong>{activeMasterplan.title}</strong>
+                </span>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto', maxHeight: 180 }}>
-                  {agents.map((a) => (
-                    <div
-                      key={a.id}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        padding: '6px 8px',
-                        backgroundColor: 'var(--bg-input)',
-                        borderRadius: 'var(--radius-sm)',
-                        fontSize: 11,
-                      }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span
-                          style={{
-                            width: 6,
-                            height: 6,
-                            borderRadius: '50%',
-                            backgroundColor: a.status === 'WORKING' ? 'var(--accent-yellow)' : 'var(--accent-green)',
-                          }}
-                        />
-                        <span style={{ fontWeight: 600 }}>{a.name}</span>
-                        <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>({a.agent_type})</span>
-                      </div>
-                      <code style={{ fontSize: 9, color: 'var(--text-muted)' }}>{a.id.substring(0, 8)}</code>
-                    </div>
-                  ))}
-                </div>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', color: 'var(--accent-yellow)' }}>
+                  <AlertCircle size={13} /> No Active Plan (MCP Swarms Inactive)
+                </span>
               )}
             </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.75rem' }}>
+            <button
+              onClick={() => setShowCreateModal(true)}
+              className="btn btn-primary"
+              style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem 1rem' }}
+            >
+              <Plus size={16} />
+              New Masterplan
+            </button>
+          </div>
+        </div>
+
+        {/* Masterplans Grid */}
+        {masterplans.length === 0 ? (
+          <div
+            className="card"
+            style={{
+              padding: '3.5rem 2rem',
+              textAlign: 'center',
+              background: 'var(--bg-secondary)',
+              border: '1px dashed var(--border-color)',
+            }}
+          >
+            <Layers size={48} style={{ color: 'var(--text-muted)', margin: '0 auto 1rem', opacity: 0.5 }} />
+            <h3 style={{ margin: '0 0 0.5rem', fontSize: '1.2rem' }}>No Masterplans Created Yet</h3>
+            <p style={{ color: 'var(--text-muted)', maxWidth: '500px', margin: '0 auto 1.5rem', fontSize: '0.9rem' }}>
+              Create a masterplan to decompose your architecture into high-fidelity, verified steps and parallelize agent swarms with isolated Git worktrees.
+            </p>
+            <button
+              onClick={() => setShowCreateModal(true)}
+              className="btn btn-primary"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}
+            >
+              <Plus size={16} />
+              Create First Masterplan
+            </button>
+          </div>
+        ) : (
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(380px, 1fr))',
+              gap: '1.25rem',
+            }}
+          >
+            {masterplans.map((plan) => (
+              <div
+                key={plan.id}
+                className="card animate-fade-in"
+                style={{
+                  padding: '1.25rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '1rem',
+                  border: plan.is_active
+                    ? '1px solid rgba(46, 160, 67, 0.6)'
+                    : '1px solid var(--border-color)',
+                  boxShadow: plan.is_active
+                    ? '0 0 16px rgba(46, 160, 67, 0.15)'
+                    : 'none',
+                  background: 'var(--bg-secondary)',
+                  position: 'relative',
+                }}
+              >
+                {/* Card Top: Title & Status */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                  <div style={{ flex: 1, marginRight: '0.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 600, color: 'var(--text-normal)' }}>
+                        {plan.title}
+                      </h3>
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>
+                      Updated {new Date(plan.updated_at).toLocaleDateString()} at {new Date(plan.updated_at).toLocaleTimeString()}
+                    </div>
+                  </div>
+                  {getStatusBadge(plan.status)}
+                </div>
+
+                {/* Active / Published Toggle Switch */}
+                <div
+                  style={{
+                    padding: '0.65rem 0.85rem',
+                    borderRadius: '6px',
+                    backgroundColor: plan.is_active ? 'rgba(46, 160, 67, 0.1)' : 'rgba(255, 255, 255, 0.03)',
+                    border: plan.is_active ? '1px solid rgba(46, 160, 67, 0.3)' : '1px solid var(--border-color)',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    {plan.is_active ? (
+                      <Eye size={15} style={{ color: 'var(--accent-green)' }} />
+                    ) : (
+                      <EyeOff size={15} style={{ color: 'var(--text-muted)' }} />
+                    )}
+                    <div>
+                      <div style={{ fontSize: '0.8rem', fontWeight: 600, color: plan.is_active ? 'var(--accent-green)' : 'var(--text-muted)' }}>
+                        {plan.is_active ? 'ACTIVE — Visible to AI Agents' : 'INACTIVE — Hidden from MCP'}
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                        {plan.is_active ? 'Agents can claim chunks and execute steps' : 'Agents cannot see or claim this masterplan'}
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => handleToggleActive(plan)}
+                    className={plan.is_active ? 'btn btn-secondary' : 'btn btn-primary'}
+                    style={{
+                      fontSize: '0.75rem',
+                      padding: '0.25rem 0.65rem',
+                      height: 'auto',
+                      minHeight: 'unset',
+                    }}
+                  >
+                    {plan.is_active ? 'Deactivate' : 'Activate Plan'}
+                  </button>
+                </div>
+
+                {/* Plan Meta Chips */}
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', fontSize: '0.75rem' }}>
+                  <span
+                    style={{
+                      padding: '0.2rem 0.5rem',
+                      borderRadius: '4px',
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      color: 'var(--text-muted)',
+                      border: '1px solid var(--border-color)',
+                    }}
+                  >
+                    Target: <strong>{plan.target_step_count} steps</strong>
+                  </span>
+                  <span
+                    style={{
+                      padding: '0.2rem 0.5rem',
+                      borderRadius: '4px',
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      color: 'var(--text-muted)',
+                      border: '1px solid var(--border-color)',
+                    }}
+                  >
+                    Chunk Cap: <strong>Max {plan.max_steps_per_agent} / agent</strong>
+                  </span>
+                  <span
+                    style={{
+                      padding: '0.2rem 0.5rem',
+                      borderRadius: '4px',
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      color: 'var(--text-muted)',
+                      border: '1px solid var(--border-color)',
+                    }}
+                  >
+                    Mode: <strong>{plan.require_milestone_approval ? 'Milestones' : 'Autonomous'}</strong>
+                  </span>
+                </div>
+
+                {/* Card Actions */}
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginTop: 'auto',
+                    paddingTop: '0.75rem',
+                    borderTop: '1px solid var(--border-color)',
+                  }}
+                >
+                  <button
+                    onClick={() => handleOpenPlan(plan)}
+                    className="btn btn-secondary"
+                    style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem' }}
+                  >
+                    <Edit3 size={13} />
+                    Inspect & Decompose
+                  </button>
+
+                  <button
+                    onClick={() => handleDeletePlan(plan)}
+                    className="btn btn-secondary"
+                    title="Delete Masterplan"
+                    style={{
+                      padding: '0.4rem',
+                      color: 'var(--accent-red)',
+                      borderColor: 'rgba(248, 81, 73, 0.3)',
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Modal: Create New Masterplan */}
+        {showCreateModal && (
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              background: 'rgba(0, 0, 0, 0.75)',
+              backdropFilter: 'blur(4px)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 1000,
+              padding: '1rem',
+            }}
+          >
+            <div
+              className="card animate-scale-up"
+              style={{
+                width: '100%',
+                maxWidth: '650px',
+                background: 'var(--bg-primary)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '8px',
+                padding: '1.75rem',
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+                <h3 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Layers size={18} style={{ color: 'var(--accent-blue)' }} /> Create New Masterplan
+                </h3>
+                <button
+                  onClick={() => setShowCreateModal(false)}
+                  className="btn btn-secondary"
+                  style={{ padding: '0.25rem 0.5rem', fontSize: '0.8rem' }}
+                >
+                  ✕
+                </button>
+              </div>
+
+              <form onSubmit={handleCreatePlan} style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                    Masterplan Title
+                  </label>
+                  <input
+                    type="text"
+                    className="input"
+                    value={newTitle}
+                    onChange={(e) => setNewTitle(e.target.value)}
+                    placeholder="e.g. Phase 1: Authentication & Database Architecture"
+                    required
+                    style={{ width: '100%' }}
+                  />
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                      Target Step Count (Up to 100)
+                    </label>
+                    <select
+                      className="input"
+                      value={newTargetSteps}
+                      onChange={(e) => setNewTargetSteps(Number(e.target.value))}
+                      style={{ width: '100%' }}
+                    >
+                      {stepCountOptions.map((n) => (
+                        <option key={n} value={n}>
+                          {n} Steps
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                      Max Steps Per Agent (Up to 8)
+                    </label>
+                    <select
+                      className="input"
+                      value={newMaxStepsPerAgent}
+                      onChange={(e) => setNewMaxStepsPerAgent(Number(e.target.value))}
+                      style={{ width: '100%' }}
+                    >
+                      {maxStepsOptions.map((n) => (
+                        <option key={n} value={n}>
+                          {n} Steps per Agent
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                    Raw Specification / Architectural Blueprint
+                  </label>
+                  <textarea
+                    className="input"
+                    value={newRawText}
+                    onChange={(e) => setNewRawText(e.target.value)}
+                    placeholder="Paste or write raw specification requirements here. The architect agent will decompose this into structured execution milestones."
+                    rows={8}
+                    style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: '0.85rem' }}
+                  />
+                </div>
+
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.75rem',
+                    padding: '0.75rem',
+                    borderRadius: '6px',
+                    background: 'var(--bg-secondary)',
+                    border: '1px solid var(--border-color)',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    id="newActivate"
+                    checked={newActivate}
+                    onChange={(e) => setNewActivate(e.target.checked)}
+                    style={{ width: '16px', height: '16px', cursor: 'pointer' }}
+                  />
+                  <label htmlFor="newActivate" style={{ fontSize: '0.85rem', cursor: 'pointer' }}>
+                    <strong>Activate immediately</strong> (sets this as active plan for MCP agents; deactivates any other active plan)
+                  </label>
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '0.5rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowCreateModal(false)}
+                    className="btn btn-secondary"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={isCreating}
+                    style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+                  >
+                    {isCreating ? 'Creating...' : 'Create Masterplan'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Conflict Modal: Single Active Invariant Warning */}
+        {conflictModal.show && conflictModal.targetPlan && conflictModal.currentActivePlan && (
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              background: 'rgba(0, 0, 0, 0.8)',
+              backdropFilter: 'blur(4px)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 1100,
+              padding: '1rem',
+            }}
+          >
+            <div
+              className="card animate-scale-up"
+              style={{
+                width: '100%',
+                maxWidth: '520px',
+                background: 'var(--bg-primary)',
+                border: '1px solid rgba(210, 153, 34, 0.4)',
+                borderRadius: '8px',
+                padding: '1.75rem',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
+                <div
+                  style={{
+                    width: '36px',
+                    height: '36px',
+                    borderRadius: '50%',
+                    background: 'rgba(210, 153, 34, 0.15)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: 'var(--accent-yellow)',
+                  }}
+                >
+                  <AlertTriangle size={20} />
+                </div>
+                <h3 style={{ margin: 0, fontSize: '1.15rem', fontWeight: 600 }}>Masterplan Activation Conflict</h3>
+              </div>
+
+              <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: '1.5', margin: '0 0 1.25rem' }}>
+                Only <strong>one masterplan</strong> can be active at a time for this project. Masterplan{' '}
+                <strong style={{ color: 'var(--text-normal)' }}>"{conflictModal.currentActivePlan.title}"</strong> is currently active and receiving agent traffic.
+              </p>
+
+              <div
+                style={{
+                  padding: '0.75rem',
+                  borderRadius: '6px',
+                  backgroundColor: 'rgba(56, 139, 253, 0.08)',
+                  border: '1px solid rgba(56, 139, 253, 0.2)',
+                  fontSize: '0.85rem',
+                  color: 'var(--text-normal)',
+                  marginBottom: '1.5rem',
+                }}
+              >
+                Activating <strong>"{conflictModal.targetPlan.title}"</strong> will immediately deactivate "{conflictModal.currentActivePlan.title}" and redirect all AI agent MCP requests to the new plan.
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
+                <button
+                  onClick={() => setConflictModal({ show: false, targetPlan: null, currentActivePlan: null })}
+                  className="btn btn-secondary"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleConfirmSwitchActive}
+                  className="btn btn-primary"
+                  style={{ background: 'var(--accent-yellow)', color: '#000', borderColor: 'var(--accent-yellow)' }}
+                >
+                  Switch Active Masterplan
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ==========================================
+  // VIEW 2: Detailed Masterplan Inspection & Step Hub
+  // ==========================================
+  return (
+    <div className="view-content animate-fade-in" style={{ padding: '1.5rem 2rem', maxWidth: '1400px', margin: '0 auto' }}>
+      {/* Back to Catalog Bar */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+        <button
+          onClick={handleBackToCatalog}
+          className="btn btn-secondary"
+          style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}
+        >
+          <ArrowLeft size={15} />
+          Back to Masterplans Catalog
+        </button>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <div
+            style={{
+              padding: '0.35rem 0.75rem',
+              borderRadius: '6px',
+              backgroundColor: selectedPlan.is_active ? 'rgba(46, 160, 67, 0.15)' : 'rgba(255, 255, 255, 0.05)',
+              border: selectedPlan.is_active ? '1px solid rgba(46, 160, 67, 0.4)' : '1px solid var(--border-color)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              fontSize: '0.8rem',
+            }}
+          >
+            {selectedPlan.is_active ? (
+              <Eye size={14} style={{ color: 'var(--accent-green)' }} />
+            ) : (
+              <EyeOff size={14} style={{ color: 'var(--text-muted)' }} />
+            )}
+            <span style={{ color: selectedPlan.is_active ? 'var(--accent-green)' : 'var(--text-muted)', fontWeight: 600 }}>
+              {selectedPlan.is_active ? 'Active on MCP' : 'Inactive (Hidden)'}
+            </span>
+            <button
+              onClick={() => handleToggleActive(selectedPlan)}
+              className="btn btn-secondary"
+              style={{ fontSize: '0.7rem', padding: '0.15rem 0.5rem', height: 'auto', minHeight: 'unset' }}
+            >
+              {selectedPlan.is_active ? 'Deactivate' : 'Activate'}
+            </button>
+          </div>
+
+          <button
+            onClick={() => handleDeletePlan(selectedPlan)}
+            className="btn btn-secondary"
+            style={{ color: 'var(--accent-red)', borderColor: 'rgba(248, 81, 73, 0.3)', fontSize: '0.8rem' }}
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
+      </div>
+
+      {/* Header Banner */}
+      <div
+        className="card"
+        style={{
+          padding: '1.25rem 1.5rem',
+          marginBottom: '1.25rem',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          background: 'var(--bg-secondary)',
+          border: '1px solid var(--border-color)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          <div
+            style={{
+              width: '40px',
+              height: '40px',
+              borderRadius: '8px',
+              background: 'rgba(56, 139, 253, 0.15)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'var(--accent-blue)',
+            }}
+          >
+            <Layers size={22} />
+          </div>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              <h2 style={{ margin: 0, fontSize: '1.3rem', fontWeight: 600 }}>{selectedPlan.title}</h2>
+              {getStatusBadge(selectedPlan.status)}
+            </div>
+            <div style={{ display: 'flex', gap: '1rem', color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '0.25rem' }}>
+              <span>
+                Project: <strong>{project?.name || projectId}</strong>
+              </span>
+              <span>•</span>
+              <span>
+                Target: <strong>{selectedPlan.target_step_count} steps</strong>
+              </span>
+              <span>•</span>
+              <span>
+                Chunk Cap: <strong>Max {selectedPlan.max_steps_per_agent} / agent</strong>
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            onClick={handleCopyMcpPrompt}
+            className="btn btn-secondary"
+            style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem' }}
+          >
+            {copiedPrompt ? <Check size={14} style={{ color: 'var(--accent-green)' }} /> : <Copy size={14} />}
+            {copiedPrompt ? 'Prompt Copied!' : 'Copy Handoff Prompt'}
+          </button>
+          <button
+            onClick={handleResetPlan}
+            className="btn btn-secondary"
+            style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', color: 'var(--accent-yellow)' }}
+          >
+            <RotateCcw size={14} />
+            Reset Plan
+          </button>
+        </div>
+      </div>
+
+      {/* Hybrid Milestone Approval Control Banner */}
+      <div
+        className="card"
+        style={{
+          padding: '0.9rem 1.25rem',
+          marginBottom: '1.25rem',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          background: requireMilestoneApproval
+            ? 'rgba(56, 139, 253, 0.06)'
+            : 'rgba(210, 153, 34, 0.06)',
+          border: requireMilestoneApproval
+            ? '1px solid rgba(56, 139, 253, 0.3)'
+            : '1px solid rgba(210, 153, 34, 0.3)',
+          borderRadius: '6px',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem' }}>
+          <div
+            style={{
+              width: '32px',
+              height: '32px',
+              borderRadius: '6px',
+              background: requireMilestoneApproval ? 'rgba(56, 139, 253, 0.15)' : 'rgba(210, 153, 34, 0.15)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: requireMilestoneApproval ? 'var(--accent-blue)' : 'var(--accent-yellow)',
+            }}
+          >
+            {requireMilestoneApproval ? <Bot size={18} /> : <Zap size={18} />}
+          </div>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>
+                {requireMilestoneApproval
+                  ? 'Interactive Milestone Checkpoints Active'
+                  : 'Continuous Autonomous Swarm Mode Active'}
+              </span>
+              <span
+                style={{
+                  fontSize: '0.7rem',
+                  padding: '0.15rem 0.45rem',
+                  borderRadius: '4px',
+                  fontWeight: 600,
+                  backgroundColor: requireMilestoneApproval ? 'rgba(56, 139, 253, 0.2)' : 'rgba(210, 153, 34, 0.2)',
+                  color: requireMilestoneApproval ? 'var(--accent-blue)' : 'var(--accent-yellow)',
+                }}
+              >
+                {requireMilestoneApproval ? 'PAUSE & REPORT' : 'UNINTERRUPTED SWARM'}
+              </span>
+            </div>
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.15rem' }}>
+              {requireMilestoneApproval
+                ? 'Agents submit their completed chunk, stop tool calls, report in IDE chat, and wait for confirmation before claiming the next chunk.'
+                : 'Agents submit their completed chunk and immediately claim subsequent chunks autonomously until all steps finish.'}
+            </div>
+          </div>
+        </div>
+
+        <button
+          onClick={() => handleToggleMilestoneApproval(!requireMilestoneApproval)}
+          disabled={isUpdatingMode}
+          className="btn btn-secondary"
+          style={{
+            fontSize: '0.8rem',
+            padding: '0.35rem 0.75rem',
+            borderColor: requireMilestoneApproval ? 'rgba(56, 139, 253, 0.4)' : 'rgba(210, 153, 34, 0.4)',
+          }}
+        >
+          {isUpdatingMode
+            ? 'Updating...'
+            : requireMilestoneApproval
+            ? 'Switch to Autonomous Swarm'
+            : 'Switch to Interactive Milestones'}
+        </button>
+      </div>
+
+      {/* Raw Specification Editor if UNSORTED or isEditing */}
+      {(selectedPlan.status === 'UNSORTED' || isEditing) && (
+        <div className="card" style={{ padding: '1.25rem', marginBottom: '1.25rem', background: 'var(--bg-secondary)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+            <h3 style={{ margin: 0, fontSize: '1rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <FileText size={16} /> Raw Master Specification
+            </h3>
+            <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem' }}>
+                <span style={{ color: 'var(--text-muted)' }}>Target:</span>
+                <select
+                  className="input"
+                  value={targetStepCount}
+                  onChange={(e) => setTargetStepCount(Number(e.target.value))}
+                  style={{ padding: '0.2rem 0.5rem', fontSize: '0.8rem' }}
+                >
+                  {stepCountOptions.map((n) => (
+                    <option key={n} value={n}>
+                      {n} Steps
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem' }}>
+                <span style={{ color: 'var(--text-muted)' }}>Chunk Cap:</span>
+                <select
+                  className="input"
+                  value={maxStepsPerAgent}
+                  onChange={(e) => setMaxStepsPerAgent(Number(e.target.value))}
+                  style={{ padding: '0.2rem 0.5rem', fontSize: '0.8rem' }}
+                >
+                  {maxStepsOptions.map((n) => (
+                    <option key={n} value={n}>
+                      {n} Steps
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <button
+                onClick={handleSavePlan}
+                disabled={isSaving}
+                className="btn btn-primary"
+                style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem' }}
+              >
+                {isSaving ? 'Saving...' : 'Save Specification'}
+              </button>
+            </div>
+          </div>
+
+          <textarea
+            className="input"
+            value={rawText}
+            onChange={(e) => setRawText(e.target.value)}
+            placeholder="Paste raw masterplan specifications here..."
+            rows={10}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: '0.85rem' }}
+          />
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '0.75rem' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              Tip: AI agents calling <code>masterplan_decompose</code> will automatically formulate high-fidelity steps matching this spec.
+            </span>
+            <button
+              onClick={handleParseStructuredSteps}
+              className="btn btn-secondary"
+              style={{ fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+            >
+              <Sparkles size={14} style={{ color: 'var(--accent-blue)' }} /> Quick Auto-Decompose (Client)
+            </button>
           </div>
         </div>
       )}
 
-      {/* VIEW MODE 3: RESORTED & ORGANIZED VISUAL CHECKLIST VIEW */}
-      {masterplan && masterplan.status !== 'UNSORTED' && !isEditing && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {/* Action & Filter Toolbar */}
+      {/* Progress & Step Management when organized */}
+      {selectedPlan.status !== 'UNSORTED' && (
+        <>
+          {/* Progress Bar Card */}
+          <div
+            className="card"
+            style={{
+              padding: '1.25rem',
+              marginBottom: '1.25rem',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border-color)',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.6rem' }}>
+              <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>Masterplan Execution Progress</span>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                <strong>{completedSteps}</strong> of <strong>{totalSteps}</strong> Steps Merged ({progressPercent}%)
+              </span>
+            </div>
+            <div
+              style={{
+                width: '100%',
+                height: '8px',
+                background: 'rgba(255, 255, 255, 0.08)',
+                borderRadius: '4px',
+                overflow: 'hidden',
+              }}
+            >
+              <div
+                style={{
+                  width: `${progressPercent}%`,
+                  height: '100%',
+                  background: progressPercent === 100 ? 'var(--accent-green)' : 'var(--accent-blue)',
+                  borderRadius: '4px',
+                  transition: 'width 0.3s ease',
+                }}
+              />
+            </div>
+
+            {/* Step Status Badges Counter */}
+            <div style={{ display: 'flex', gap: '1rem', marginTop: '0.75rem', fontSize: '0.8rem' }}>
+              <span style={{ color: 'var(--text-muted)' }}>
+                Pending: <strong style={{ color: 'var(--text-normal)' }}>{pendingSteps}</strong>
+              </span>
+              <span style={{ color: 'var(--text-muted)' }}>
+                Claimed / In-Progress: <strong style={{ color: 'var(--accent-blue)' }}>{claimedSteps}</strong>
+              </span>
+              <span style={{ color: 'var(--text-muted)' }}>
+                Completed: <strong style={{ color: 'var(--accent-green)' }}>{completedSteps}</strong>
+              </span>
+            </div>
+          </div>
+
+          {/* Step Filter Bar & Manual Claim Control */}
           <div
             style={{
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
-              backgroundColor: 'var(--bg-surface)',
-              border: '1px solid var(--border-medium)',
-              borderRadius: 'var(--radius-md)',
-              padding: 10,
+              marginBottom: '1rem',
+              gap: '1rem',
               flexWrap: 'wrap',
-              gap: 10,
             }}
           >
-            {/* Filter Pills */}
-            <div style={{ display: 'flex', gap: 4 }}>
+            {/* Filter Tabs */}
+            <div style={{ display: 'flex', gap: '0.4rem' }}>
               {(['ALL', 'PENDING', 'CLAIMED', 'COMPLETED'] as const).map((f) => (
                 <button
                   key={f}
-                  className={`btn ${filter === f ? 'btn-primary' : 'btn-secondary'}`}
-                  style={{ height: 26, fontSize: 10, padding: '0 8px' }}
                   onClick={() => setFilter(f)}
+                  className={`btn ${filter === f ? 'btn-primary' : 'btn-secondary'}`}
+                  style={{ fontSize: '0.75rem', padding: '0.3rem 0.75rem' }}
                 >
-                  {f === 'ALL'
-                    ? `All (${totalSteps})`
-                    : f === 'PENDING'
-                    ? `Pending (${pendingSteps})`
-                    : f === 'CLAIMED'
-                    ? `In Progress (${claimedSteps})`
-                    : `Completed (${completedSteps})`}
+                  {f} {f === 'ALL' ? `(${totalSteps})` : f === 'PENDING' ? `(${pendingSteps})` : f === 'CLAIMED' ? `(${claimedSteps})` : `(${completedSteps})`}
                 </button>
               ))}
             </div>
 
-            {/* Quick Chunk Claim Launcher */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
-                <span style={{ color: 'var(--text-secondary)' }}>Agent:</span>
-                <select
-                  className="input-field"
-                  style={{ height: 26, fontSize: 11, padding: '0 6px', maxWidth: 140 }}
-                  value={selectedAgentId}
-                  onChange={(e) => setSelectedAgentId(e.target.value)}
-                  title="Select registered agent to claim the next chunk"
-                >
-                  {agents.length === 0 ? (
-                    <option value="">No agents connected</option>
-                  ) : (
-                    agents.map((a) => (
-                      <option key={a.id} value={a.id}>
-                        {a.name} ({a.agent_type})
-                      </option>
-                    ))
-                  )}
-                </select>
-              </div>
+            {/* Manual Test Claim Controls */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <select
+                className="input"
+                value={selectedAgentId}
+                onChange={(e) => setSelectedAgentId(e.target.value)}
+                style={{ fontSize: '0.8rem', padding: '0.3rem 0.5rem' }}
+              >
+                {agents.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name} ({a.agent_type})
+                  </option>
+                ))}
+              </select>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
-                <span style={{ color: 'var(--text-secondary)' }}>Chunk:</span>
-                <select
-                  className="input-field"
-                  style={{ height: 26, fontSize: 11, padding: '0 6px' }}
-                  value={customChunkSize}
-                  onChange={(e) => setCustomChunkSize(Number(e.target.value))}
-                  title="Number of steps to allocate in this worktree batch"
-                >
-                  <option value={2}>2 Steps</option>
-                  <option value={3}>3 Steps</option>
-                  <option value={4}>4 Steps</option>
-                  <option value={5}>5 Steps</option>
-                </select>
-              </div>
+              <select
+                className="input"
+                value={customChunkSize}
+                onChange={(e) => setCustomChunkSize(Number(e.target.value))}
+                style={{ fontSize: '0.8rem', padding: '0.3rem 0.5rem' }}
+              >
+                {maxStepsOptions.map((n) => (
+                  <option key={n} value={n}>
+                    {n} Steps Chunk
+                  </option>
+                ))}
+              </select>
 
               <button
-                className="btn btn-primary"
-                style={{ height: 26, fontSize: 11 }}
                 onClick={handleClaimChunk}
-                disabled={isClaiming || pendingSteps === 0 || !selectedAgentId}
-                title="Atomically claim the next batch of pending steps and cut a dedicated Git worktree"
+                disabled={isClaiming || pendingSteps === 0}
+                className="btn btn-primary"
+                style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', padding: '0.35rem 0.75rem' }}
               >
-                <Play size={11} /> {isClaiming ? 'Claiming...' : `Claim Next ${customChunkSize} Steps`}
+                <Play size={13} />
+                {isClaiming ? 'Claiming...' : 'Manual Claim Chunk'}
               </button>
             </div>
           </div>
 
-          {/* Visual Step Checklist */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {filteredSteps.map((step) => {
-              const isClaimed = step.status === 'CLAIMED' || step.status === 'IN_PROGRESS';
-              const isDone = step.status === 'COMPLETED';
-              const assignedAgent = agents.find((a) => a.id === step.claimed_agent_id);
-
-              return (
-                <div
-                  key={step.id}
-                  style={{
-                    backgroundColor: isDone
-                      ? 'rgba(35, 134, 54, 0.06)'
-                      : isClaimed
-                      ? 'rgba(56, 139, 253, 0.05)'
-                      : 'var(--bg-surface)',
-                    border: `1px solid ${
-                      isDone
-                        ? 'rgba(46, 160, 67, 0.4)'
-                        : isClaimed
-                        ? 'rgba(56, 139, 253, 0.4)'
-                        : 'var(--border-medium)'
-                    }`,
-                    borderRadius: 'var(--radius-md)',
-                    padding: '12px 16px',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 8,
-                    transition: 'border-color 0.2s ease',
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      <span
-                        style={{
-                          fontFamily: 'var(--font-mono)',
-                          fontSize: 11,
-                          fontWeight: 700,
-                          padding: '2px 6px',
-                          borderRadius: 'var(--radius-sm)',
-                          backgroundColor: isDone
-                            ? 'var(--accent-green)'
-                            : isClaimed
-                            ? 'var(--accent-blue)'
-                            : 'var(--bg-input)',
-                          color: isDone || isClaimed ? '#ffffff' : 'var(--text-secondary)',
-                        }}
-                      >
-                        #{String(step.step_index).padStart(2, '0')}
-                      </span>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
-                        {step.title}
-                      </span>
-                    </div>
-
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      {step.status === 'COMPLETED' ? (
-                        <span className="badge badge-READY" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                          <CheckCircle2 size={10} /> MERGED
-                        </span>
-                      ) : isClaimed ? (
-                        <span className="badge badge-RUNNING" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                          <Layers size={10} /> WORKING
-                        </span>
-                      ) : (
-                        <span className="badge" style={{ backgroundColor: 'var(--bg-input)', color: 'var(--text-muted)' }}>
-                          PENDING
-                        </span>
-                      )}
-                    </div>
+          {/* Steps List */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+            {filteredSteps.map((s) => (
+              <div
+                key={s.id}
+                className="card animate-fade-in"
+                style={{
+                  padding: '1rem',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'flex-start',
+                  background: 'var(--bg-secondary)',
+                  border: s.status === 'COMPLETED'
+                    ? '1px solid rgba(46, 160, 67, 0.4)'
+                    : s.status === 'CLAIMED' || s.status === 'IN_PROGRESS'
+                    ? '1px solid rgba(56, 139, 253, 0.4)'
+                    : '1px solid var(--border-color)',
+                }}
+              >
+                <div style={{ flex: 1, marginRight: '1rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.3rem' }}>
+                    <span
+                      style={{
+                        fontSize: '0.75rem',
+                        fontWeight: 700,
+                        padding: '0.15rem 0.45rem',
+                        borderRadius: '4px',
+                        background: 'rgba(255, 255, 255, 0.08)',
+                        color: 'var(--text-muted)',
+                      }}
+                    >
+                      Step #{s.step_index}
+                    </span>
+                    <h4 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 600 }}>{s.title}</h4>
                   </div>
+                  <p style={{ margin: '0 0 0.5rem', fontSize: '0.85rem', color: 'var(--text-muted)', lineHeight: '1.4' }}>
+                    {s.description}
+                  </p>
 
-                  {/* Description */}
-                  <div
-                    style={{
-                      fontSize: 11,
-                      color: 'var(--text-secondary)',
-                      lineHeight: 1.5,
-                      whiteSpace: 'pre-wrap',
-                      paddingLeft: 34,
-                    }}
-                  >
-                    {step.description}
-                  </div>
-
-                  {/* Metadata Footer */}
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      paddingLeft: 34,
-                      paddingTop: 6,
-                      borderTop: '1px solid var(--border-subtle)',
-                      flexWrap: 'wrap',
-                      gap: 8,
-                      fontSize: 10,
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                      {step.suggested_scope && (
-                        <span
-                          style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' }}
-                          title="Target file glob scope reserved for this step"
-                        >
-                          <FolderGit2 size={11} style={{ color: 'var(--accent-blue)' }} />
-                          <code>{step.suggested_scope}</code>
-                        </span>
-                      )}
-
-                      {step.acceptance_criteria && (
-                        <span
-                          style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' }}
-                          title="Acceptance test criteria required to pass verification"
-                        >
-                          <ShieldCheck size={11} style={{ color: 'var(--accent-green)' }} />
-                          {step.acceptance_criteria}
-                        </span>
-                      )}
-                    </div>
-
-                    {isClaimed && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 4,
-                            color: 'var(--accent-yellow)',
-                            fontWeight: 600,
-                          }}
-                        >
-                          <Cpu size={11} /> {assignedAgent?.name || 'Assigned Agent'}
-                        </span>
-                        {step.claimed_task_id && (
-                          <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-                            [{step.claimed_task_id}]
-                          </span>
-                        )}
-                      </div>
+                  <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', fontSize: '0.75rem' }}>
+                    {s.suggested_scope && (
+                      <span style={{ color: 'var(--text-muted)' }}>
+                        Scope: <code style={{ color: 'var(--accent-blue)' }}>{s.suggested_scope}</code>
+                      </span>
+                    )}
+                    {s.acceptance_criteria && (
+                      <span style={{ color: 'var(--text-muted)' }}>
+                        Criteria: <code style={{ color: 'var(--text-normal)' }}>{s.acceptance_criteria}</code>
+                      </span>
                     )}
                   </div>
                 </div>
-              );
-            })}
+
+                <div>
+                  <span
+                    className="badge"
+                    style={{
+                      backgroundColor:
+                        s.status === 'COMPLETED'
+                          ? 'rgba(46, 160, 67, 0.2)'
+                          : s.status === 'CLAIMED' || s.status === 'IN_PROGRESS'
+                          ? 'rgba(56, 139, 253, 0.2)'
+                          : 'rgba(255, 255, 255, 0.08)',
+                      color:
+                        s.status === 'COMPLETED'
+                          ? 'var(--accent-green)'
+                          : s.status === 'CLAIMED' || s.status === 'IN_PROGRESS'
+                          ? 'var(--accent-blue)'
+                          : 'var(--text-muted)',
+                      border:
+                        s.status === 'COMPLETED'
+                          ? '1px solid rgba(46, 160, 67, 0.4)'
+                          : s.status === 'CLAIMED' || s.status === 'IN_PROGRESS'
+                          ? '1px solid rgba(56, 139, 253, 0.4)'
+                          : '1px solid var(--border-color)',
+                    }}
+                  >
+                    {s.status}
+                  </span>
+                </div>
+              </div>
+            ))}
           </div>
-        </div>
+        </>
       )}
     </div>
   );

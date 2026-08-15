@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-08-15
+
+### Added
+- **Multi-Masterplan Catalog & Single-Active Toggle System (Migration 0011)**:
+  - Added `title` and `is_active` columns to `masterplans` table with project-active index.
+  - Rebuilt Masterplan Hub with a two-level hierarchy: Masterplan Catalog & Selection Grid (manage multiple draft/archived/active plans) and Detailed Plan Workspace.
+  - 1-Click Active/Inactive toggle switch: Only active masterplans (`is_active = true`) are visible and actionable to AI agents via MCP.
+  - Strict single-active plan mutual exclusion per project: Attempting to activate a plan while another is active triggers a conflict resolution modal with a 1-click switch action.
+  - MCP Visibility & Tool Gates: `masterplan_get`, `masterplan_status`, and `masterplan_claim_chunk` query strictly the active plan (`is_active = 1`). Inactive plans are safely sequestered from agent tool calls.
+  - Expanded capacity limits: Target step count dropdown expanded up to **100 steps** (5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100), and chunk anti-hoarding cap expanded up to **8 steps per agent**.
+  - High-performance non-blocking query architecture: Resolved internal SQLite connection lock contention and added child process timeout protection to prevent hanging operations.
+
+---
+
 ## [0.3.0] - 2026-08-15
 
 ### Added

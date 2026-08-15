@@ -280,11 +280,13 @@ export interface McpInfo {
 export interface Masterplan {
   id: string;
   project_id: string;
+  title: string;
   raw_text: string;
   status: 'UNSORTED' | 'RESORTED' | 'EXECUTING' | 'COMPLETED';
   target_step_count: number;
   max_steps_per_agent: number;
   require_milestone_approval?: boolean;
+  is_active: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -394,6 +396,8 @@ export interface MasterplanSummary {
   project_name: string;
   repository_path: string;
   masterplan_id: string;
+  title: string;
+  is_active: boolean;
   status: string;
   target_step_count: number;
   max_steps_per_agent: number;

@@ -491,18 +491,26 @@ pub struct ContextPack {
 pub struct Masterplan {
     pub id: String,
     pub project_id: String,
+    #[serde(default = "default_masterplan_title")]
+    pub title: String,
     pub raw_text: String,
     pub status: String, // UNSORTED, RESORTED, EXECUTING, COMPLETED
     pub target_step_count: i32,
     pub max_steps_per_agent: i32,
     #[serde(default = "default_true")]
     pub require_milestone_approval: bool,
+    #[serde(default)]
+    pub is_active: bool,
     pub created_at: String,
     pub updated_at: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_masterplan_title() -> String {
+    "Masterplan".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -621,6 +629,10 @@ pub struct MasterplanSummary {
     pub project_name: String,
     pub repository_path: String,
     pub masterplan_id: String,
+    #[serde(default = "default_masterplan_title")]
+    pub title: String,
+    #[serde(default)]
+    pub is_active: bool,
     pub status: String,
     pub target_step_count: i32,
     pub max_steps_per_agent: i32,
