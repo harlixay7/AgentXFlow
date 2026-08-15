@@ -48,6 +48,9 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   const [selectedAgentId, setSelectedAgentId] = useState<string>('');
   const [customChunkSize, setCustomChunkSize] = useState<number>(4);
 
+  const [requireMilestoneApproval, setRequireMilestoneApproval] = useState<boolean>(true);
+  const [isUpdatingMode, setIsUpdatingMode] = useState<boolean>(false);
+
   const lastSeqRef = useRef<number>(0);
 
   const fetchPlan = async () => {
@@ -60,6 +63,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
         setTargetStepCount(plan.target_step_count);
         setMaxStepsPerAgent(plan.max_steps_per_agent);
         setCustomChunkSize(plan.max_steps_per_agent);
+        setRequireMilestoneApproval(plan.require_milestone_approval ?? true);
         const fetchedSteps = await invoke<MasterplanStep[]>('list_masterplan_steps', { projectId });
         setSteps(fetchedSteps);
       } else {
@@ -69,6 +73,20 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
       console.error('Failed to fetch masterplan:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleToggleMilestoneApproval = async (enabled: boolean) => {
+    setIsUpdatingMode(true);
+    setRequireMilestoneApproval(enabled);
+    try {
+      await coordinatorApi.setMasterplanMilestoneApproval(projectId, enabled);
+    } catch (err) {
+      console.error('Failed to update milestone mode:', err);
+      // revert on error
+      setRequireMilestoneApproval(!enabled);
+    } finally {
+      setIsUpdatingMode(false);
     }
   };
 
@@ -352,6 +370,73 @@ Instructions:
           )}
         </div>
       </div>
+
+      {/* Milestone Handoff Execution Policy Control */}
+      {masterplan && (
+        <div
+          style={{
+            backgroundColor: 'var(--bg-surface)',
+            border: '1px solid var(--border-medium)',
+            borderRadius: 'var(--radius-md)',
+            padding: '12px 16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 16,
+            flexWrap: 'wrap',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div
+              style={{
+                width: 32,
+                height: 32,
+                borderRadius: 6,
+                backgroundColor: requireMilestoneApproval ? 'rgba(56, 139, 253, 0.15)' : 'rgba(46, 160, 67, 0.15)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: requireMilestoneApproval ? 'var(--accent-blue)' : 'var(--accent-green)',
+                flexShrink: 0,
+              }}
+            >
+              {requireMilestoneApproval ? <ShieldCheck size={18} /> : <Bot size={18} />}
+            </div>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span>{requireMilestoneApproval ? 'Interactive Milestone Checkpoints' : 'Continuous Autonomous Swarm Mode'}</span>
+                <span
+                  className="badge"
+                  style={{
+                    fontSize: 10,
+                    padding: '1px 6px',
+                    backgroundColor: requireMilestoneApproval ? 'rgba(56, 139, 253, 0.2)' : 'rgba(46, 160, 67, 0.2)',
+                    color: requireMilestoneApproval ? 'var(--accent-blue)' : 'var(--accent-green)',
+                    border: `1px solid ${requireMilestoneApproval ? 'rgba(56, 139, 253, 0.4)' : 'rgba(46, 160, 67, 0.4)'}`,
+                  }}
+                >
+                  {requireMilestoneApproval ? 'PAUSE & REPORT' : 'UNINTERRUPTED SWARM'}
+                </span>
+              </div>
+              <p style={{ margin: '2px 0 0', fontSize: 11, color: 'var(--text-secondary)' }}>
+                {requireMilestoneApproval
+                  ? 'Agents pause after submitting their chunk (e.g. 5 steps), report a full walkthrough in chat, and wait for your confirmation.'
+                  : 'Agents automatically claim and execute subsequent chunks in background until all masterplan steps are completed.'}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            className={`btn ${requireMilestoneApproval ? 'btn-secondary' : 'btn-primary'}`}
+            style={{ fontSize: 11, height: 28, minWidth: 170 }}
+            disabled={isUpdatingMode}
+            onClick={() => handleToggleMilestoneApproval(!requireMilestoneApproval)}
+          >
+            {requireMilestoneApproval ? 'Switch to Autonomous Swarm' : 'Switch to Interactive Milestones'}
+          </button>
+        </div>
+      )}
 
       {/* Progress & Stats Bar (when organized) */}
       {masterplan && masterplan.status !== 'UNSORTED' && totalSteps > 0 && !isEditing && (

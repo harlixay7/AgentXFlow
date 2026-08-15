@@ -518,10 +518,29 @@ fn execute_mcp_tool(
                 if res.is_valid {
                     let task = state.coordinator.get_task(task_id).ok();
                     let project_id = task.as_ref().map(|t| t.project_id.as_str()).unwrap_or("");
+                    let plan = state.coordinator.get_masterplan(project_id).ok().flatten();
+                    let require_approval = plan.as_ref().map(|p| p.require_milestone_approval).unwrap_or(true);
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
                     let remaining_pending = steps.iter().filter(|s| s.status == "PENDING").count();
                     let completed_in_plan = steps.iter().filter(|s| s.status == "COMPLETED").count();
                     let total_steps = steps.len();
+
+                    let (next_action, instruction) = if require_approval {
+                        (
+                            "REPORT_TO_USER",
+                            "Milestone completed successfully: All chunk steps verified and enqueued for merge. Interactive Milestone Mode is active. Stop calling MCP tools now. Present a comprehensive milestone walkthrough and test summary to the user in this IDE chat, and wait for the user to confirm/prompt before claiming the next chunk."
+                        )
+                    } else if remaining_pending > 0 {
+                        (
+                            "masterplan_claim_chunk",
+                            "Chunk verified and enqueued for merge. Continuous Autonomous Swarm Mode is active: proceed immediately to claim the next available chunk using 'masterplan_claim_chunk'."
+                        )
+                    } else {
+                        (
+                            "all_steps_completed",
+                            "All masterplan steps have been claimed and completed. No further steps remain in the masterplan."
+                        )
+                    };
 
                     serde_json::json!({
                         "is_valid": true,
@@ -529,13 +548,14 @@ fn execute_mcp_tool(
                         "verification": res,
                         "task_id": task_id,
                         "agent_id": agent_id,
+                        "require_milestone_approval": require_approval,
                         "masterplan_progress": {
                             "completed_steps": completed_in_plan,
                             "remaining_pending_steps": remaining_pending,
                             "total_steps": total_steps
                         },
-                        "next_action": "REPORT_TO_USER",
-                        "instruction": "Milestone completed successfully: All chunk steps verified and enqueued for merge. Stop calling MCP tools now. Present a comprehensive milestone walkthrough and test summary to the user in this IDE chat, and wait for the user to confirm/prompt before claiming the next chunk."
+                        "next_action": next_action,
+                        "instruction": instruction
                     })
                 } else {
                     serde_json::json!({

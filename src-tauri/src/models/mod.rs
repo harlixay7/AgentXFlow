@@ -495,8 +495,14 @@ pub struct Masterplan {
     pub status: String, // UNSORTED, RESORTED, EXECUTING, COMPLETED
     pub target_step_count: i32,
     pub max_steps_per_agent: i32,
+    #[serde(default = "default_true")]
+    pub require_milestone_approval: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

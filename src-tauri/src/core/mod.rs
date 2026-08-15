@@ -1413,7 +1413,7 @@ impl CoordinatorEngine {
             let _ = self.cancel_task(tid, None, Some("Masterplan created/updated with new specification text"));
         }
 
-        let plan_id = if let Some((id, old_text)) = existing {
+        let (plan_id, require_approval) = if let Some((id, old_text)) = existing {
             let conn = self.db.lock();
             // Archive existing plan into masterplan_revisions before updating
             let rev_id = Uuid::new_v4().to_string();
@@ -1422,6 +1422,12 @@ impl CoordinatorEngine {
                 [&id],
                 |r| r.get(0),
             ).unwrap_or(1);
+
+            let existing_approval: bool = conn.query_row(
+                "SELECT COALESCE(require_milestone_approval, 1) FROM masterplans WHERE id = ?1",
+                [&id],
+                |r| r.get(0),
+            ).unwrap_or(true);
 
             conn.execute(
                 "INSERT INTO masterplan_revisions (id, masterplan_id, project_id, revision_number, raw_text, reason, steps_snapshot_json, archived_at)
@@ -1436,16 +1442,16 @@ impl CoordinatorEngine {
                 "UPDATE masterplans SET raw_text = ?1, status = 'UNSORTED', target_step_count = ?2, max_steps_per_agent = ?3, updated_at = ?4 WHERE id = ?5",
                 params![raw_text, target_step_count, max_steps_per_agent, now, id],
             ).map_err(|e| e.to_string())?;
-            id
+            (id, existing_approval)
         } else {
             let id = Uuid::new_v4().to_string();
             let conn = self.db.lock();
             conn.execute(
-                "INSERT INTO masterplans (id, project_id, raw_text, status, target_step_count, max_steps_per_agent, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'UNSORTED', ?4, ?5, ?6, ?6)",
+                "INSERT INTO masterplans (id, project_id, raw_text, status, target_step_count, max_steps_per_agent, require_milestone_approval, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'UNSORTED', ?4, ?5, 1, ?6, ?6)",
                 params![id, project_id, raw_text, target_step_count, max_steps_per_agent, now],
             ).map_err(|e| e.to_string())?;
-            id
+            (id, true)
         };
 
         self.emit_event(Some(project_id), None, None, "MASTERPLAN_UPDATED", json!({ "status": "UNSORTED", "plan_id": plan_id }));
@@ -1457,16 +1463,29 @@ impl CoordinatorEngine {
             status: "UNSORTED".to_string(),
             target_step_count,
             max_steps_per_agent,
+            require_milestone_approval: require_approval,
             created_at: now.clone(),
             updated_at: now,
         })
+    }
+
+    pub fn set_masterplan_milestone_approval(&self, project_id: &str, require_approval: bool) -> Result<bool, String> {
+        let conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE masterplans SET require_milestone_approval = ?1, updated_at = ?2 WHERE project_id = ?3",
+            rusqlite::params![require_approval, now, project_id],
+        ).map_err(|e| format!("Failed to update milestone approval mode: {}", e))?;
+        drop(conn);
+        self.emit_event(Some(project_id), None, None, "MASTERPLAN_UPDATED", json!({ "require_milestone_approval": require_approval }));
+        Ok(require_approval)
     }
 
     pub fn get_masterplan(&self, project_id: &str) -> Result<Option<Masterplan>, String> {
         let conn = self.db.lock();
         let plan = conn
             .query_row(
-                "SELECT id, project_id, raw_text, status, target_step_count, max_steps_per_agent, created_at, updated_at FROM masterplans WHERE project_id = ?1",
+                "SELECT id, project_id, raw_text, status, target_step_count, max_steps_per_agent, COALESCE(require_milestone_approval, 1), created_at, updated_at FROM masterplans WHERE project_id = ?1",
                 [project_id],
                 |r| {
                     Ok(Masterplan {
@@ -1476,8 +1495,9 @@ impl CoordinatorEngine {
                         status: r.get(3)?,
                         target_step_count: r.get(4)?,
                         max_steps_per_agent: r.get(5)?,
-                        created_at: r.get(6)?,
-                        updated_at: r.get(7)?,
+                        require_milestone_approval: r.get::<_, i64>(6)? != 0,
+                        created_at: r.get(7)?,
+                        updated_at: r.get(8)?,
                     })
                 },
             )

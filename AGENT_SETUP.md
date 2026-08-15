@@ -160,7 +160,9 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 7. Implement      -> Make changes strictly inside your allocated worktree path and verify locally.
 8. Step Evidence  -> Call task_complete_step with step_id and command verification evidence.
 9. Submit & Gate  -> Call task_submit. The coordinator automatically executes verification profiles, audits scope mutations, generates ProofBundle, and enqueues to merge queue.
-10. Milestone Stop-> When task_submit returns CHUNK_COMPLETED, STOP calling tools immediately. Present a milestone summary in chat and WAIT for the user to prompt before claiming the next chunk.
+10. Milestone Handoff -> Inspect `next_action` in task_submit response:
+                     - If `REPORT_TO_USER`: Interactive Milestone mode is active. Stop calling tools immediately, present a milestone walkthrough in chat, and wait for user confirmation.
+                     - If `masterplan_claim_chunk`: Continuous Autonomous Swarm mode is active. Proceed immediately to claim the next chunk.
 ```
 
 ### Fundamental Coordination Invariants
@@ -168,7 +170,7 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 - **Zero Self-Certification**: Autonomous agents cannot mark their own criteria valid or bypass verification. All criteria satisfaction is derived exclusively from passing automated machine evaluators executed by the coordinator.
 - **Isolated Worktrees**: All code edits must occur inside `.agentxflow/worktrees/task-<id>` or the assigned AppData worktree path. Never edit the primary repository root directly.
 - **Attempt-Scoped Auditing**: Scope violations are bound to your active `attempt_id`. Acquiring missing scope leases cleanly clears violations on subsequent re-runs and submissions.
-- **Milestone Checkpoints**: Upon chunk submission (`CHUNK_COMPLETED`), the agent stops calling tools and presents a progress report to the user in their IDE chat, waiting for user instructions before claiming subsequent chunks.
+- **Hybrid Milestone Handoff**: When `require_milestone_approval` is enabled in the UI (Interactive Milestone Mode), agents pause after each chunk, report back in IDE chat, and await user instructions. In Continuous Autonomous Swarm Mode, agents claim subsequent chunks immediately.
 
 ---
 

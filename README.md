@@ -136,7 +136,9 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 7. Implement      -> Make changes strictly inside your allocated worktree path and verify locally.
 8. Step Evidence  -> Call task_complete_step with step_id and command verification evidence.
 9. Submit & Gate  -> Call task_submit. The coordinator automatically executes verification profiles, audits scope mutations, generates ProofBundle, and enqueues to merge queue.
-10. Milestone Stop-> When task_submit returns CHUNK_COMPLETED, STOP calling tools immediately. Present a milestone summary in chat and WAIT for the user to prompt before claiming the next chunk.
+10. Milestone Handoff -> Inspect `next_action` in task_submit response:
+                     - If `REPORT_TO_USER`: Interactive Milestone mode is active. Stop calling tools immediately, present a milestone walkthrough in chat, and wait for user confirmation.
+                     - If `masterplan_claim_chunk`: Continuous Autonomous Swarm mode is active. Proceed immediately to claim the next chunk.
 ```
 
 ---

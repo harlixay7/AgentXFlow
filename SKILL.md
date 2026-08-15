@@ -23,7 +23,9 @@ The coordinator enforces task integrity on the server with deterministic, machin
 7. Implement      -> Make changes strictly inside your allocated worktree path and verify locally.
 8. Step Evidence  -> Call task_complete_step with step_id and command verification evidence.
 9. Submit & Gate  -> Call task_submit. The coordinator automatically executes verification profiles, audits scope mutations, generates ProofBundle, and enqueues to merge queue.
-10. Milestone Stop-> When task_submit returns CHUNK_COMPLETED, STOP calling tools immediately. Present a milestone summary in chat and WAIT for the user to prompt before claiming the next chunk.
+10. Milestone Handoff -> Inspect `next_action` in task_submit response:
+                     - If `REPORT_TO_USER`: Interactive Milestone mode is active. STOP calling tools immediately, present a milestone walkthrough in chat, and WAIT for user confirmation before claiming the next chunk.
+                     - If `masterplan_claim_chunk`: Continuous Autonomous Swarm mode is active. Proceed immediately to claim the next available chunk.
 ```
 
 ---
@@ -104,6 +106,8 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 4. **Decompose Unsorted Masterplans Professionally**: When `masterplan_get` reports `status: "UNSORTED"`, formulate full production-grade steps with exact file paths, exports, and scopes before calling `masterplan_decompose`.
 5. **Respect Chunk Caps**: Claims are strictly capped by `max_steps_per_agent`. Never attempt to hoard steps.
 6. **Only Edit Locked Files in Worktrees**: The coordinator checks `git diff` against your locked globs. Edit files strictly inside your allocated worktree path. Never modify the repository root directly.
-7. **Milestone Handoff Stop**: When you submit a chunk of steps and receive `status: "CHUNK_COMPLETED"`, STOP calling tools. Output a clear milestone walkthrough to the user in your IDE chat and wait for user confirmation before claiming the next chunk.
+7. **Hybrid Milestone Handoff Compliance**: Inspect `next_action` on `task_submit`:
+   - If `next_action == 'REPORT_TO_USER'`: Stop calling tools immediately, report your milestone summary to the user in chat, and wait for confirmation.
+   - If `next_action == 'masterplan_claim_chunk'`: Autonomous swarm mode is enabled; proceed to claim your next chunk immediately without waiting.
 8. **Automated Machine Verification**: Criteria satisfaction is derived strictly from passing automated machine evaluators and verification profiles.
 9. **Fix Submission Rejections**: If `task_submit` returns validation errors, inspect `rejection_reasons`, address them inside your worktree, and call `task_submit` again.

@@ -347,6 +347,15 @@ fn reset_masterplan(
 }
 
 #[tauri::command]
+fn set_masterplan_milestone_approval(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    require_approval: bool,
+) -> Result<bool, String> {
+    state.coordinator.set_masterplan_milestone_approval(&project_id, require_approval)
+}
+
+#[tauri::command]
 fn prepare_masterplan(
     state: State<'_, Arc<AppState>>,
     project_id: String,
@@ -492,6 +501,7 @@ pub fn run() {
             decompose_masterplan,
             claim_masterplan_chunk,
             reset_masterplan,
+            set_masterplan_milestone_approval,
             list_all_masterplans,
             get_current_context,
         ])

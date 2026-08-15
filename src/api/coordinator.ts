@@ -212,6 +212,13 @@ export const coordinatorApi = {
     }
     return await invoke('get_current_context', { agentId, projectId });
   },
+
+  async setMasterplanMilestoneApproval(projectId: string, requireApproval: boolean): Promise<boolean> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('set_masterplan_milestone_approval', { projectId, requireApproval });
+  },
 };
 
 

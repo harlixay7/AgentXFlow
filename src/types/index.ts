@@ -284,6 +284,7 @@ export interface Masterplan {
   status: 'UNSORTED' | 'RESORTED' | 'EXECUTING' | 'COMPLETED';
   target_step_count: number;
   max_steps_per_agent: number;
+  require_milestone_approval?: boolean;
   created_at: string;
   updated_at: string;
 }
