@@ -77,7 +77,7 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 | `masterplan_get` | `project_id` | Inspect masterplan state, raw specification text, project identity, and architect decomposition instructions. |
 | `masterplan_status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
 | `prepare_masterplan` | `project_id`, `raw_text`, `target_step_count?`, `max_steps_per_agent?` | Atomically save, parse, structure, and prepare a masterplan for agents. |
-| `masterplan_decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured, non-overlapping execution steps. |
+| `masterplan_decompose` | `project_id`, `steps`, `idempotency_key?`, `compact?` | Normalize raw masterplan text into structured, non-overlapping execution steps. Returns compact summary by default. |
 | `masterplan_claim_chunk`| `project_id`, `agent_id`, `count?` | Claim next batch of steps (strictly capped by limit) and allocate an isolated Git worktree. |
 | `agent_register` | `name`, `agent_type` | Idempotently register agent session with a canonical IDE identity and get an authoritative session token. |
 | `agent_heartbeat` | `agent_id` | Refresh your session heartbeat and active lease timers. |
@@ -101,14 +101,17 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 
 ## 5. Execution Rules
 
-1. **Discover Context First**: Call `agentxflow_current_context` to determine current project handoff instructions and active tasks.
-2. **Register with Canonical IDE Name**: Always pass your recognized IDE name (e.g. `agent_register(name="Antigravity")`).
-3. **Always Pass Exact Project ID**: Never guess project IDs; retrieve exact IDs via `project_list` or `agentxflow_current_context`.
-4. **Decompose Unsorted Masterplans Professionally**: When `masterplan_get` reports `status: "UNSORTED"`, formulate full production-grade steps with exact file paths, exports, and scopes before calling `masterplan_decompose`.
-5. **Respect Chunk Caps**: Claims are strictly capped by `max_steps_per_agent`. Never attempt to hoard steps.
-6. **Only Edit Locked Files in Worktrees**: The coordinator checks `git diff` against your locked globs. Edit files strictly inside your allocated worktree path. Never modify the repository root directly.
-7. **Hybrid Milestone Handoff Compliance**: Inspect `next_action` on `task_submit`:
+1. **Direct Native MCP Transport**: Connect directly to the AgentXFlow MCP server at `http://127.0.0.1:7890/mcp` or use the native Node client helper (`node scripts/agentxflow_client.mjs <command>`). Avoid wrapping large JSON payloads into PowerShell command-line strings.
+2. **Persistent MCP Session**: Register once per session (`agent_register`) and reuse your persistent session token. Do not re-register before every status or decomposition call.
+3. **Discover Context First**: Call `agentxflow_current_context` to determine current project handoff instructions and active tasks.
+4. **Register with Canonical IDE Name**: Always pass your recognized IDE name (e.g. `agent_register(name="Antigravity")`).
+5. **Always Pass Exact Project ID**: Never guess project IDs; retrieve exact IDs via `project_list` or `agentxflow_current_context`.
+6. **Decompose Unsorted Masterplans Professionally**: When `masterplan_get` reports `status: "UNSORTED"`, formulate full production-grade steps with exact file paths, exports, and scopes before calling `masterplan_decompose`. Returns compact `{ status: "RESORTED", masterplan_id, step_count, pending_steps, next_action }`.
+7. **Idempotency & Retry Safety**: Pass an optional `idempotency_key` (e.g. `decompose:<masterplan_id>:<content_hash>`) on `masterplan_decompose` to guarantee safe retries without duplicating or corrupting existing steps.
+8. **Respect Chunk Caps**: Claims are strictly capped by `max_steps_per_agent` (up to 8 steps). Never attempt to hoard steps.
+9. **Only Edit Locked Files in Worktrees**: The coordinator checks `git diff` against your locked globs. Edit files strictly inside your allocated worktree path. Never modify the repository root directly.
+10. **Hybrid Milestone Handoff Compliance**: Inspect `next_action` on `task_submit`:
    - If `next_action == 'REPORT_TO_USER'`: Stop calling tools immediately, report your milestone summary to the user in chat, and wait for confirmation.
    - If `next_action == 'masterplan_claim_chunk'`: Autonomous swarm mode is enabled; proceed to claim your next chunk immediately without waiting.
-8. **Automated Machine Verification**: Criteria satisfaction is derived strictly from passing automated machine evaluators and verification profiles.
-9. **Fix Submission Rejections**: If `task_submit` returns validation errors, inspect `rejection_reasons`, address them inside your worktree, and call `task_submit` again.
+11. **Automated Machine Verification**: Criteria satisfaction is derived strictly from passing automated machine evaluators and verification profiles.
+12. **Fix Submission Rejections**: If `task_submit` returns validation errors, inspect `rejection_reasons`, address them inside your worktree, and call `task_submit` again.

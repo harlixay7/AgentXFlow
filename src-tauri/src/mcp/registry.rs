@@ -79,11 +79,13 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
         }),
         json!({
             "name": "masterplan_decompose",
-            "description": "Decompose raw masterplan into structured execution steps.",
+            "description": "Decompose raw masterplan into structured execution steps. Returns compact summary by default.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project_id": { "type": "string", "description": "Project ID" },
+                    "idempotency_key": { "type": "string", "description": "Optional client idempotency key (e.g. 'decompose:<plan_id>:<hash>') for retry protection" },
+                    "compact": { "type": "boolean", "description": "When true (default), returns token-efficient summary instead of echoing all step records" },
                     "steps": {
                         "type": "array",
                         "items": {

@@ -215,7 +215,8 @@ async fn test_full_e2e_mcp_workflow() {
             }
         ]
     })).await;
-    assert_eq!(dec_res.as_array().unwrap().len(), 2);
+    assert_eq!(dec_res["status"], "RESORTED");
+    assert_eq!(dec_res["step_count"], 2);
 
     let claim_res = send_rpc(&session_token, "masterplan.claim_chunk", json!({
         "project_id": proj.id,

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.2] - 2026-08-15
+
+### Added
+- **Compact Response Mode for `masterplan_decompose`**:
+  - By default, `masterplan_decompose` returns a token-efficient summary `{ status: "RESORTED", masterplan_id, step_count, pending_steps, next_action }` rather than echoing 75-100 full step objects over MCP.
+  - Supports optional `compact: false` parameter for clients requiring full step objects.
+- **Decomposition Idempotency & Safe Retry Protection**:
+  - Added `idempotency_key` parameter support to `masterplan_decompose`.
+  - Added server-side idempotency checks in coordinator core to return existing structured steps on duplicate requests rather than rejecting with hostile active claim conflicts.
+- **Native Node.js MCP Client Helper (`scripts/agentxflow_client.mjs`)**:
+  - Lightweight, dependency-free native Node client using native `fetch` and `Buffer`.
+  - Automatically loads authentication token, registers agent platform once per session, and connects directly to `http://127.0.0.1:7890/mcp`.
+  - Eliminates PowerShell command-line argument wrapping and shell bridge latency.
+
+---
+
 ## [0.4.1] - 2026-08-15
 
 ### Fixed

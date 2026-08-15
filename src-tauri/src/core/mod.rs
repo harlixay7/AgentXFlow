@@ -1819,7 +1819,7 @@ impl CoordinatorEngine {
 
         let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {}", e))?;
 
-        // Invariant check 1: Reject re-decomposition if any steps in current plan are active
+        // Invariant check 1: Reject hostile re-decomposition if active claims exist, but allow idempotent retries
         let active_claims: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status != 'PENDING'",
@@ -1829,6 +1829,22 @@ impl CoordinatorEngine {
             .unwrap_or(0);
 
         if active_claims > 0 {
+            // Check for idempotent retry: if existing step count and step titles match
+            let mut stmt_chk = tx.prepare("SELECT step_index, title FROM masterplan_steps WHERE masterplan_id = ?1 ORDER BY step_index ASC").map_err(|e| e.to_string())?;
+            let existing_chk: Vec<(i32, String)> = stmt_chk.query_map([&plan.id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?.flatten().collect();
+            drop(stmt_chk);
+
+            if existing_chk.len() == steps.len() {
+                let is_identical = existing_chk.iter().zip(&steps).all(|(ext, inc)| {
+                    ext.0 == inc.step_index && ext.1.trim() == inc.title.trim()
+                });
+                if is_identical {
+                    drop(tx);
+                    drop(conn);
+                    return self.list_masterplan_steps_by_plan_id(&plan.id);
+                }
+            }
+
             return Err(format!(
                 "Cannot re-decompose masterplan: {} step(s) are actively claimed, in-progress, or completed. Reset the plan first via 'reset_masterplan' or submit active chunks.",
                 active_claims

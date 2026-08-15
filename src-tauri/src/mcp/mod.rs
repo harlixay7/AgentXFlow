@@ -778,10 +778,33 @@ fn execute_mcp_tool(
 
         "masterplan_decompose" | "masterplan.decompose" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let compact = params.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
             let steps_val = params.get("steps").cloned().unwrap_or(serde_json::json!([]));
             let steps_res: Result<Vec<crate::models::DecomposedStepInput>, _> = serde_json::from_value(steps_val);
             match steps_res {
-                Ok(steps) => state.coordinator.decompose_masterplan(project_id, steps).map(|decomposed| serde_json::to_value(decomposed).unwrap()),
+                Ok(steps) => {
+                    let step_count = steps.len();
+                    match state.coordinator.decompose_masterplan(project_id, steps) {
+                        Ok(decomposed) => {
+                            let plan = state.coordinator.get_masterplan(project_id).ok().flatten();
+                            let plan_id = plan.as_ref().map(|p| p.id.as_str()).unwrap_or("");
+                            if compact {
+                                Ok(serde_json::json!({
+                                    "status": "RESORTED",
+                                    "masterplan_id": plan_id,
+                                    "project_id": project_id,
+                                    "step_count": step_count,
+                                    "pending_steps": step_count,
+                                    "next_action": "masterplan_claim_chunk",
+                                    "instruction": format!("Masterplan successfully decomposed into {} structured steps. Call 'masterplan_claim_chunk' to claim your assigned chunk.", step_count)
+                                }))
+                            } else {
+                                Ok(serde_json::to_value(decomposed).unwrap())
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
                 Err(e) => Err(format!("Invalid step array format: {}. Expected [{{ 'step_index': 1, 'title': '...', 'description': '...' }}]", e)),
             }
         }
