@@ -169,6 +169,15 @@ async fn test_full_e2e_mcp_workflow() {
     assert_eq!(proj_arr.len(), 1);
     assert_eq!(proj_arr[0]["id"], proj.id);
 
+    // Test project_context without task_id (fresh agent flow)
+    let proj_ctx_res = send_rpc(&auth_token, "project_context", json!({ "project_id": proj.id })).await;
+    assert_eq!(proj_ctx_res["project_id"], proj.id);
+    assert_eq!(proj_ctx_res["project_name"], proj.name);
+    assert!(proj_ctx_res["contract_hash"].is_string());
+    assert!(proj_ctx_res["project_rules"].is_array());
+    assert!(!proj_ctx_res["project_rules"].as_array().unwrap().is_empty());
+    assert!(proj_ctx_res.get("task_id").is_none());
+
     // 11. Masterplan Workflow: create raw plan, get it, decompose it, and claim chunk
     coordinator.create_or_update_masterplan(
         &proj.id,
@@ -219,6 +228,13 @@ async fn test_full_e2e_mcp_workflow() {
     // 12. Test task_list requires project_id
     let tasks_res = send_rpc(&session_token, "task_list", json!({ "project_id": proj.id })).await;
     assert_eq!(tasks_res.as_array().unwrap().len(), 1);
+
+    // Test project_context WITH task_id (task-specific context pack)
+    let task_ctx_res = send_rpc(&session_token, "project_context", json!({ "project_id": proj.id, "task_id": task_id })).await;
+    assert_eq!(task_ctx_res["project_id"], proj.id);
+    assert_eq!(task_ctx_res["task_id"], task_id);
+    assert!(task_ctx_res["required_steps"].is_array());
+    assert_eq!(task_ctx_res["required_steps"].as_array().unwrap().len(), 2);
 
     // 13. Lock Scopes
     let scope_res = send_rpc(&session_token, "scope.acquire", json!({

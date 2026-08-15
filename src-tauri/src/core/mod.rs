@@ -14,7 +14,7 @@ use crate::merge::MergeEngine;
 use crate::models::{
     AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, CurrentContext, DecomposedStepInput,
     EvaluatorResult, EventItem, EvidenceRecord, IntegrationAttempt, Masterplan, MasterplanStep, MasterplanSummary,
-    MergeQueueItem, PreparedMasterplanSnapshot, Project, ProofBundle, ScopeLease, ScopeViolation,
+    MergeQueueItem, PreparedMasterplanSnapshot, Project, ProjectContextPack, ProofBundle, ScopeLease, ScopeViolation,
     Task, TaskAttempt, TaskDependency, TaskDetails, TaskState, TaskStep, TaskSubstate,
     VerificationResult, VerificationRun,
 };
@@ -1290,13 +1290,9 @@ impl CoordinatorEngine {
         Ok(())
     }
 
-    pub fn get_context_pack(&self, project_id: &str, task_id: &str) -> Result<ContextPack, String> {
-        let task = self.get_task(task_id)?;
-        if task.project_id != project_id {
-            return Err(format!("Task '{}' belongs to project '{}', not '{}'", task_id, task.project_id, project_id));
-        }
-
-        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
+    pub fn get_project_context(&self, project_id: &str) -> Result<ProjectContextPack, String> {
+        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id)
+            .ok_or_else(|| format!("Project '{}' not found", project_id))?;
 
         let conn = self.db.lock();
 
@@ -1333,7 +1329,27 @@ impl CoordinatorEngine {
             .flatten()
             .collect();
 
-        // 4. Steps & Criteria
+        Ok(ProjectContextPack {
+            project_id: proj.id,
+            project_name: proj.name,
+            contract_hash,
+            contract_overview,
+            project_rules,
+            project_memory,
+        })
+    }
+
+    pub fn get_context_pack(&self, project_id: &str, task_id: &str) -> Result<ContextPack, String> {
+        let task = self.get_task(task_id)?;
+        if task.project_id != project_id {
+            return Err(format!("Task '{}' belongs to project '{}', not '{}'", task_id, task.project_id, project_id));
+        }
+
+        let proj_ctx = self.get_project_context(project_id)?;
+
+        let conn = self.db.lock();
+
+        // Steps & Criteria
         let mut stmt_steps = conn.prepare("SELECT id, task_id, order_index, title, description, is_mandatory, status, completed_at FROM task_steps WHERE task_id = ?1 ORDER BY order_index ASC").map_err(|e| e.to_string())?;
         let steps: Vec<TaskStep> = stmt_steps.query_map([task_id], |r| {
             Ok(TaskStep { id: r.get(0)?, task_id: r.get(1)?, order_index: r.get(2)?, title: r.get(3)?, description: r.get(4)?, is_mandatory: r.get(5)?, status: r.get(6)?, completed_at: r.get(7)? })
@@ -1344,23 +1360,23 @@ impl CoordinatorEngine {
             Ok(AcceptanceCriteria { id: r.get(0)?, task_id: r.get(1)?, criterion: r.get(2)?, is_satisfied: r.get(3)?, is_locked: r.get(4)? })
         }).map_err(|e| e.to_string())?.flatten().collect();
 
-        // 5. Blocking Dependencies
+        // Blocking Dependencies
         let mut stmt_deps = conn.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1 AND dependency_type = 'BLOCKS'").map_err(|e| e.to_string())?;
         let dependencies: Vec<String> = stmt_deps.query_map([task_id], |r| r.get(0)).map_err(|e| e.to_string())?.flatten().collect();
 
-        // 6. Scope Leases
+        // Scope Leases
         let mut stmt_leases = conn.prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let leases: Vec<ScopeLease> = stmt_leases.query_map([task_id], |r| {
             Ok(ScopeLease { id: r.get(0)?, task_id: r.get(1)?, agent_id: r.get(2)?, pattern: r.get(3)?, access_type: r.get(4)?, expires_at: r.get(5)?, created_at: r.get(6)? })
         }).map_err(|e| e.to_string())?.flatten().collect();
 
         Ok(ContextPack {
-            project_id: proj.id,
-            project_name: proj.name,
-            contract_hash,
-            contract_overview,
-            project_rules,
-            project_memory,
+            project_id: proj_ctx.project_id,
+            project_name: proj_ctx.project_name,
+            contract_hash: proj_ctx.contract_hash,
+            contract_overview: proj_ctx.contract_overview,
+            project_rules: proj_ctx.project_rules,
+            project_memory: proj_ctx.project_memory,
             task_id: task.id,
             task_title: task.title,
             task_prompt: task.description,

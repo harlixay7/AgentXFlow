@@ -383,17 +383,23 @@ fn execute_mcp_tool(
         }
 
         "project_context" | "project.context" => {
-            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            if project_id.trim().is_empty() {
+            let project_id_raw = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let task_id_opt = params.get("task_id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+            let project_id = if project_id_raw.trim().is_empty() {
                 let ctx = state.coordinator.get_current_context(None, None)?;
                 if let Some(pid) = ctx.active_project_id {
-                    state.coordinator.get_context_pack(&pid, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+                    pid
                 } else {
-                    Err("Missing required parameter 'project_id'. Query 'project_list' to obtain valid project IDs.".to_string())
+                    return Err("Missing required parameter 'project_id'. Query 'project_list' to obtain valid project IDs.".to_string());
                 }
             } else {
-                state.coordinator.get_context_pack(project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+                project_id_raw.to_string()
+            };
+
+            if let Some(task_id) = task_id_opt {
+                state.coordinator.get_context_pack(&project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+            } else {
+                state.coordinator.get_project_context(&project_id).map(|pc| serde_json::to_value(pc).unwrap())
             }
         }
 
@@ -787,4 +793,84 @@ fn execute_mcp_tool(
 fn get_tool_definitions() -> Vec<serde_json::Value> {
     registry::get_all_tool_definitions()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbPool;
+
+    fn setup_test_mcp_state() -> (Arc<McpServerState>, String, String) {
+        let temp_dir = std::env::temp_dir().join(format!("agentxflow_mcp_unit_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let readme = temp_dir.join("README.md");
+        std::fs::write(&readme, "# Test MCP Project\n").unwrap();
+
+        let run_cmd = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&temp_dir)
+                .output()
+                .expect("Failed to run git command");
+            if !out.status.success() {
+                eprintln!("Git cmd {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            }
+        };
+
+        run_cmd(&["init"]);
+        run_cmd(&["config", "user.name", "AgentXFlow Unit Test"]);
+        run_cmd(&["config", "user.email", "test@agentxflow.local"]);
+        run_cmd(&["add", "README.md"]);
+        run_cmd(&["commit", "-m", "Initial commit"]);
+        run_cmd(&["branch", "-M", "main"]);
+
+        let temp_db = temp_dir.join("test.db");
+        let pool = DbPool::new(&temp_db).expect("Failed to initialize test SQLite pool");
+        let engine = CoordinatorEngine::new(pool);
+        let proj = engine.create_project("Test MCP Project", &temp_dir.to_string_lossy(), "Spec", "main").unwrap();
+        let task = engine.create_task(&proj.id, "Test Task", "Task desc", "HIGH", vec![], vec![]).unwrap();
+
+        let security = SecurityManager::init_or_load(&temp_dir).unwrap();
+        let state = Arc::new(McpServerState {
+            coordinator: engine,
+            security,
+        });
+
+        (state, proj.id, task.id)
+    }
+
+    #[test]
+    fn test_mcp_project_context_without_task_id() {
+        let (state, proj_id, _) = setup_test_mcp_state();
+        let params = serde_json::json!({
+            "project_id": proj_id
+        });
+        let res = execute_mcp_tool(&state, None, "project_context", &params);
+        assert!(res.is_ok(), "project_context without task_id should succeed: {:?}", res);
+        let val = res.unwrap();
+        assert_eq!(val["project_id"], proj_id);
+        assert_eq!(val["project_name"], "Test MCP Project");
+        assert!(val["contract_hash"].is_string());
+        assert!(val["project_rules"].is_array());
+        assert!(!val["project_rules"].as_array().unwrap().is_empty());
+        assert!(val.get("task_id").is_none());
+    }
+
+    #[test]
+    fn test_mcp_project_context_with_task_id() {
+        let (state, proj_id, task_id) = setup_test_mcp_state();
+        let params = serde_json::json!({
+            "project_id": proj_id,
+            "task_id": task_id
+        });
+        let res = execute_mcp_tool(&state, None, "project_context", &params);
+        assert!(res.is_ok(), "project_context with task_id should succeed: {:?}", res);
+        let val = res.unwrap();
+        assert_eq!(val["project_id"], proj_id);
+        assert_eq!(val["task_id"], task_id);
+        assert_eq!(val["task_title"], "Test Task");
+        assert_eq!(val["task_prompt"], "Task desc");
+    }
+}
+
 

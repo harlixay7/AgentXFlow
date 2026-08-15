@@ -242,5 +242,36 @@ pub mod tests {
         ]);
         assert!(decomp_res2.is_ok(), "Decomposing after cancelling active task must succeed");
     }
+
+    #[test]
+    fn test_get_project_context_without_task_id() {
+        let (engine, proj_id) = setup_test_engine();
+
+        let ctx = engine.get_project_context(&proj_id).unwrap();
+        assert_eq!(ctx.project_id, proj_id);
+        assert_eq!(ctx.project_name, "Test Unit Project");
+        assert!(!ctx.contract_hash.is_empty());
+        assert_eq!(ctx.contract_overview, "Spec");
+        assert!(!ctx.project_rules.is_empty());
+        assert!(ctx.project_rules[0].contains("Git worktrees"));
+    }
+
+    #[test]
+    fn test_get_context_pack_with_task_id() {
+        let (engine, proj_id) = setup_test_engine();
+        let task = engine.create_task(&proj_id, "Task A", "Task Prompt", "HIGH", vec![
+            ("Step 1".into(), "Do step 1".into(), true),
+        ], vec!["Criterion 1".into()]).unwrap();
+
+        let pack = engine.get_context_pack(&proj_id, &task.id).unwrap();
+        assert_eq!(pack.project_id, proj_id);
+        assert_eq!(pack.project_name, "Test Unit Project");
+        assert_eq!(pack.task_id, task.id);
+        assert_eq!(pack.task_title, "Task A");
+        assert_eq!(pack.task_prompt, "Task Prompt");
+        assert_eq!(pack.required_steps.len(), 1);
+        assert_eq!(pack.acceptance_criteria.len(), 1);
+    }
 }
+
 

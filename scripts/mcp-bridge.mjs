@@ -422,6 +422,40 @@ function handleOfflineRead(toolName, args) {
       const rows = db.prepare('SELECT id, name, root_path, target_branch, created_at FROM projects').all();
       return rows;
     }
+    case 'project_context': {
+      const proj = db.prepare('SELECT id, name, master_spec FROM projects WHERE id = ?').get(args.project_id);
+      if (!proj) throw new Error(`Project '${args.project_id}' not found`);
+      const contract = db.prepare('SELECT contract_hash, overview FROM project_contracts WHERE project_id = ? ORDER BY version DESC LIMIT 1').get(args.project_id);
+      const rules = db.prepare('SELECT rule_text FROM project_rules WHERE project_id = ? ORDER BY created_at ASC').all(args.project_id).map((r) => r.rule_text);
+      const memory = db.prepare('SELECT content FROM project_memory WHERE project_id = ? ORDER BY created_at DESC').all(args.project_id).map((r) => r.content);
+      if (args.task_id) {
+        const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(args.task_id);
+        const steps = db.prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY sequence_order ASC').all(args.task_id);
+        const criteria = db.prepare('SELECT * FROM acceptance_criteria WHERE task_id = ?').all(args.task_id);
+        return {
+          project_id: proj.id,
+          project_name: proj.name,
+          contract_hash: contract ? contract.contract_hash : '',
+          contract_overview: contract ? contract.overview : proj.master_spec,
+          project_rules: rules,
+          project_memory: memory,
+          task_id: task ? task.id : args.task_id,
+          task_title: task ? task.title : '',
+          task_prompt: task ? task.description : '',
+          task_state: task ? task.state : '',
+          acceptance_criteria: criteria,
+          required_steps: steps,
+        };
+      }
+      return {
+        project_id: proj.id,
+        project_name: proj.name,
+        contract_hash: contract ? contract.contract_hash : '',
+        contract_overview: contract ? contract.overview : proj.master_spec,
+        project_rules: rules,
+        project_memory: memory,
+      };
+    }
     case 'masterplan_list': {
       const plans = db.prepare('SELECT p.id as project_id, p.name, m.status, m.version FROM projects p LEFT JOIN masterplans m ON m.project_id = p.id').all();
       return plans;

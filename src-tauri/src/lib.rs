@@ -23,7 +23,7 @@ use crate::git::RepoInspectionResult;
 use crate::mcp::McpServer;
 use crate::models::{
     Agent, CollisionRisk, ContextPack, EventItem, IntegrationAttempt, Masterplan,
-    MasterplanStep, MergeQueueItem, Project, ScopeLease, Task, TaskDependency, TaskDetails,
+    MasterplanStep, MergeQueueItem, Project, ProjectContextPack, ScopeLease, Task, TaskDependency, TaskDetails,
     TaskStep, VerificationResult,
 };
 use crate::security::SecurityManager;
@@ -259,6 +259,14 @@ fn get_events_after(
     last_sequence: i64,
 ) -> Result<Vec<EventItem>, String> {
     state.coordinator.get_events_after(last_sequence)
+}
+
+#[tauri::command]
+fn get_project_context(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<ProjectContextPack, String> {
+    state.coordinator.get_project_context(&project_id)
 }
 
 #[tauri::command]
@@ -552,6 +560,7 @@ pub fn run() {
             process_next_merge,
             reconcile_task,
             get_events_after,
+            get_project_context,
             get_context_pack,
             register_agent,
             unregister_agent,

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.1] - 2026-08-15
+
+### Fixed
+- **MCP `project_context` Dispatcher Fix for Fresh Agent Workflows**:
+  - Resolved workflow bug where calling `project_context` without an optional `task_id` failed by attempting to query a task with an empty string (`""`).
+  - Added dedicated `get_project_context(&project_id)` engine method returning `ProjectContextPack` containing project contract hash, overview, memory, and mandatory rules.
+  - Retained full task-level context packing when `task_id` is supplied.
+  - Added offline SQLite fallback support for `project_context` in `scripts/mcp-bridge.mjs`.
+  - Added unit, regression, and E2E MCP test suites for `project_context` with and without `task_id`.
+
+---
+
 ## [0.4.0] - 2026-08-15
 
 ### Added

@@ -465,6 +465,16 @@ pub struct VerificationResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectContextPack {
+    pub project_id: String,
+    pub project_name: String,
+    pub contract_hash: String,
+    pub contract_overview: String,
+    pub project_rules: Vec<String>,
+    pub project_memory: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextPack {
     pub project_id: String,
     pub project_name: String,
