@@ -128,10 +128,10 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
           {/* Live Active Agent Counter */}
           <div
             style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, fontFamily: 'var(--font-mono)', padding: '2px 8px', backgroundColor: 'var(--bg-input)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}
-            title="Active agent connections communicating with internal MCP 2026 gateway (127.0.0.1:7890)"
+            title="Active agent connections communicating with internal MCP gateway (127.0.0.1:7890)"
           >
-            <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: agents.some((a) => a.status === 'WORKING') ? 'var(--accent-yellow)' : 'var(--accent-green)' }} />
-            <span>{agents.filter((a) => a.status === 'WORKING').length}/{agents.length} Agents</span>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: agents.some((a) => a.status === 'WORKING') ? 'var(--accent-blue)' : agents.some(a => a.status === 'IDLE') ? 'var(--accent-green)' : 'var(--text-muted)' }} />
+            <span>{agents.filter((a) => a.status === 'WORKING').length} Working · {agents.filter((a) => a.status === 'IDLE').length} Idle</span>
           </div>
         </div>
       </header>

@@ -272,6 +272,43 @@ pub mod tests {
         assert_eq!(pack.required_steps.len(), 1);
         assert_eq!(pack.acceptance_criteria.len(), 1);
     }
+
+    #[test]
+    fn test_dynamic_agent_status_and_unclaim() {
+        let (engine, proj_id) = setup_test_engine();
+        let agent = engine.register_agent("Antigravity", "IDE").unwrap();
+
+        // 1. Initial status with 0 tasks should be IDLE
+        let agents = engine.list_agents().unwrap();
+        let ag = agents.iter().find(|a| a.id == agent.id).unwrap();
+        assert_eq!(ag.status, "IDLE");
+        assert_eq!(ag.active_task_id, None);
+
+        // 2. Prepare masterplan and claim chunk -> status becomes WORKING
+        let raw_plan = "# Step 1: Alpha\nDesc Alpha\n# Step 2: Beta\nDesc Beta";
+        engine.prepare_masterplan(&proj_id, raw_plan, 2, 2).unwrap();
+        let chunk = engine.claim_masterplan_chunk(&proj_id, &agent.id, Some(2)).unwrap();
+
+        let agents_working = engine.list_agents().unwrap();
+        let ag_working = agents_working.iter().find(|a| a.id == agent.id).unwrap();
+        assert_eq!(ag_working.status, "WORKING");
+        assert_eq!(ag_working.active_task_id, Some(chunk.id.clone()));
+
+        // 3. Unclaim agent tasks -> reverts steps to PENDING and returns agent to IDLE
+        let unclaimed = engine.unclaim_agent_tasks(&agent.id).unwrap();
+        assert_eq!(unclaimed.len(), 1);
+        assert_eq!(unclaimed[0], chunk.id);
+
+        let agents_idle = engine.list_agents().unwrap();
+        let ag_idle = agents_idle.iter().find(|a| a.id == agent.id).unwrap();
+        assert_eq!(ag_idle.status, "IDLE");
+        assert_eq!(ag_idle.active_task_id, None);
+
+        // Verify masterplan steps are PENDING again
+        let steps = engine.list_masterplan_steps(&proj_id).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert!(steps.iter().all(|s| s.status == "PENDING"));
+    }
 }
 
 

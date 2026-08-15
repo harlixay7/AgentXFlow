@@ -167,6 +167,18 @@ export const coordinatorApi = {
     return await invoke('list_agents');
   },
 
+  async unregisterAgent(agentId: string): Promise<void> {
+    return await invoke('unregister_agent', { agentId });
+  },
+
+  async unclaimAgentTasks(agentId: string): Promise<string[]> {
+    return await invoke('unclaim_agent_tasks', { agentId });
+  },
+
+  async forceAgentIdle(agentId: string): Promise<void> {
+    return await invoke('force_agent_idle', { agentId });
+  },
+
   async listAllMasterplans(): Promise<import('../types').MasterplanSummary[]> {
     if (!isTauri) return [];
     return await invoke('list_all_masterplans');

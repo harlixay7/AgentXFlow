@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.3] - 2026-08-16
+
+### Added
+- **Dynamic Agent State Engine**:
+  - Automatically derives live agent status (`WORKING`, `IDLE`, `DISCONNECTED`) based on active in-flight task assignments (`RUNNING` / `VERIFYING`) and a 120-second liveness threshold.
+  - Adds `active_task_id`, `active_task_title`, and `last_seen_seconds` to the `Agent` model.
+- **Transparent MCP Activity Heartbeats**:
+  - Automatically touches agent session timestamps and heartbeats on every inbound MCP tool call without requiring agents to run background heartbeat timers.
+- **Interactive Step Unclaiming & Worktree Cleanup UI**:
+  - **Agent Management View**: Added live color indicators (🟢 IDLE, 🔵 WORKING, ⚪ DISCONNECTED), last seen timers ("Active 5s ago", "Seen 3m ago"), and 1-click **"Unclaim Steps"** & **"Force Idle"** controls.
+  - **Masterplan Hub View**: Added agent indicators on claimed chunk cards, inline 1-click **"Unclaim"** buttons for individual steps, and a batch **"Unclaim All (N)"** button to instantly release stale in-flight work back to `PENDING`.
+- **Coordinator Engine & IPC Extensions**:
+  - Added `unclaim_agent_tasks` and `force_agent_idle` core methods and exposed them via Tauri IPC and MCP tools (`unclaim_agent_tasks`, `force_agent_idle`).
+
+---
+
 ## [0.4.2] - 2026-08-15
 
 ### Added

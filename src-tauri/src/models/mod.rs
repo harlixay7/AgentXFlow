@@ -264,6 +264,12 @@ pub struct Agent {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

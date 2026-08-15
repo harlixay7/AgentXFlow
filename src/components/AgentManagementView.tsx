@@ -114,79 +114,201 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
         </div>
       ) : (
         /* Agent Cards Grid */
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
-          {agents.map((a) => (
-            <div
-              key={a.id}
-              style={{
-                backgroundColor: 'var(--bg-surface)',
-                border: '1px solid var(--border-medium)',
-                borderRadius: 'var(--radius-md)',
-                padding: 14,
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 10,
-                position: 'relative',
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <Bot size={16} style={{ color: 'var(--accent-blue)' }} />
-                  <div>
-                    <div style={{ fontWeight: 700, fontSize: 12 }}>{a.name}</div>
-                    <div style={{ color: 'var(--text-muted)', fontSize: 10 }}>Type: {a.agent_type}</div>
-                  </div>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span className={`badge ${a.status === 'WORKING' ? 'badge-RUNNING' : 'badge-READY'}`}>{a.status}</span>
-                  <button
-                    className="btn btn-secondary"
-                    style={{
-                      height: 24,
-                      width: 24,
-                      padding: 0,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      color: 'var(--accent-red)',
-                      borderColor: 'rgba(248, 81, 73, 0.3)',
-                    }}
-                    onClick={() => handleRemoveAgent(a.id, a.name)}
-                    disabled={deletingId === a.id}
-                    title="Remove this agent and release its scope locks"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                </div>
-              </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
+          {agents.map((a) => {
+            const isWorking = a.status === 'WORKING';
+            const isDisconnected = a.status === 'DISCONNECTED';
+            const isIdle = a.status === 'IDLE';
 
-              <div style={{ padding: 8, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 10 }}>
-                <div style={{ color: 'var(--text-muted)', marginBottom: 4, fontWeight: 600 }}>ASSIGNED PROFILE</div>
-                <div style={{ color: 'var(--accent-blue)', fontWeight: 600 }}>{a.profile || 'Implementer'}</div>
-              </div>
+            const formatLastSeen = () => {
+              if (a.last_seen_seconds === undefined || a.last_seen_seconds === null) return 'Active';
+              if (a.last_seen_seconds < 10) return 'Active just now';
+              if (a.last_seen_seconds < 60) return `Active ${a.last_seen_seconds}s ago`;
+              if (a.last_seen_seconds < 3600) return `Seen ${Math.floor(a.last_seen_seconds / 60)}m ago`;
+              return `Seen ${Math.floor(a.last_seen_seconds / 3600)}h ago`;
+            };
 
-              {/* Normalized Capability Set */}
-              <div>
-                <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 4, fontWeight: 600 }}>CAPABILITY SET</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, fontSize: 10 }}>
-                  {Object.entries(a.capabilities || { read_files: true, write_files: true, terminal: true, streaming: true, steering: true, mcp: true }).map(([k, v]) => (
-                    <span
-                      key={k}
+            return (
+              <div
+                key={a.id}
+                style={{
+                  backgroundColor: 'var(--bg-surface)',
+                  border: isWorking
+                    ? '1px solid rgba(88, 166, 255, 0.4)'
+                    : isDisconnected
+                    ? '1px solid rgba(240, 140, 0, 0.3)'
+                    : '1px solid var(--border-medium)',
+                  borderRadius: 'var(--radius-md)',
+                  padding: 14,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 10,
+                  position: 'relative',
+                  boxShadow: isWorking ? '0 0 12px rgba(88, 166, 255, 0.1)' : 'none',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div
                       style={{
-                        padding: '2px 5px',
-                        backgroundColor: 'var(--bg-input)',
-                        border: '1px solid var(--border-subtle)',
-                        borderRadius: 3,
-                        color: v ? 'var(--text-primary)' : 'var(--text-muted)',
+                        width: 28,
+                        height: 28,
+                        borderRadius: 6,
+                        backgroundColor: isWorking
+                          ? 'rgba(88, 166, 255, 0.15)'
+                          : isDisconnected
+                          ? 'rgba(139, 148, 158, 0.15)'
+                          : 'rgba(63, 185, 80, 0.15)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: isWorking
+                          ? 'var(--accent-blue)'
+                          : isDisconnected
+                          ? 'var(--text-muted)'
+                          : 'var(--accent-green)',
                       }}
                     >
-                      {k}
+                      <Bot size={16} />
+                    </div>
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        {a.name}
+                        <span
+                          style={{
+                            width: 6,
+                            height: 6,
+                            borderRadius: '50%',
+                            backgroundColor: isWorking
+                              ? 'var(--accent-blue)'
+                              : isDisconnected
+                              ? 'var(--text-muted)'
+                              : 'var(--accent-green)',
+                            display: 'inline-block',
+                          }}
+                        />
+                      </div>
+                      <div style={{ color: 'var(--text-muted)', fontSize: 10 }}>
+                        {a.agent_type} · <span style={{ color: isDisconnected ? 'var(--accent-yellow)' : 'var(--text-secondary)' }}>{formatLastSeen()}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span
+                      className={`badge ${
+                        isWorking ? 'badge-RUNNING' : isDisconnected ? 'badge-CANCELLED' : 'badge-READY'
+                      }`}
+                      style={{ fontSize: 10 }}
+                    >
+                      {a.status}
                     </span>
-                  ))}
+                    <button
+                      className="btn btn-secondary"
+                      style={{
+                        height: 24,
+                        width: 24,
+                        padding: 0,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: 'var(--accent-red)',
+                        borderColor: 'rgba(248, 81, 73, 0.3)',
+                      }}
+                      onClick={() => handleRemoveAgent(a.id, a.name)}
+                      disabled={deletingId === a.id}
+                      title="Remove this agent and release its session"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Active in-flight Task Info */}
+                {a.active_task_id && (
+                  <div
+                    style={{
+                      padding: '8px 10px',
+                      backgroundColor: 'rgba(88, 166, 255, 0.08)',
+                      border: '1px solid rgba(88, 166, 255, 0.2)',
+                      borderRadius: 'var(--radius-sm)',
+                      fontSize: 11,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 4,
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--accent-blue)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                        Current In-Flight Task
+                      </span>
+                      <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>
+                        {a.active_task_id.slice(0, 8)}...
+                      </span>
+                    </div>
+                    <div style={{ fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {a.active_task_title || a.active_task_id}
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ padding: 8, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 10 }}>
+                  <div style={{ color: 'var(--text-muted)', marginBottom: 4, fontWeight: 600 }}>ASSIGNED PROFILE</div>
+                  <div style={{ color: 'var(--accent-blue)', fontWeight: 600 }}>{a.profile || 'Implementer'}</div>
+                </div>
+
+                {/* Interactive State Recovery Controls */}
+                <div style={{ display: 'flex', gap: 6, paddingTop: 4, borderTop: '1px solid var(--border-subtle)' }}>
+                  {a.active_task_id && (
+                    <button
+                      className="btn btn-secondary"
+                      style={{
+                        flex: 1,
+                        height: 26,
+                        fontSize: 10,
+                        color: 'var(--accent-yellow)',
+                        borderColor: 'rgba(240, 140, 0, 0.3)',
+                      }}
+                      onClick={async () => {
+                        if (window.confirm(`Unclaim all in-flight tasks for ${a.name}? Steps will revert to PENDING and worktrees will be cleaned up.`)) {
+                          try {
+                            await invoke('unclaim_agent_tasks', { agentId: a.id });
+                            onRefresh();
+                          } catch (err) {
+                            alert(`Failed to unclaim tasks: ${err}`);
+                          }
+                        }
+                      }}
+                      title="Revert all in-flight steps back to PENDING and clean up isolated worktree"
+                    >
+                      Unclaim Steps
+                    </button>
+                  )}
+                  {(!isIdle || isDisconnected) && (
+                    <button
+                      className="btn btn-secondary"
+                      style={{
+                        flex: 1,
+                        height: 26,
+                        fontSize: 10,
+                      }}
+                      onClick={async () => {
+                        try {
+                          await invoke('force_agent_idle', { agentId: a.id });
+                          onRefresh();
+                        } catch (err) {
+                          alert(`Failed to reset agent: ${err}`);
+                        }
+                      }}
+                      title="Reset agent status to IDLE and unclaim any orphaned work"
+                    >
+                      Force Idle
+                    </button>
+                  )}
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

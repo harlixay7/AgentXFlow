@@ -1336,6 +1336,38 @@ Instructions:
                 <Play size={13} />
                 {isClaiming ? 'Claiming...' : 'Manual Claim Chunk'}
               </button>
+
+              {claimedSteps > 0 && (
+                <button
+                  onClick={async () => {
+                    if (window.confirm(`Unclaim all ${claimedSteps} active step(s)? All in-flight chunk tasks will be cancelled, worktrees cleaned, and steps reverted to PENDING.`)) {
+                      try {
+                        const activeTasks = Array.from(new Set(steps.filter(s => s.claimed_task_id && s.status !== 'COMPLETED').map(s => s.claimed_task_id!)));
+                        for (const tid of activeTasks) {
+                          await coordinatorApi.requeueTask(tid);
+                        }
+                        await fetchAllPlans();
+                        onRefreshTasks();
+                      } catch (err) {
+                        alert(`Failed to unclaim steps: ${err}`);
+                      }
+                    }
+                  }}
+                  className="btn btn-secondary"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    fontSize: '0.8rem',
+                    padding: '0.35rem 0.75rem',
+                    color: 'var(--accent-yellow)',
+                    borderColor: 'rgba(240, 140, 0, 0.4)',
+                  }}
+                  title="Revert all currently claimed steps back to PENDING"
+                >
+                  Unclaim All ({claimedSteps})
+                </button>
+              )}
             </div>
           </div>
 
@@ -1392,7 +1424,7 @@ Instructions:
                   </div>
                 </div>
 
-                <div>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.4rem' }}>
                   <span
                     className="badge"
                     style={{
@@ -1418,6 +1450,37 @@ Instructions:
                   >
                     {s.status}
                   </span>
+                  {s.claimed_agent_id && (
+                    <span style={{ fontSize: '0.7rem', color: 'var(--accent-blue)', fontWeight: 600 }}>
+                      Agent: {s.claimed_agent_id}
+                    </span>
+                  )}
+                  {s.claimed_task_id && s.status !== 'COMPLETED' && (
+                    <button
+                      className="btn btn-secondary"
+                      style={{
+                        height: 22,
+                        padding: '0 6px',
+                        fontSize: '0.7rem',
+                        color: 'var(--accent-yellow)',
+                        borderColor: 'rgba(240, 140, 0, 0.3)',
+                      }}
+                      onClick={async () => {
+                        if (window.confirm(`Unclaim step #${s.step_index}? It will revert to PENDING, releasing locks and worktrees.`)) {
+                          try {
+                            await coordinatorApi.requeueTask(s.claimed_task_id!);
+                            await fetchAllPlans();
+                            onRefreshTasks();
+                          } catch (err) {
+                            alert(`Failed to unclaim step: ${err}`);
+                          }
+                        }
+                      }}
+                      title="Revert this step back to PENDING and release worktree/locks"
+                    >
+                      Unclaim
+                    </button>
+                  )}
                 </div>
               </div>
             ))}

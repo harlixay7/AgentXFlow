@@ -609,6 +609,9 @@ impl CoordinatorEngine {
                         last_heartbeat: r.get(5)?,
                         created_at: r.get(6)?,
                         session_token: None,
+                        active_task_id: Some(task_id.to_string()),
+                        active_task_title: Some(task.title.clone()),
+                        last_seen_seconds: None,
                     })
                 },
             ).ok()
@@ -1139,6 +1142,9 @@ impl CoordinatorEngine {
             last_heartbeat: now_str.clone(),
             created_at: now_str,
             session_token: Some(session_token),
+            active_task_id: None,
+            active_task_title: None,
+            last_seen_seconds: Some(0),
         };
 
         drop(conn);
@@ -1173,6 +1179,9 @@ impl CoordinatorEngine {
                     last_heartbeat: row.get(5)?,
                     created_at: row.get(6)?,
                     session_token: Some(token.to_string()),
+                    active_task_id: None,
+                    active_task_title: None,
+                    last_seen_seconds: None,
                 })
             })
             .ok();
@@ -1218,6 +1227,23 @@ impl CoordinatorEngine {
         Ok(())
     }
 
+    pub fn touch_agent_activity(&self, agent_id: &str) {
+        if agent_id.trim().is_empty() {
+            return;
+        }
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
+        let conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
+            rusqlite::params![now, agent_id, canonical_id],
+        ).ok();
+        conn.execute(
+            "UPDATE agent_sessions SET last_activity_at = ?1 WHERE agent_id = ?2 OR agent_id = ?3",
+            rusqlite::params![now, agent_id, canonical_id],
+        ).ok();
+    }
+
     pub fn list_agents(&self) -> Result<Vec<Agent>, String> {
         let conn = self.db.lock();
         let mut stmt = conn
@@ -1236,25 +1262,105 @@ impl CoordinatorEngine {
                     last_heartbeat: row.get(5)?,
                     created_at: row.get(6)?,
                     session_token: None,
+                    active_task_id: None,
+                    active_task_title: None,
+                    last_seen_seconds: None,
                 })
             })
             .map_err(|e| e.to_string())?;
 
-        let mut res = Vec::new();
-        for r in rows.flatten() {
-            res.push(r);
+        let mut raw_agents: Vec<Agent> = rows.flatten().collect();
+        let now = Utc::now();
+
+        // Dynamically evaluate live status and in-flight tasks for each agent
+        for agent in &mut raw_agents {
+            let last_dt = chrono::DateTime::parse_from_rfc3339(&agent.last_heartbeat)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now);
+            let elapsed_secs = (now - last_dt).num_seconds().max(0);
+            agent.last_seen_seconds = Some(elapsed_secs);
+
+            // Query active in-flight task assigned to this agent (canonical ID or raw ID)
+            let active_task: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT id, title FROM tasks WHERE (assigned_agent_id = ?1 OR assigned_agent_id = ?2) AND state IN ('RUNNING', 'VERIFYING') AND is_stale = 0 ORDER BY updated_at DESC LIMIT 1",
+                    [&agent.id, &agent.name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+
+            if let Some((t_id, t_title)) = active_task {
+                agent.active_task_id = Some(t_id);
+                agent.active_task_title = Some(t_title);
+                if elapsed_secs > 120 {
+                    // Silent > 2 minutes with in-flight task
+                    agent.status = "DISCONNECTED".to_string();
+                } else {
+                    agent.status = "WORKING".to_string();
+                }
+            } else if elapsed_secs > 120 {
+                agent.status = "DISCONNECTED".to_string();
+            } else {
+                agent.status = "IDLE".to_string();
+            }
         }
-        Ok(res)
+
+        Ok(raw_agents)
     }
 
     pub fn unregister_agent(&self, agent_id: &str) -> Result<(), String> {
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
         let conn = self.db.lock();
-        conn.execute("UPDATE tasks SET assigned_agent_id = NULL WHERE assigned_agent_id = ?1", [agent_id]).ok();
-        conn.execute("DELETE FROM scope_leases WHERE agent_id = ?1", [agent_id]).ok();
-        conn.execute("DELETE FROM agents WHERE id = ?1", [agent_id]).map_err(|e| e.to_string())?;
+        conn.execute("UPDATE tasks SET assigned_agent_id = NULL WHERE assigned_agent_id = ?1 OR assigned_agent_id = ?2", [agent_id, &canonical_id]).ok();
+        conn.execute("DELETE FROM scope_leases WHERE agent_id = ?1 OR agent_id = ?2", [agent_id, &canonical_id]).ok();
+        conn.execute("DELETE FROM agents WHERE id = ?1 OR id = ?2", [agent_id, &canonical_id]).map_err(|e| e.to_string())?;
         drop(conn);
 
         self.emit_event(None, None, Some(agent_id), "AGENT_UNREGISTERED", json!({ "agent_id": agent_id }));
+        Ok(())
+    }
+
+    /// Safely unclaims all active tasks for an agent: reverts masterplan steps to PENDING, releases scopes, and cleans worktrees
+    pub fn unclaim_agent_tasks(&self, agent_id: &str) -> Result<Vec<String>, String> {
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM tasks WHERE (assigned_agent_id = ?1 OR assigned_agent_id = ?2) AND state IN ('RUNNING', 'VERIFYING') AND is_stale = 0")
+            .map_err(|e| e.to_string())?;
+
+        let task_ids: Vec<String> = stmt
+            .query_map([agent_id, &canonical_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        drop(stmt);
+        drop(conn);
+
+        let mut unassigned = Vec::new();
+        for tid in &task_ids {
+            if let Ok(cancelled_task) = self.cancel_task(tid, Some(agent_id), Some("Reclaimed to masterplan pending backlog by user/coordinator")) {
+                unassigned.push(cancelled_task.id);
+            }
+        }
+
+        self.emit_event(None, None, Some(agent_id), "AGENT_TASKS_UNCLAIMED", json!({ "agent_id": agent_id, "reclaimed_tasks": unassigned }));
+        Ok(unassigned)
+    }
+
+    /// Forces an agent to IDLE state, unclaiming any active tasks and resetting heartbeat
+    pub fn force_agent_idle(&self, agent_id: &str) -> Result<(), String> {
+        let _ = self.unclaim_agent_tasks(agent_id);
+        let conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
+
+        conn.execute(
+            "UPDATE agents SET status = 'IDLE', last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
+            rusqlite::params![now, agent_id, canonical_id],
+        ).map_err(|e| e.to_string())?;
+
+        drop(conn);
+        self.emit_event(None, None, Some(agent_id), "AGENT_STATUS_CHANGED", json!({ "agent_id": agent_id, "status": "IDLE" }));
         Ok(())
     }
 
@@ -1262,22 +1368,24 @@ impl CoordinatorEngine {
         if agent_id.trim().is_empty() {
             return false;
         }
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
         let conn = self.db.lock();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [agent_id], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1 OR id = ?2", [agent_id, &canonical_id], |r| r.get(0))
             .unwrap_or(0);
         count > 0
     }
 
     pub fn agent_heartbeat(&self, agent_id: &str) -> Result<(), String> {
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
         let conn = self.db.lock();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let expires_str = (now + chrono::Duration::hours(4)).to_rfc3339();
 
         let updated = conn.execute(
-            "UPDATE agents SET last_heartbeat = ?1, status = 'WORKING' WHERE id = ?2",
-            params![now_str, agent_id],
+            "UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
+            rusqlite::params![now_str, agent_id, canonical_id],
         ).map_err(|e| e.to_string())?;
 
         if updated == 0 {
@@ -1285,8 +1393,9 @@ impl CoordinatorEngine {
         }
 
         // Transactionally renew active scope leases for this agent
-        conn.execute("UPDATE scope_leases SET expires_at = ?1 WHERE agent_id = ?2", params![expires_str, agent_id]).ok();
+        conn.execute("UPDATE scope_leases SET expires_at = ?1 WHERE agent_id = ?2 OR agent_id = ?3", params![expires_str, agent_id, canonical_id]).ok();
 
+        drop(conn);
         Ok(())
     }
 

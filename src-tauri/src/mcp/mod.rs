@@ -338,6 +338,13 @@ fn execute_mcp_tool(
     tool_name: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    // Transparent activity heartbeat: refresh liveness for caller whenever an agent is resolved
+    if let Some(agent) = caller_agent {
+        state.coordinator.touch_agent_activity(&agent.id);
+    } else if let Some(raw_aid) = params.get("agent_id").and_then(|v| v.as_str()).or_else(|| params.get("caller_agent_id").and_then(|v| v.as_str())) {
+        state.coordinator.touch_agent_activity(raw_aid);
+    }
+
     let resolve_agent_id = |req_id: &str| -> Result<String, String> {
         if let Some(agent) = caller_agent {
             if !req_id.is_empty() && req_id != agent.id {
@@ -807,6 +814,25 @@ fn execute_mcp_tool(
                 }
                 Err(e) => Err(format!("Invalid step array format: {}. Expected [{{ 'step_index': 1, 'title': '...', 'description': '...' }}]", e)),
             }
+        }
+
+        "unclaim_agent_tasks" | "agent.unclaim_tasks" => {
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.unclaim_agent_tasks(&agent_id).map(|tasks| serde_json::json!({
+                "status": "UNCLAIMED",
+                "agent_id": agent_id,
+                "reclaimed_tasks": tasks
+            }))
+        }
+
+        "force_agent_idle" | "agent.force_idle" => {
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.force_agent_idle(&agent_id).map(|_| serde_json::json!({
+                "status": "IDLE",
+                "agent_id": agent_id
+            }))
         }
 
         _ => Err(format!("Unknown MCP tool: '{}'. Call tools/list to see available methods.", tool_name)),

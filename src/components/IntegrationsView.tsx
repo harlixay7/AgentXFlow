@@ -297,7 +297,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', gap: 6, userSelect: 'text' }}>
                   <span>{ag.agent_type}</span>
                   <span>•</span>
-                  <span style={{ color: ag.status === 'WORKING' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{ag.status}</span>
+                  <span style={{ color: ag.status === 'WORKING' ? 'var(--accent-blue)' : ag.status === 'IDLE' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{ag.status}</span>
                 </div>
               </div>
             </div>

@@ -301,6 +301,22 @@ fn list_agents(state: State<'_, Arc<AppState>>) -> Result<Vec<Agent>, String> {
 }
 
 #[tauri::command]
+fn unclaim_agent_tasks(
+    state: State<'_, Arc<AppState>>,
+    agent_id: String,
+) -> Result<Vec<String>, String> {
+    state.coordinator.unclaim_agent_tasks(&agent_id)
+}
+
+#[tauri::command]
+fn force_agent_idle(
+    state: State<'_, Arc<AppState>>,
+    agent_id: String,
+) -> Result<(), String> {
+    state.coordinator.force_agent_idle(&agent_id)
+}
+
+#[tauri::command]
 fn create_or_update_masterplan(
     state: State<'_, Arc<AppState>>,
     project_id: String,
@@ -565,6 +581,8 @@ pub fn run() {
             register_agent,
             unregister_agent,
             list_agents,
+            unclaim_agent_tasks,
+            force_agent_idle,
             create_or_update_masterplan,
             create_masterplan,
             list_masterplans_for_project,
