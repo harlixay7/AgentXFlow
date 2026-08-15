@@ -129,12 +129,31 @@ const TOOLS = [
   },
   {
     name: 'agent_register',
-    description: 'Register an agent session and get an authoritative session token and agent_id.',
+    description: 'Register an agent session with a canonical AI IDE platform and get an authoritative session token and agent_id.',
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Agent name (e.g. Antigravity, Claude Code, Codex)' },
-        agent_type: { type: 'string', description: 'Agent category type' },
+        name: {
+          type: 'string',
+          enum: [
+            'Antigravity',
+            'Claude Code',
+            'Cursor',
+            'OpenCode',
+            'OpenAI Codex',
+            'Gemini CLI',
+            'GitHub Copilot',
+            'Windsurf',
+            'Junie',
+            'Aider',
+          ],
+          description: 'Select your AI IDE / Agent platform',
+        },
+        agent_type: {
+          type: 'string',
+          enum: ['IDE', 'CLI', 'Autonomous Swarm', 'Reviewer', 'Implementer'],
+          description: 'Agent category type',
+        },
       },
       required: ['name'],
     },
@@ -248,8 +267,92 @@ const TOOLS = [
     },
   },
   {
+    name: 'prepare_masterplan',
+    description: 'Atomically save, parse, structure, and prepare a masterplan for agents.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' },
+        raw_text: { type: 'string', description: 'Raw masterplan text' },
+        target_step_count: { type: 'integer', description: 'Target step count' },
+        max_steps_per_agent: { type: 'integer', description: 'Max steps per agent' },
+      },
+      required: ['project_id', 'raw_text'],
+    },
+  },
+  {
+    name: 'task_details',
+    description: 'Get complete task details including steps, acceptance criteria, active scope leases, attempts, and verification results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'task_cancel',
+    description: 'Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Optional agent identifier' },
+        reason: { type: 'string', description: 'Cancellation reason' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'task_requeue',
+    description: 'Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Optional agent identifier' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'task_reconcile',
+    description: 'Reconcile task state, task attempt, proof bundle, and merge queue status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
     name: 'merge_queue_status',
     description: 'List all queued branch merges and their integration statuses.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'merge_enqueue',
+    description: 'Enqueue a verified or MERGE_READY task into the serialized merge queue.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' },
+        task_id: { type: 'string', description: 'Task identifier' },
+      },
+      required: ['project_id', 'task_id'],
+    },
+  },
+  {
+    name: 'merge_process',
+    description: 'Process the next ready serialized branch merge in queue for a project.',
     inputSchema: {
       type: 'object',
       properties: {

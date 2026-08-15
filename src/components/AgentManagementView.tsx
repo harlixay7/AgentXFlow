@@ -235,23 +235,40 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
             <form onSubmit={handleAddAgent} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div>
                 <label style={{ fontSize: 11, color: 'var(--text-secondary)', display: 'block', marginBottom: 4 }}>
-                  Agent / IDE Instance Name
+                  Select Canonical AI IDE / Platform
                 </label>
-                <input
-                  type="text"
+                <select
                   className="input-field"
                   style={{ width: '100%', height: 32, fontSize: 12 }}
-                  placeholder="e.g. Antigravity Lead, Claude Backend, Cursor UI"
                   value={agentName}
-                  onChange={(e) => setAgentName(e.target.value)}
-                  autoFocus
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setAgentName(val);
+                    if (val === 'Antigravity' || val === 'Cursor' || val === 'OpenCode' || val === 'GitHub Copilot' || val === 'Windsurf' || val === 'Junie') {
+                      setAgentType('IDE');
+                    } else {
+                      setAgentType('CLI');
+                    }
+                  }}
                   required
-                />
+                >
+                  <option value="">-- Choose AI IDE / Worker Platform --</option>
+                  <option value="Antigravity">Google Antigravity (IDE)</option>
+                  <option value="Claude Code">Claude Code (CLI)</option>
+                  <option value="Cursor">Cursor (IDE)</option>
+                  <option value="OpenCode">OpenCode (IDE)</option>
+                  <option value="OpenAI Codex">OpenAI Codex (CLI)</option>
+                  <option value="Gemini CLI">Google Gemini CLI (CLI)</option>
+                  <option value="GitHub Copilot">GitHub Copilot / VS Code (IDE)</option>
+                  <option value="Windsurf">Codeium Windsurf (IDE)</option>
+                  <option value="Junie">JetBrains Junie (IDE)</option>
+                  <option value="Aider">Aider (CLI)</option>
+                </select>
               </div>
 
               <div>
                 <label style={{ fontSize: 11, color: 'var(--text-secondary)', display: 'block', marginBottom: 4 }}>
-                  IDE / Tool Type
+                  Agent Runtime Category
                 </label>
                 <select
                   className="input-field"
@@ -259,13 +276,11 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                   value={agentType}
                   onChange={(e) => setAgentType(e.target.value)}
                 >
-                  <option value="Antigravity">Antigravity</option>
-                  <option value="Claude">Claude Code</option>
-                  <option value="Cursor">Cursor</option>
-                  <option value="Codex">Codex CLI</option>
-                  <option value="OpenCode">OpenCode</option>
-                  <option value="Gemini">Gemini</option>
-                  <option value="Custom">Custom Agent</option>
+                  <option value="IDE">IDE (Integrated Desktop Assistant)</option>
+                  <option value="CLI">CLI (Terminal Agent Engine)</option>
+                  <option value="Autonomous Swarm">Autonomous Swarm Worker</option>
+                  <option value="Reviewer">Reviewer / Gatekeeper</option>
+                  <option value="Implementer">Implementer</option>
                 </select>
               </div>
 

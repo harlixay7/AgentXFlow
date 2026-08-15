@@ -258,12 +258,24 @@ impl ScopeManager {
                     detected_at: now_str.clone(),
                     resolved: false,
                 });
-            } else {
-                // If the file is now covered by active scope leases, mark previous violations resolved
-                conn.execute(
-                    "UPDATE scope_violations SET resolved = 1 WHERE task_id = ?1 AND file_path = ?2",
-                    rusqlite::params![task_id, clean],
-                ).ok();
+            }
+        }
+
+        // Auto-resolve any previous violations for files that are either no longer in changed_files or are now covered by scope
+        if let Ok(mut unres_stmt) = conn.prepare("SELECT id, file_path FROM scope_violations WHERE task_id = ?1 AND resolved = 0") {
+            if let Ok(unres_iter) = unres_stmt.query_map([task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                let unres_list: Vec<(String, String)> = unres_iter.flatten().collect();
+                for (v_id, path) in unres_list {
+                    let normalized = path.replace('\\', "/");
+                    let clean = normalized.trim_start_matches("./").trim_start_matches('/').to_string();
+                    let is_still_changed = changed_files.iter().any(|f| {
+                        let f_clean = f.replace('\\', "/").trim_start_matches("./").trim_start_matches('/').to_string();
+                        f_clean == clean
+                    });
+                    if !is_still_changed || globset.is_match(&clean) {
+                        conn.execute("UPDATE scope_violations SET resolved = 1 WHERE id = ?1", [&v_id]).ok();
+                    }
+                }
             }
         }
 

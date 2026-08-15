@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-08-15
+
+### Added
+- **Canonical AI IDE Identity System (Migration 0009)**:
+  - Hardcoded and pre-seeded persistent first-class profiles for all major AI coding platforms: `Antigravity`, `Claude Code`, `Cursor`, `OpenCode`, `OpenAI Codex`, `Gemini CLI`, `GitHub Copilot / VS Code`, `Windsurf`, `Junie`, `Aider`.
+  - Upgraded `agent_register` MCP schema with an explicit enum dropdown.
+  - Normalized agent registration in coordinator core with alias canonicalization, eliminating random UUID duplication.
+- **Masterplan Architectural Decomposition Standard**:
+  - Structured guidelines and blueprint templates in `masterplan_get` for `UNSORTED` specifications.
+  - Mandated project-tailored folder tree structures, exact target file paths, concrete export/interface declarations, non-overlapping scope patterns, and automated verification commands.
+  - Production-grade UI/UX design standards: responsive layouts, clean glassmorphism/modern palettes, zero cliché glowing purple fluff, and zero placeholder stubs.
+- **Chunk Boundary Milestone Handoff Loop**:
+  - Enhanced `task_submit` MCP handler to emit `CHUNK_COMPLETED` with `next_action: "REPORT_TO_USER"` upon verified chunk submission.
+  - Instructs agents to stop calling tools immediately, present a comprehensive walkthrough to the user in their IDE chat, and wait for confirmation before claiming subsequent chunks.
+- **Automated Background Merge Processing & Migration 0007 / 0008**:
+  - Continuous asynchronous merge queue worker loops in Tauri application runtime and headless MCP daemon.
+  - Forward migrations for proof bundle schema normalization and worktree persistence.
+  - Startup database schema integrity verification (`verify_schema_integrity`).
+
+---
+
 ## [0.2.0] - 2026-08-14
 
 ### Added

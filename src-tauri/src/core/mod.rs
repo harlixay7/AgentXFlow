@@ -940,7 +940,7 @@ impl CoordinatorEngine {
             self.enqueue_task_by_id(&task.project_id, task_id)
                 .map_err(|e| format!("Failed to enqueue task in merge queue: {}", e))?;
 
-            // 10. Atomically transition state to MERGE_READY & attempt to VERIFIED
+            // 10. Atomically transition state to MERGE_READY & attempt to VERIFIED & complete masterplan steps
             let conn = self.db.lock();
             conn.execute(
                 "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', head_sha = ?1, updated_at = ?2 WHERE id = ?3",
@@ -951,6 +951,11 @@ impl CoordinatorEngine {
                 "UPDATE task_attempts SET status = 'VERIFIED', head_sha = ?1, finished_at = ?2 WHERE id = ?3",
                 params![head_sha, now_finished, attempt_id],
             ).map_err(|e| format!("Failed to update task attempt status: {}", e))?;
+
+            conn.execute(
+                "UPDATE masterplan_steps SET status = 'COMPLETED', updated_at = ?1 WHERE claimed_task_id = ?2",
+                params![now_finished, task_id],
+            ).ok();
             drop(conn);
 
             self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_VERIFIED", json!({ "head_sha": head_sha }));
@@ -1009,14 +1014,37 @@ impl CoordinatorEngine {
             return Err(format!("No valid proof bundle found for task '{}' at commit HEAD {}. Verification is required.", task_id, head_sha));
         }
 
-        // The queue base is the target branch state observed when this item is
-        // enqueued, not the task's original claim base. Earlier queued merges
-        // are serialized ahead of this item and may have advanced the target
-        // branch in the meantime.
-        let base_sha = self
-            .git
-            .get_ref_sha(repo_path, &proj.target_branch)
-            .or_else(|_| Ok::<String, String>(task.base_sha.unwrap_or_default()))?;
+        // Check if already enqueued in READY state (idempotent)
+        {
+            let conn = self.db.lock();
+            let existing = conn.query_row(
+                "SELECT id, project_id, task_id, branch_name, target_branch, position, status, base_sha, head_sha, queued_at, processed_at
+                 FROM merge_queue WHERE task_id = ?1 AND status = 'READY'",
+                [task_id],
+                |row| {
+                    Ok(crate::models::MergeQueueItem {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        task_id: row.get(2)?,
+                        branch_name: row.get(3)?,
+                        target_branch: row.get(4)?,
+                        position: row.get(5)?,
+                        status: row.get(6)?,
+                        base_sha: row.get(7)?,
+                        head_sha: row.get(8)?,
+                        queued_at: row.get(9)?,
+                        processed_at: row.get(10)?,
+                    })
+                },
+            ).ok();
+            if let Some(item) = existing {
+                return Ok(item);
+            }
+        }
+
+        let base_sha = task.base_sha
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.git.get_ref_sha(repo_path, &proj.target_branch).unwrap_or_default());
 
         let item = self.merge.enqueue_task(
             project_id,
@@ -1038,55 +1066,74 @@ impl CoordinatorEngine {
     }
 
     // --- Agents ---
+    pub fn canonicalize_ide_identity(name: &str, agent_type: &str) -> (String, String, String, String) {
+        let combined = format!("{} {}", name, agent_type).to_lowercase().replace(['_', ' '], "-");
+        if combined.contains("antigravity") || combined.contains("agy") {
+            ("antigravity".into(), "Antigravity".into(), "IDE".into(), "Google Antigravity Advanced Agentic Coding Assistant".into())
+        } else if combined.contains("claude") {
+            ("claude-code".into(), "Claude Code".into(), "CLI".into(), "Anthropic Claude Code Agentic Terminal Engine".into())
+        } else if combined.contains("cursor") {
+            ("cursor".into(), "Cursor".into(), "IDE".into(), "Cursor AI Coding Assistant".into())
+        } else if combined.contains("opencode") {
+            ("opencode".into(), "OpenCode".into(), "IDE".into(), "OpenCode Multi-Agent Orchestrator".into())
+        } else if combined.contains("codex") || combined.contains("openai") {
+            ("codex".into(), "OpenAI Codex".into(), "CLI".into(), "OpenAI Codex Agentic Coding Engine".into())
+        } else if combined.contains("gemini") {
+            ("gemini-cli".into(), "Gemini CLI".into(), "CLI".into(), "Google Gemini Developer CLI".into())
+        } else if combined.contains("copilot") || combined.contains("vscode") {
+            ("copilot".into(), "GitHub Copilot".into(), "IDE".into(), "GitHub Copilot / VS Code Agent".into())
+        } else if combined.contains("windsurf") || combined.contains("codeium") {
+            ("windsurf".into(), "Windsurf".into(), "IDE".into(), "Codeium Windsurf AI Cascade IDE".into())
+        } else if combined.contains("junie") || combined.contains("jetbrains") {
+            ("junie".into(), "Junie".into(), "IDE".into(), "JetBrains Junie AI Assistant".into())
+        } else if combined.contains("aider") {
+            ("aider".into(), "Aider".into(), "CLI".into(), "Aider AI Pair Programmer".into())
+        } else {
+            let clean_id = name.trim().to_lowercase().replace(['_', ' '], "-");
+            let id = if clean_id.is_empty() { "custom-agent".to_string() } else { clean_id };
+            let profile = format!("Custom AI Agent ({})", name);
+            let default_type = if agent_type.trim().is_empty() { "Implementer".to_string() } else { agent_type.to_string() };
+            (id, name.to_string(), default_type, profile)
+        }
+    }
+
     pub fn register_agent(&self, name: &str, agent_type: &str) -> Result<Agent, String> {
+        let (canonical_id, canonical_name, default_type, profile) = Self::canonicalize_ide_identity(name, agent_type);
+        let actual_type = if agent_type.trim().is_empty() || agent_type == "Generic" { default_type } else { agent_type.to_string() };
         let conn = self.db.lock();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let expires_str = (now + chrono::Duration::hours(24)).to_rfc3339();
+        let expires_str = (now + chrono::Duration::days(365)).to_rfc3339();
+        let session_token = format!("axf_sess_{}", canonical_id.replace('-', "_"));
 
-        let existing: Option<(String, String)> = conn
-            .query_row(
-                "SELECT id, session_token FROM agents WHERE name = ?1",
-                [name],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
+        conn.execute(
+            "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at, session_token)
+             VALUES (?1, ?2, ?3, ?4, 'IDLE', ?5, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 agent_type = excluded.agent_type,
+                 profile = excluded.profile,
+                 last_heartbeat = excluded.last_heartbeat,
+                 session_token = excluded.session_token",
+            rusqlite::params![canonical_id, canonical_name, actual_type, profile, now_str, session_token],
+        ).map_err(|e| format!("Failed to register canonical agent: {}", e))?;
 
-        let (id, session_token) = if let Some((existing_id, existing_token)) = existing {
-            // Idempotent: refresh heartbeat, type, and session lease for existing agent
-            conn.execute(
-                "UPDATE agents SET last_heartbeat = ?1, status = 'IDLE', agent_type = ?2 WHERE id = ?3",
-                params![now_str, agent_type, existing_id],
-            ).ok();
-            conn.execute(
-                "UPDATE agent_sessions SET expires_at = ?1, last_activity_at = ?2 WHERE agent_id = ?3",
-                params![expires_str, now_str, existing_id],
-            ).ok();
-            (existing_id, existing_token)
-        } else {
-            let new_id = Uuid::new_v4().to_string();
-            let new_token = format!("axf_sess_{}", Uuid::new_v4().simple());
-            conn.execute(
-                "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at, session_token)
-                 VALUES (?1, ?2, ?3, 'Implementer', 'IDLE', ?4, ?4, ?5)",
-                params![new_id, name, agent_type, now_str, new_token],
-            ).map_err(|e| e.to_string())?;
-
-            let sess_id = Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO agent_sessions (id, agent_id, session_token, created_at, expires_at, last_activity_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
-                params![sess_id, new_id, new_token, now_str, expires_str],
-            ).map_err(|e| e.to_string())?;
-
-            (new_id, new_token)
-        };
+        let sess_id = format!("sess_{}", canonical_id.replace('-', "_"));
+        conn.execute(
+            "INSERT INTO agent_sessions (id, agent_id, session_token, created_at, expires_at, last_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 expires_at = excluded.expires_at,
+                 last_activity_at = excluded.last_activity_at,
+                 session_token = excluded.session_token",
+            rusqlite::params![sess_id, canonical_id, session_token, now_str, expires_str],
+        ).map_err(|e| format!("Failed to register agent session: {}", e))?;
 
         let agent = Agent {
-            id: id.clone(),
-            name: name.to_string(),
-            agent_type: agent_type.to_string(),
-            profile: "Implementer".to_string(),
+            id: canonical_id.clone(),
+            name: canonical_name,
+            agent_type: actual_type.clone(),
+            profile,
             status: "IDLE".to_string(),
             capabilities: AgentCapabilitySet::default(),
             last_heartbeat: now_str.clone(),
@@ -1095,7 +1142,7 @@ impl CoordinatorEngine {
         };
 
         drop(conn);
-        self.emit_event(None, None, Some(&id), "AGENT_REGISTERED", json!({ "name": name, "type": agent_type }));
+        self.emit_event(None, None, Some(&canonical_id), "AGENT_REGISTERED", json!({ "name": agent.name, "type": actual_type, "id": canonical_id }));
         Ok(agent)
     }
 

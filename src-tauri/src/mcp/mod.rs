@@ -348,7 +348,10 @@ fn execute_mcp_tool(
             }
             Ok(agent.id.clone())
         } else if !req_id.is_empty() {
-            if state.coordinator.is_agent_registered(req_id) {
+            let (canon_id, ..) = crate::core::CoordinatorEngine::canonicalize_ide_identity(req_id, "");
+            if state.coordinator.is_agent_registered(&canon_id) {
+                Ok(canon_id)
+            } else if state.coordinator.is_agent_registered(req_id) {
                 Ok(req_id.to_string())
             } else {
                 Err(format!(
@@ -511,7 +514,42 @@ fn execute_mcp_tool(
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id = resolve_agent_id(raw_agent_id)?;
-            state.coordinator.submit_task(task_id, &agent_id).map(|res| serde_json::to_value(res).unwrap())
+            state.coordinator.submit_task(task_id, &agent_id).map(|res| {
+                if res.is_valid {
+                    let task = state.coordinator.get_task(task_id).ok();
+                    let project_id = task.as_ref().map(|t| t.project_id.as_str()).unwrap_or("");
+                    let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
+                    let remaining_pending = steps.iter().filter(|s| s.status == "PENDING").count();
+                    let completed_in_plan = steps.iter().filter(|s| s.status == "COMPLETED").count();
+                    let total_steps = steps.len();
+
+                    serde_json::json!({
+                        "is_valid": true,
+                        "status": "CHUNK_COMPLETED",
+                        "verification": res,
+                        "task_id": task_id,
+                        "agent_id": agent_id,
+                        "masterplan_progress": {
+                            "completed_steps": completed_in_plan,
+                            "remaining_pending_steps": remaining_pending,
+                            "total_steps": total_steps
+                        },
+                        "next_action": "REPORT_TO_USER",
+                        "instruction": "Milestone completed successfully: All chunk steps verified and enqueued for merge. Stop calling MCP tools now. Present a comprehensive milestone walkthrough and test summary to the user in this IDE chat, and wait for the user to confirm/prompt before claiming the next chunk."
+                    })
+                } else {
+                    serde_json::json!({
+                        "is_valid": false,
+                        "status": "VERIFICATION_FAILED",
+                        "verification": res,
+                        "task_id": task_id,
+                        "agent_id": agent_id,
+                        "rejection_reasons": res.rejection_reasons,
+                        "next_action": "FIX_VIOLATIONS_AND_RESUBMIT",
+                        "instruction": "Verification rejected. Inspect rejection_reasons, correct the code inside your assigned worktree, and call task_submit again."
+                    })
+                }
+            })
         }
 
         "task_cancel" | "task.cancel" => {
@@ -592,15 +630,35 @@ fn execute_mcp_tool(
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
-                    let (next_action, instruction) = if plan.status == "UNSORTED" {
+                    let (next_action, instruction, architectural_guidelines) = if plan.status == "UNSORTED" {
                         (
                             "masterplan_decompose",
-                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array."
+                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array.",
+                            Some(serde_json::json!({
+                                "role": "Master Architect / Planner",
+                                "objective": "Decompose raw master specification into exhaustive, production-grade implementation steps.",
+                                "rules": [
+                                    "1. File Structure: Design a clean, modular folder tree tailored to the project stack (e.g. React/Vite/Tauri/Rust).",
+                                    "2. Step Granularity: Each step must be a standalone, high-fidelity milestone specifying: Exact Target Files, Concrete Exports & Interfaces, Design & UX Standard, Non-Overlapping Scope globs, and Automated Verification Commands.",
+                                    "3. Non-Overlapping Scopes: Assign distinct suggested_scope globs (e.g. 'src/components/Navigation/**', 'src-tauri/src/db/**') so parallel agents never collide.",
+                                    "4. Professional UX Standard: Mandate responsive layouts, modern design tokens, proper state management, dark/light themes, keyboard accessibility, and zero toy placeholders or empty stubs.",
+                                    "5. Zero Cliché Tropes: Avoid excessive purple glows or generic vibe fluff; prioritize crisp contrast, high density, and functional excellence.",
+                                    "6. Target Step Count: Decompose into the target step count (default 20 steps) to allow maximum parallelization across agents."
+                                ],
+                                "step_schema_example": {
+                                    "step_index": 1,
+                                    "title": "Module Name: Feature Implementation",
+                                    "description": "Comprehensive specification including:\n- Target Files: [exact file paths]\n- Exports & Types: [interface/function signatures]\n- Design Specs: [UI layout, theme tokens, error boundaries]\n- Features: [core business logic and state flows]",
+                                    "suggested_scope": "src/components/feature/**",
+                                    "acceptance_criteria": "Code compiles cleanly, exports match interfaces, and tests pass via: npm run build / cargo test"
+                                }
+                            }))
                         )
                     } else {
                         (
                             "masterplan_claim_chunk",
-                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk."
+                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk.",
+                            None
                         )
                     };
                     Ok(serde_json::json!({
@@ -613,6 +671,7 @@ fn execute_mcp_tool(
                         "plan": plan,
                         "steps": steps,
                         "instruction": instruction,
+                        "architectural_guidelines": architectural_guidelines
                     }))
                 }
                 Ok(None) => Err(format!("No masterplan found for project '{}'", project_id)),
