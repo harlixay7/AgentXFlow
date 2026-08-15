@@ -72,7 +72,7 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 |---|---|---|
 | `agentxflow_current_context` | `agent_id?`, `project_id?` | Get tailored context, active task, assigned worktree, active scopes, and recommended next action. |
 | `project_list` | _(none)_ | List all managed projects with exact IDs, repository paths, and target branches. |
-| `project_context` | `project_id`, `task_id?` | Fetch contract hash and project architectural rules. |
+| `project_context` | `project_id`, `task_id?` | Fetch contract hash and project architectural rules (or full task context pack when `task_id` is supplied). |
 | `masterplan_list` | _(none)_ | List all masterplans across all projects with status, step counts, and active handoffs. |
 | `masterplan_get` | `project_id` | Inspect masterplan state, raw specification text, project identity, and architect decomposition instructions. |
 | `masterplan_status` | `project_id` | Query plan progress stats, total steps, and step statuses. |

@@ -33,7 +33,7 @@ Developed by **[harlixay7](https://github.com/harlixay7)** • **AgentXFlow by V
 +---------------------------------------------------------------+
 |                     AgentXFlow Coordinator                    |
 |   - Masterplan Hub (Decomposition & anti-hoarding chunking)   |
-|   - SQLite Database (Versioned migrations 1-5, WAL mode)      |
+|   - SQLite Database (Versioned migrations 1–11, WAL mode)     |
 |   - Scope Engine (Multi-glob splitting & attempt auditing)    |
 |   - Verification Engine (Machine evaluators & profile runner) |
 |   - Merge Queue Engine (Serialized FIFO 3-way integration)    |
@@ -151,7 +151,7 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 |---|---|---|
 | `agentxflow_current_context` | `agent_id?`, `project_id?` | Get tailored context, active task, assigned worktree, active scopes, and recommended next action. |
 | `project_list` | _(none)_ | List all managed projects with exact IDs, repository paths, and target branches. |
-| `project_context` | `project_id`, `task_id?` | Fetch contract hash and project architectural rules. |
+| `project_context` | `project_id`, `task_id?` | Fetch contract hash and project architectural rules (or full task context pack when `task_id` is supplied). |
 | `masterplan_list` | _(none)_ | List all masterplans across all projects with status, step counts, and active handoffs. |
 | `masterplan_get` | `project_id` | Inspect masterplan state, raw specification text, project identity, and architect decomposition instructions. |
 | `masterplan_status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
@@ -206,7 +206,7 @@ npm run build
 - `src-tauri/src/scope/`: Glob pattern collision detection, pattern normalization, and attempt-scoped mutation auditor.
 - `src-tauri/src/verification/`: Verification profiles, automated machine evaluators, and SHA-256 proof bundle generator.
 - `src-tauri/src/merge/`: Serialized FIFO merge engine with disposable integration worktrees, automated background runner, and CAS ref updates.
-- `src-tauri/src/db/`: Versioned SQLite migrations (1–9), connection pooling, and single-instance file lock.
+- `src-tauri/src/db/`: Versioned SQLite migrations (1–11), connection pooling, and single-instance file lock.
 - `src/`: React 19 / TypeScript workbench UI.
 
 ---
