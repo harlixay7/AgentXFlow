@@ -103,6 +103,21 @@ fn get_all_migrations() -> Vec<Migration> {
             name: "task_attempt_worktree_paths",
             run: migration_0008_task_attempt_worktree_paths,
         },
+        Migration {
+            version: 9,
+            name: "seed_canonical_ide_profiles_and_cleanup",
+            run: migration_0009_seed_canonical_ide_profiles_and_cleanup,
+        },
+        Migration {
+            version: 10,
+            name: "masterplan_milestone_approval_toggle",
+            run: migration_0010_masterplan_milestone_approval_toggle,
+        },
+        Migration {
+            version: 11,
+            name: "multiple_masterplans_and_active_toggle",
+            run: migration_0011_multiple_masterplans_and_active_toggle,
+        },
     ]
 }
 
@@ -1011,6 +1026,171 @@ fn migration_0008_task_attempt_worktree_paths(tx: &Transaction) -> Result<()> {
     if !ta_cols.contains(&"worktree_path".to_string()) {
         tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN worktree_path TEXT NOT NULL DEFAULT '';")?;
     }
+
+    Ok(())
+}
+
+/// Seeds first-class canonical IDE profiles and normalizes legacy random UUID agents
+fn migration_0009_seed_canonical_ide_profiles_and_cleanup(tx: &Transaction) -> Result<()> {
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let expires_str = (now + chrono::Duration::days(365)).to_rfc3339();
+
+    // 1. Ensure agents table has session_token column
+    let mut check_ag_stmt = tx.prepare("PRAGMA table_info(agents)")?;
+    let ag_cols = check_ag_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_ag_stmt);
+
+    if !ag_cols.contains(&"session_token".to_string()) {
+        tx.execute_batch("ALTER TABLE agents ADD COLUMN session_token TEXT;")?;
+    }
+
+    // 2. Ensure agent_sessions table exists
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            session_token TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_activity_at TEXT NOT NULL,
+            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+        );
+        "
+    )?;
+
+    let canonical_roster = [
+        ("antigravity", "Antigravity", "IDE", "Google Antigravity Advanced Agentic Coding Assistant"),
+        ("claude-code", "Claude Code", "CLI", "Anthropic Claude Code Agentic Terminal Engine"),
+        ("cursor", "Cursor", "IDE", "Cursor AI Coding Assistant"),
+        ("opencode", "OpenCode", "IDE", "OpenCode Multi-Agent Orchestrator"),
+        ("codex", "OpenAI Codex", "CLI", "OpenAI Codex Agentic Coding Engine"),
+        ("gemini-cli", "Gemini CLI", "CLI", "Google Gemini Developer CLI"),
+        ("copilot", "GitHub Copilot", "IDE", "GitHub Copilot / VS Code Agent"),
+        ("windsurf", "Windsurf", "IDE", "Codeium Windsurf AI Cascade IDE"),
+        ("junie", "Junie", "IDE", "JetBrains Junie AI Assistant"),
+        ("aider", "Aider", "CLI", "Aider AI Pair Programmer"),
+    ];
+
+    for (id, name, agent_type, profile) in canonical_roster {
+        let token = format!("axf_sess_{}", id.replace('-', "_"));
+        tx.execute(
+            "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at, session_token)
+             VALUES (?1, ?2, ?3, ?4, 'IDLE', ?5, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 agent_type = excluded.agent_type,
+                 profile = excluded.profile,
+                 last_heartbeat = excluded.last_heartbeat,
+                 session_token = excluded.session_token",
+            rusqlite::params![id, name, agent_type, profile, now_str, token],
+        )?;
+
+        let sess_id = format!("sess_{}", id.replace('-', "_"));
+        tx.execute(
+            "INSERT INTO agent_sessions (id, agent_id, session_token, created_at, expires_at, last_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 expires_at = excluded.expires_at,
+                 last_activity_at = excluded.last_activity_at,
+                 session_token = excluded.session_token",
+            rusqlite::params![sess_id, id, token, now_str, expires_str],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Adds require_milestone_approval column to masterplans for hybrid autonomous/milestone handoffs
+fn migration_0010_masterplan_milestone_approval_toggle(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS masterplans (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'UNSORTED',
+            target_step_count INTEGER NOT NULL DEFAULT 20,
+            max_steps_per_agent INTEGER NOT NULL DEFAULT 4,
+            require_milestone_approval BOOLEAN NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        "
+    )?;
+
+    let mut check_mp_stmt = tx.prepare("PRAGMA table_info(masterplans)")?;
+    let mp_cols = check_mp_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_mp_stmt);
+
+    if !mp_cols.contains(&"require_milestone_approval".to_string()) {
+        tx.execute_batch("ALTER TABLE masterplans ADD COLUMN require_milestone_approval BOOLEAN NOT NULL DEFAULT 1;")?;
+    }
+
+    Ok(())
+}
+
+/// Adds title, is_active toggle, and indexes to masterplans for multi-masterplan cataloging
+fn migration_0011_multiple_masterplans_and_active_toggle(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS masterplans (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT 'Masterplan',
+            raw_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'UNSORTED',
+            target_step_count INTEGER NOT NULL DEFAULT 20,
+            max_steps_per_agent INTEGER NOT NULL DEFAULT 4,
+            require_milestone_approval BOOLEAN NOT NULL DEFAULT 1,
+            is_active BOOLEAN NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        "
+    )?;
+
+    let mut check_mp_stmt = tx.prepare("PRAGMA table_info(masterplans)")?;
+    let mp_cols = check_mp_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_mp_stmt);
+
+    if !mp_cols.contains(&"title".to_string()) {
+        tx.execute_batch("ALTER TABLE masterplans ADD COLUMN title TEXT NOT NULL DEFAULT 'Masterplan';")?;
+    }
+
+    if !mp_cols.contains(&"is_active".to_string()) {
+        tx.execute_batch("ALTER TABLE masterplans ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 0;")?;
+        // Set the latest masterplan for each project to is_active = 1
+        tx.execute_batch(
+            "
+            UPDATE masterplans
+            SET is_active = 1
+            WHERE id IN (
+                SELECT m1.id
+                FROM masterplans m1
+                WHERE m1.updated_at = (
+                    SELECT MAX(m2.updated_at)
+                    FROM masterplans m2
+                    WHERE m2.project_id = m1.project_id
+                )
+            );
+            "
+        )?;
+    }
+
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_masterplans_project_active ON masterplans(project_id, is_active);")?;
 
     Ok(())
 }

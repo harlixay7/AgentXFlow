@@ -79,11 +79,13 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
         }),
         json!({
             "name": "masterplan_decompose",
-            "description": "Decompose raw masterplan into structured execution steps.",
+            "description": "Decompose raw masterplan into structured execution steps. Returns compact summary by default.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project_id": { "type": "string", "description": "Project ID" },
+                    "idempotency_key": { "type": "string", "description": "Optional client idempotency key (e.g. 'decompose:<plan_id>:<hash>') for retry protection" },
+                    "compact": { "type": "boolean", "description": "When true (default), returns token-efficient summary instead of echoing all step records" },
                     "steps": {
                         "type": "array",
                         "items": {
@@ -117,12 +119,31 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
         }),
         json!({
             "name": "agent_register",
-            "description": "Register an agent session idempotently and obtain a unique agent_id and session token.",
+            "description": "Register or connect an AI IDE / agent session and obtain an authoritative agent_id and session token.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Agent name (e.g. Claude-Code, Codex, Antigravity)" },
-                    "agent_type": { "type": "string", "description": "Agent category type" }
+                    "name": {
+                        "type": "string",
+                        "enum": [
+                            "Antigravity",
+                            "Claude Code",
+                            "Cursor",
+                            "OpenCode",
+                            "OpenAI Codex",
+                            "Gemini CLI",
+                            "GitHub Copilot",
+                            "Windsurf",
+                            "Junie",
+                            "Aider"
+                        ],
+                        "description": "Select your AI IDE / Agent platform"
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "enum": ["IDE", "CLI", "Autonomous Swarm", "Reviewer", "Implementer"],
+                        "description": "Agent category type"
+                    }
                 },
                 "required": ["name"]
             }

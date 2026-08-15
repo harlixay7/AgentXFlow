@@ -129,12 +129,31 @@ const TOOLS = [
   },
   {
     name: 'agent_register',
-    description: 'Register an agent session and get an authoritative session token and agent_id.',
+    description: 'Register an agent session with a canonical AI IDE platform and get an authoritative session token and agent_id.',
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Agent name (e.g. Antigravity, Claude Code, Codex)' },
-        agent_type: { type: 'string', description: 'Agent category type' },
+        name: {
+          type: 'string',
+          enum: [
+            'Antigravity',
+            'Claude Code',
+            'Cursor',
+            'OpenCode',
+            'OpenAI Codex',
+            'Gemini CLI',
+            'GitHub Copilot',
+            'Windsurf',
+            'Junie',
+            'Aider',
+          ],
+          description: 'Select your AI IDE / Agent platform',
+        },
+        agent_type: {
+          type: 'string',
+          enum: ['IDE', 'CLI', 'Autonomous Swarm', 'Reviewer', 'Implementer'],
+          description: 'Agent category type',
+        },
       },
       required: ['name'],
     },
@@ -248,8 +267,92 @@ const TOOLS = [
     },
   },
   {
+    name: 'prepare_masterplan',
+    description: 'Atomically save, parse, structure, and prepare a masterplan for agents.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' },
+        raw_text: { type: 'string', description: 'Raw masterplan text' },
+        target_step_count: { type: 'integer', description: 'Target step count' },
+        max_steps_per_agent: { type: 'integer', description: 'Max steps per agent' },
+      },
+      required: ['project_id', 'raw_text'],
+    },
+  },
+  {
+    name: 'task_details',
+    description: 'Get complete task details including steps, acceptance criteria, active scope leases, attempts, and verification results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'task_cancel',
+    description: 'Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Optional agent identifier' },
+        reason: { type: 'string', description: 'Cancellation reason' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'task_requeue',
+    description: 'Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Optional agent identifier' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'task_reconcile',
+    description: 'Reconcile task state, task attempt, proof bundle, and merge queue status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
     name: 'merge_queue_status',
     description: 'List all queued branch merges and their integration statuses.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' },
+      },
+      required: ['project_id'],
+    },
+  },
+  {
+    name: 'merge_enqueue',
+    description: 'Enqueue a verified or MERGE_READY task into the serialized merge queue.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' },
+        task_id: { type: 'string', description: 'Task identifier' },
+      },
+      required: ['project_id', 'task_id'],
+    },
+  },
+  {
+    name: 'merge_process',
+    description: 'Process the next ready serialized branch merge in queue for a project.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -318,6 +421,40 @@ function handleOfflineRead(toolName, args) {
     case 'project_list': {
       const rows = db.prepare('SELECT id, name, root_path, target_branch, created_at FROM projects').all();
       return rows;
+    }
+    case 'project_context': {
+      const proj = db.prepare('SELECT id, name, master_spec FROM projects WHERE id = ?').get(args.project_id);
+      if (!proj) throw new Error(`Project '${args.project_id}' not found`);
+      const contract = db.prepare('SELECT contract_hash, overview FROM project_contracts WHERE project_id = ? ORDER BY version DESC LIMIT 1').get(args.project_id);
+      const rules = db.prepare('SELECT rule_text FROM project_rules WHERE project_id = ? ORDER BY created_at ASC').all(args.project_id).map((r) => r.rule_text);
+      const memory = db.prepare('SELECT content FROM project_memory WHERE project_id = ? ORDER BY created_at DESC').all(args.project_id).map((r) => r.content);
+      if (args.task_id) {
+        const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(args.task_id);
+        const steps = db.prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY sequence_order ASC').all(args.task_id);
+        const criteria = db.prepare('SELECT * FROM acceptance_criteria WHERE task_id = ?').all(args.task_id);
+        return {
+          project_id: proj.id,
+          project_name: proj.name,
+          contract_hash: contract ? contract.contract_hash : '',
+          contract_overview: contract ? contract.overview : proj.master_spec,
+          project_rules: rules,
+          project_memory: memory,
+          task_id: task ? task.id : args.task_id,
+          task_title: task ? task.title : '',
+          task_prompt: task ? task.description : '',
+          task_state: task ? task.state : '',
+          acceptance_criteria: criteria,
+          required_steps: steps,
+        };
+      }
+      return {
+        project_id: proj.id,
+        project_name: proj.name,
+        contract_hash: contract ? contract.contract_hash : '',
+        contract_overview: contract ? contract.overview : proj.master_spec,
+        project_rules: rules,
+        project_memory: memory,
+      };
     }
     case 'masterplan_list': {
       const plans = db.prepare('SELECT p.id as project_id, p.name, m.status, m.version FROM projects p LEFT JOIN masterplans m ON m.project_id = p.id').all();

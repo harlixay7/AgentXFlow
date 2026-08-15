@@ -348,7 +348,10 @@ fn execute_mcp_tool(
             }
             Ok(agent.id.clone())
         } else if !req_id.is_empty() {
-            if state.coordinator.is_agent_registered(req_id) {
+            let (canon_id, ..) = crate::core::CoordinatorEngine::canonicalize_ide_identity(req_id, "");
+            if state.coordinator.is_agent_registered(&canon_id) {
+                Ok(canon_id)
+            } else if state.coordinator.is_agent_registered(req_id) {
                 Ok(req_id.to_string())
             } else {
                 Err(format!(
@@ -380,17 +383,23 @@ fn execute_mcp_tool(
         }
 
         "project_context" | "project.context" => {
-            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            if project_id.trim().is_empty() {
+            let project_id_raw = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let task_id_opt = params.get("task_id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+            let project_id = if project_id_raw.trim().is_empty() {
                 let ctx = state.coordinator.get_current_context(None, None)?;
                 if let Some(pid) = ctx.active_project_id {
-                    state.coordinator.get_context_pack(&pid, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+                    pid
                 } else {
-                    Err("Missing required parameter 'project_id'. Query 'project_list' to obtain valid project IDs.".to_string())
+                    return Err("Missing required parameter 'project_id'. Query 'project_list' to obtain valid project IDs.".to_string());
                 }
             } else {
-                state.coordinator.get_context_pack(project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+                project_id_raw.to_string()
+            };
+
+            if let Some(task_id) = task_id_opt {
+                state.coordinator.get_context_pack(&project_id, task_id).map(|cp| serde_json::to_value(cp).unwrap())
+            } else {
+                state.coordinator.get_project_context(&project_id).map(|pc| serde_json::to_value(pc).unwrap())
             }
         }
 
@@ -511,7 +520,62 @@ fn execute_mcp_tool(
             let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id = resolve_agent_id(raw_agent_id)?;
-            state.coordinator.submit_task(task_id, &agent_id).map(|res| serde_json::to_value(res).unwrap())
+            state.coordinator.submit_task(task_id, &agent_id).map(|res| {
+                if res.is_valid {
+                    let task = state.coordinator.get_task(task_id).ok();
+                    let project_id = task.as_ref().map(|t| t.project_id.as_str()).unwrap_or("");
+                    let plan = state.coordinator.get_masterplan(project_id).ok().flatten();
+                    let require_approval = plan.as_ref().map(|p| p.require_milestone_approval).unwrap_or(true);
+                    let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
+                    let remaining_pending = steps.iter().filter(|s| s.status == "PENDING").count();
+                    let completed_in_plan = steps.iter().filter(|s| s.status == "COMPLETED").count();
+                    let total_steps = steps.len();
+
+                    let (next_action, instruction) = if require_approval {
+                        (
+                            "REPORT_TO_USER",
+                            "Milestone completed successfully: All chunk steps verified and enqueued for merge. Interactive Milestone Mode is active. Stop calling MCP tools now. Present a comprehensive milestone walkthrough and test summary to the user in this IDE chat, and wait for the user to confirm/prompt before claiming the next chunk."
+                        )
+                    } else if remaining_pending > 0 {
+                        (
+                            "masterplan_claim_chunk",
+                            "Chunk verified and enqueued for merge. Continuous Autonomous Swarm Mode is active: proceed immediately to claim the next available chunk using 'masterplan_claim_chunk'."
+                        )
+                    } else {
+                        (
+                            "all_steps_completed",
+                            "All masterplan steps have been claimed and completed. No further steps remain in the masterplan."
+                        )
+                    };
+
+                    serde_json::json!({
+                        "is_valid": true,
+                        "status": "CHUNK_COMPLETED",
+                        "verification": res,
+                        "task_id": task_id,
+                        "agent_id": agent_id,
+                        "require_milestone_approval": require_approval,
+                        "masterplan_progress": {
+                            "completed_steps": completed_in_plan,
+                            "remaining_pending_steps": remaining_pending,
+                            "total_steps": total_steps
+                        },
+                        "next_action": next_action,
+                        "instruction": instruction
+                    })
+                } else {
+                    serde_json::json!({
+                        "is_valid": false,
+                        "status": "VERIFICATION_FAILED",
+                        "verification": res,
+                        "task_id": task_id,
+                        "agent_id": agent_id,
+                        "rejection_reasons": res.rejection_reasons,
+                        "next_action": "FIX_VIOLATIONS_AND_RESUBMIT",
+                        "instruction": "Verification rejected. Inspect rejection_reasons, correct the code inside your assigned worktree, and call task_submit again."
+                    })
+                }
+            })
         }
 
         "task_cancel" | "task.cancel" => {
@@ -592,15 +656,35 @@ fn execute_mcp_tool(
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
-                    let (next_action, instruction) = if plan.status == "UNSORTED" {
+                    let (next_action, instruction, architectural_guidelines) = if plan.status == "UNSORTED" {
                         (
                             "masterplan_decompose",
-                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array."
+                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array.",
+                            Some(serde_json::json!({
+                                "role": "Master Architect / Planner",
+                                "objective": "Decompose raw master specification into exhaustive, production-grade implementation steps.",
+                                "rules": [
+                                    "1. File Structure: Design a clean, modular folder tree tailored to the project stack (e.g. React/Vite/Tauri/Rust).",
+                                    "2. Step Granularity: Each step must be a standalone, high-fidelity milestone specifying: Exact Target Files, Concrete Exports & Interfaces, Design & UX Standard, Non-Overlapping Scope globs, and Automated Verification Commands.",
+                                    "3. Non-Overlapping Scopes: Assign distinct suggested_scope globs (e.g. 'src/components/Navigation/**', 'src-tauri/src/db/**') so parallel agents never collide.",
+                                    "4. Professional UX Standard: Mandate responsive layouts, modern design tokens, proper state management, dark/light themes, keyboard accessibility, and zero toy placeholders or empty stubs.",
+                                    "5. Zero Cliché Tropes: Avoid excessive purple glows or generic vibe fluff; prioritize crisp contrast, high density, and functional excellence.",
+                                    "6. Target Step Count: Decompose into the target step count (default 20 steps) to allow maximum parallelization across agents."
+                                ],
+                                "step_schema_example": {
+                                    "step_index": 1,
+                                    "title": "Module Name: Feature Implementation",
+                                    "description": "Comprehensive specification including:\n- Target Files: [exact file paths]\n- Exports & Types: [interface/function signatures]\n- Design Specs: [UI layout, theme tokens, error boundaries]\n- Features: [core business logic and state flows]",
+                                    "suggested_scope": "src/components/feature/**",
+                                    "acceptance_criteria": "Code compiles cleanly, exports match interfaces, and tests pass via: npm run build / cargo test"
+                                }
+                            }))
                         )
                     } else {
                         (
                             "masterplan_claim_chunk",
-                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk."
+                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk.",
+                            None
                         )
                     };
                     Ok(serde_json::json!({
@@ -613,9 +697,10 @@ fn execute_mcp_tool(
                         "plan": plan,
                         "steps": steps,
                         "instruction": instruction,
+                        "architectural_guidelines": architectural_guidelines
                     }))
                 }
-                Ok(None) => Err(format!("No masterplan found for project '{}'", project_id)),
+                Ok(None) => Err(format!("No active masterplan is currently published for project '{}'. In Masterplan Hub, toggle ON a masterplan to make it visible and actionable for AI agents.", project_id)),
                 Err(e) => Err(e),
             }
         }
@@ -633,6 +718,9 @@ fn execute_mcp_tool(
                     let completed = steps.iter().filter(|s| s.status == "COMPLETED").count();
                     Ok(serde_json::json!({
                         "status": plan.status,
+                        "masterplan_id": plan.id,
+                        "title": plan.title,
+                        "is_active": plan.is_active,
                         "total_steps": steps.len(),
                         "pending_steps": pending,
                         "claimed_steps": claimed,
@@ -641,7 +729,7 @@ fn execute_mcp_tool(
                         "steps": steps,
                     }))
                 }
-                Ok(None) => Err(format!("No masterplan found for project '{}'", project_id)),
+                Ok(None) => Err(format!("No active masterplan is currently published for project '{}'. In Masterplan Hub, toggle ON a masterplan to enable it for AI agents.", project_id)),
                 Err(e) => Err(e),
             }
         }
@@ -690,10 +778,33 @@ fn execute_mcp_tool(
 
         "masterplan_decompose" | "masterplan.decompose" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let compact = params.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
             let steps_val = params.get("steps").cloned().unwrap_or(serde_json::json!([]));
             let steps_res: Result<Vec<crate::models::DecomposedStepInput>, _> = serde_json::from_value(steps_val);
             match steps_res {
-                Ok(steps) => state.coordinator.decompose_masterplan(project_id, steps).map(|decomposed| serde_json::to_value(decomposed).unwrap()),
+                Ok(steps) => {
+                    let step_count = steps.len();
+                    match state.coordinator.decompose_masterplan(project_id, steps) {
+                        Ok(decomposed) => {
+                            let plan = state.coordinator.get_masterplan(project_id).ok().flatten();
+                            let plan_id = plan.as_ref().map(|p| p.id.as_str()).unwrap_or("");
+                            if compact {
+                                Ok(serde_json::json!({
+                                    "status": "RESORTED",
+                                    "masterplan_id": plan_id,
+                                    "project_id": project_id,
+                                    "step_count": step_count,
+                                    "pending_steps": step_count,
+                                    "next_action": "masterplan_claim_chunk",
+                                    "instruction": format!("Masterplan successfully decomposed into {} structured steps. Call 'masterplan_claim_chunk' to claim your assigned chunk.", step_count)
+                                }))
+                            } else {
+                                Ok(serde_json::to_value(decomposed).unwrap())
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
                 Err(e) => Err(format!("Invalid step array format: {}. Expected [{{ 'step_index': 1, 'title': '...', 'description': '...' }}]", e)),
             }
         }
@@ -705,4 +816,84 @@ fn execute_mcp_tool(
 fn get_tool_definitions() -> Vec<serde_json::Value> {
     registry::get_all_tool_definitions()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbPool;
+
+    fn setup_test_mcp_state() -> (Arc<McpServerState>, String, String) {
+        let temp_dir = std::env::temp_dir().join(format!("agentxflow_mcp_unit_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let readme = temp_dir.join("README.md");
+        std::fs::write(&readme, "# Test MCP Project\n").unwrap();
+
+        let run_cmd = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&temp_dir)
+                .output()
+                .expect("Failed to run git command");
+            if !out.status.success() {
+                eprintln!("Git cmd {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            }
+        };
+
+        run_cmd(&["init"]);
+        run_cmd(&["config", "user.name", "AgentXFlow Unit Test"]);
+        run_cmd(&["config", "user.email", "test@agentxflow.local"]);
+        run_cmd(&["add", "README.md"]);
+        run_cmd(&["commit", "-m", "Initial commit"]);
+        run_cmd(&["branch", "-M", "main"]);
+
+        let temp_db = temp_dir.join("test.db");
+        let pool = DbPool::new(&temp_db).expect("Failed to initialize test SQLite pool");
+        let engine = CoordinatorEngine::new(pool);
+        let proj = engine.create_project("Test MCP Project", &temp_dir.to_string_lossy(), "Spec", "main").unwrap();
+        let task = engine.create_task(&proj.id, "Test Task", "Task desc", "HIGH", vec![], vec![]).unwrap();
+
+        let security = SecurityManager::init_or_load(&temp_dir).unwrap();
+        let state = Arc::new(McpServerState {
+            coordinator: engine,
+            security,
+        });
+
+        (state, proj.id, task.id)
+    }
+
+    #[test]
+    fn test_mcp_project_context_without_task_id() {
+        let (state, proj_id, _) = setup_test_mcp_state();
+        let params = serde_json::json!({
+            "project_id": proj_id
+        });
+        let res = execute_mcp_tool(&state, None, "project_context", &params);
+        assert!(res.is_ok(), "project_context without task_id should succeed: {:?}", res);
+        let val = res.unwrap();
+        assert_eq!(val["project_id"], proj_id);
+        assert_eq!(val["project_name"], "Test MCP Project");
+        assert!(val["contract_hash"].is_string());
+        assert!(val["project_rules"].is_array());
+        assert!(!val["project_rules"].as_array().unwrap().is_empty());
+        assert!(val.get("task_id").is_none());
+    }
+
+    #[test]
+    fn test_mcp_project_context_with_task_id() {
+        let (state, proj_id, task_id) = setup_test_mcp_state();
+        let params = serde_json::json!({
+            "project_id": proj_id,
+            "task_id": task_id
+        });
+        let res = execute_mcp_tool(&state, None, "project_context", &params);
+        assert!(res.is_ok(), "project_context with task_id should succeed: {:?}", res);
+        let val = res.unwrap();
+        assert_eq!(val["project_id"], proj_id);
+        assert_eq!(val["task_id"], task_id);
+        assert_eq!(val["task_title"], "Test Task");
+        assert_eq!(val["task_prompt"], "Task desc");
+    }
+}
+
 

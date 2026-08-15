@@ -26,17 +26,42 @@ impl GitService {
     }
 
     pub fn run_git_cmd(&self, cwd: &Path, args: &[&str]) -> Result<String, String> {
-        let output = Command::new("git")
+        let mut child = Command::new("git")
             .args(args)
             .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("Failed to execute git command {:?}: {}", args, e))?;
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .spawn()
+            .map_err(|e| format!("Failed to spawn git command {:?}: {}", args, e))?;
 
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        } else {
-            let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(format!("Git error (code {:?}): {}", output.status.code(), err_msg))
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(15);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let output = child.wait_with_output().map_err(|e| format!("Failed to read git output: {}", e))?;
+                    if status.success() {
+                        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                    } else {
+                        let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        return Err(format!("Git error (code {:?}): {}", status.code(), err_msg));
+                    }
+                }
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        let _ = child.kill();
+                        return Err(format!("Git command {:?} timed out after 15 seconds", args));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(format!("Error waiting for git command: {}", e));
+                }
+            }
         }
     }
 
@@ -144,10 +169,34 @@ impl GitService {
         self.run_git_cmd(repo_path, &["worktree", "prune"]).ok();
 
         if worktree_dir.exists() {
-            std::fs::remove_dir_all(worktree_dir).map_err(|e| format!("Failed to delete worktree directory: {}", e))?;
+            let _ = Self::safe_remove_dir_all(worktree_dir);
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::permissions_set_readonly_false)]
+    pub fn safe_remove_dir_all(path: &Path) -> std::io::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+        }
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let _ = Self::safe_remove_dir_all(&entry.path());
+                }
+            }
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        }
     }
 
     pub fn get_diff(&self, repo_path: &Path, base_ref: &str, target_ref: &str) -> Result<String, String> {

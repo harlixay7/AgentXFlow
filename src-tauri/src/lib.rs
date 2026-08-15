@@ -23,7 +23,7 @@ use crate::git::RepoInspectionResult;
 use crate::mcp::McpServer;
 use crate::models::{
     Agent, CollisionRisk, ContextPack, EventItem, IntegrationAttempt, Masterplan,
-    MasterplanStep, MergeQueueItem, Project, ScopeLease, Task, TaskDependency, TaskDetails,
+    MasterplanStep, MergeQueueItem, Project, ProjectContextPack, ScopeLease, Task, TaskDependency, TaskDetails,
     TaskStep, VerificationResult,
 };
 use crate::security::SecurityManager;
@@ -262,6 +262,14 @@ fn get_events_after(
 }
 
 #[tauri::command]
+fn get_project_context(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<ProjectContextPack, String> {
+    state.coordinator.get_project_context(&project_id)
+}
+
+#[tauri::command]
 fn get_context_pack(
     state: State<'_, Arc<AppState>>,
     project_id: String,
@@ -329,6 +337,68 @@ fn decompose_masterplan(
 }
 
 #[tauri::command]
+fn list_masterplans_for_project(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<Vec<crate::models::Masterplan>, String> {
+    state.coordinator.list_masterplans_for_project(&project_id)
+}
+
+#[tauri::command]
+fn get_masterplan_by_id(
+    state: State<'_, Arc<AppState>>,
+    masterplan_id: String,
+) -> Result<Option<crate::models::Masterplan>, String> {
+    state.coordinator.get_masterplan_by_id(&masterplan_id)
+}
+
+#[tauri::command]
+fn create_masterplan(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    title: Option<String>,
+    raw_text: String,
+    target_step_count: i32,
+    max_steps_per_agent: i32,
+    activate: bool,
+) -> Result<crate::models::Masterplan, String> {
+    state.coordinator.create_masterplan(
+        &project_id,
+        title.as_deref(),
+        &raw_text,
+        target_step_count,
+        max_steps_per_agent,
+        activate,
+    )
+}
+
+#[tauri::command]
+fn set_masterplan_active_toggle(
+    state: State<'_, Arc<AppState>>,
+    masterplan_id: String,
+    is_active: bool,
+    force: bool,
+) -> Result<crate::models::Masterplan, String> {
+    state.coordinator.set_masterplan_active_toggle(&masterplan_id, is_active, force)
+}
+
+#[tauri::command]
+fn delete_masterplan(
+    state: State<'_, Arc<AppState>>,
+    masterplan_id: String,
+) -> Result<(), String> {
+    state.coordinator.delete_masterplan(&masterplan_id)
+}
+
+#[tauri::command]
+fn list_masterplan_steps_by_plan_id(
+    state: State<'_, Arc<AppState>>,
+    masterplan_id: String,
+) -> Result<Vec<crate::models::MasterplanStep>, String> {
+    state.coordinator.list_masterplan_steps_by_plan_id(&masterplan_id)
+}
+
+#[tauri::command]
 fn claim_masterplan_chunk(
     state: State<'_, Arc<AppState>>,
     project_id: String,
@@ -344,6 +414,15 @@ fn reset_masterplan(
     project_id: String,
 ) -> Result<(), String> {
     state.coordinator.reset_masterplan(&project_id)
+}
+
+#[tauri::command]
+fn set_masterplan_milestone_approval(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    require_approval: bool,
+) -> Result<bool, String> {
+    state.coordinator.set_masterplan_milestone_approval(&project_id, require_approval)
 }
 
 #[tauri::command]
@@ -481,17 +560,25 @@ pub fn run() {
             process_next_merge,
             reconcile_task,
             get_events_after,
+            get_project_context,
             get_context_pack,
             register_agent,
             unregister_agent,
             list_agents,
             create_or_update_masterplan,
+            create_masterplan,
+            list_masterplans_for_project,
+            get_masterplan_by_id,
+            set_masterplan_active_toggle,
+            delete_masterplan,
+            list_masterplan_steps_by_plan_id,
             prepare_masterplan,
             get_masterplan,
             list_masterplan_steps,
             decompose_masterplan,
             claim_masterplan_chunk,
             reset_masterplan,
+            set_masterplan_milestone_approval,
             list_all_masterplans,
             get_current_context,
         ])

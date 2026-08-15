@@ -153,8 +153,9 @@ async fn test_entire_pipeline_from_a_to_z() {
         }))
         .send().await.unwrap();
     let dec_json: serde_json::Value = dec_res.json().await.unwrap();
-    assert_eq!(dec_json["result"].as_array().unwrap().len(), 4);
-    println!(" [Step 6] Masterplan Decomposed into 4 Structured Steps");
+    assert_eq!(dec_json["result"]["status"], "RESORTED");
+    assert_eq!(dec_json["result"]["step_count"], 4);
+    println!(" [Step 6] Masterplan Decomposed into 4 Structured Steps (Compact Response Verified)");
 
     // Agent Alpha claims Chunk 1 (Steps 1 & 2)
     let claim_a = client.post(format!("{}/mcp", base_url))

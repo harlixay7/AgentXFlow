@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.2] - 2026-08-15
+
+### Added
+- **Compact Response Mode for `masterplan_decompose`**:
+  - By default, `masterplan_decompose` returns a token-efficient summary `{ status: "RESORTED", masterplan_id, step_count, pending_steps, next_action }` rather than echoing 75-100 full step objects over MCP.
+  - Supports optional `compact: false` parameter for clients requiring full step objects.
+- **Decomposition Idempotency & Safe Retry Protection**:
+  - Added `idempotency_key` parameter support to `masterplan_decompose`.
+  - Added server-side idempotency checks in coordinator core to return existing structured steps on duplicate requests rather than rejecting with hostile active claim conflicts.
+- **Native Node.js MCP Client Helper (`scripts/agentxflow_client.mjs`)**:
+  - Lightweight, dependency-free native Node client using native `fetch` and `Buffer`.
+  - Automatically loads authentication token, registers agent platform once per session, and connects directly to `http://127.0.0.1:7890/mcp`.
+  - Eliminates PowerShell command-line argument wrapping and shell bridge latency.
+
+---
+
+## [0.4.1] - 2026-08-15
+
+### Fixed
+- **MCP `project_context` Dispatcher Fix for Fresh Agent Workflows**:
+  - Resolved workflow bug where calling `project_context` without an optional `task_id` failed by attempting to query a task with an empty string (`""`).
+  - Added dedicated `get_project_context(&project_id)` engine method returning `ProjectContextPack` containing project contract hash, overview, memory, and mandatory rules.
+  - Retained full task-level context packing when `task_id` is supplied.
+  - Added offline SQLite fallback support for `project_context` in `scripts/mcp-bridge.mjs`.
+  - Added unit, regression, and E2E MCP test suites for `project_context` with and without `task_id`.
+
+---
+
+## [0.4.0] - 2026-08-15
+
+### Added
+- **Multi-Masterplan Catalog & Single-Active Toggle System (Migration 0011)**:
+  - Added `title` and `is_active` columns to `masterplans` table with project-active index.
+  - Rebuilt Masterplan Hub with a two-level hierarchy: Masterplan Catalog & Selection Grid (manage multiple draft/archived/active plans) and Detailed Plan Workspace.
+  - 1-Click Active/Inactive toggle switch: Only active masterplans (`is_active = true`) are visible and actionable to AI agents via MCP.
+  - Strict single-active plan mutual exclusion per project: Attempting to activate a plan while another is active triggers a conflict resolution modal with a 1-click switch action.
+  - MCP Visibility & Tool Gates: `masterplan_get`, `masterplan_status`, and `masterplan_claim_chunk` query strictly the active plan (`is_active = 1`). Inactive plans are safely sequestered from agent tool calls.
+  - Expanded capacity limits: Target step count dropdown expanded up to **100 steps** (5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100), and chunk anti-hoarding cap expanded up to **8 steps per agent**.
+  - High-performance non-blocking query architecture: Resolved internal SQLite connection lock contention and added child process timeout protection to prevent hanging operations.
+
+---
+
+## [0.3.0] - 2026-08-15
+
+### Added
+- **Hybrid Milestone Handoff vs Autonomous Swarm Mode (Migration 0010)**:
+  - Added `require_milestone_approval` column to `masterplans` with dedicated migration.
+  - Interactive UI toggle banner in Masterplan Hub to switch seamlessly between **Interactive Milestone Checkpoints** (pause, report in chat, await confirmation) and **Continuous Autonomous Swarm Mode** (uninterrupted continuous chunk execution).
+  - Dynamic `task_submit` MCP response emitting `next_action: "REPORT_TO_USER"` or `next_action: "masterplan_claim_chunk"` accordingly.
+- **Canonical AI IDE Identity System (Migration 0009)**:
+  - Hardcoded and pre-seeded persistent first-class profiles for all major AI coding platforms: `Antigravity`, `Claude Code`, `Cursor`, `OpenCode`, `OpenAI Codex`, `Gemini CLI`, `GitHub Copilot / VS Code`, `Windsurf`, `Junie`, `Aider`.
+  - Upgraded `agent_register` MCP schema with an explicit enum dropdown.
+  - Normalized agent registration in coordinator core with alias canonicalization, eliminating random UUID duplication.
+- **Masterplan Architectural Decomposition Standard**:
+  - Structured guidelines and blueprint templates in `masterplan_get` for `UNSORTED` specifications.
+  - Mandated project-tailored folder tree structures, exact target file paths, concrete export/interface declarations, non-overlapping scope patterns, and automated verification commands.
+  - Production-grade UI/UX design standards: responsive layouts, clean modern design tokens, zero cliché glowing purple fluff, and zero placeholder stubs.
+- **Automated Background Merge Processing & Migration 0007 / 0008**:
+  - Continuous asynchronous merge queue worker loops in Tauri application runtime and headless MCP daemon.
+  - Forward migrations for proof bundle schema normalization and worktree persistence.
+  - Startup database schema integrity verification (`verify_schema_integrity`).
+
+---
+
 ## [0.2.0] - 2026-08-14
 
 ### Added
