@@ -670,26 +670,32 @@ fn execute_mcp_tool(
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
+                    let target_steps = if plan.target_step_count > 0 { plan.target_step_count } else { 20 };
+                    let p1_end = std::cmp::max(1, (target_steps as f64 * 0.25).round() as i32);
+                    let p2_end = std::cmp::max(p1_end + 1, (target_steps as f64 * 0.50).round() as i32);
+                    let p3_end = std::cmp::max(p2_end + 1, (target_steps as f64 * 0.75).round() as i32);
+
                     let (next_action, instruction, architectural_guidelines) = if plan.status == "UNSORTED" {
                         (
                             "masterplan_decompose",
-                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array (either all steps at once or in phased 25-step chunks using append: true).",
+                            format!("The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized {} steps array (either all at once or in phased batches using append: true).", target_steps),
                             Some(serde_json::json!({
                                 "role": "Master Architect / Planner",
-                                "objective": "Decompose raw master specification into an exhaustive, production-grade 4-phase implementation blueprint.",
+                                "target_step_count": target_steps,
+                                "objective": format!("Decompose raw master specification into an exhaustive, production-grade 4-phase implementation blueprint with {} steps.", target_steps),
                                 "phased_decomposition_strategy": [
-                                    "Phase 1 (Steps 1–25): Runnable Baseline Scaffolding & Core Architecture (Step 1 MUST scaffold package.json, index.html, vite.config.ts/framework config, main.tsx/index.js, App.tsx, and router/navigation skeleton; Steps 2–25 implement database schemas, shared types, global state stores, and project utilities).",
-                                    "Phase 2 (Steps 26–50): Domain Business Logic, Service Layers, APIs, IPC Handlers, and State Bindings (connected directly to global app context and stores).",
-                                    "Phase 3 (Steps 51–75): High-Fidelity UI Views & Components (MANDATORY: Every component step must specify exact import & mounting instructions in App.tsx / AppRoutes.tsx / Navigation bar so all features are interactive and visible in the live application).",
-                                    "Phase 4 (Steps 76–100): End-to-End Integration, Error Boundaries, Automated Launcher Build (`run.bat` for Windows / `start.sh` for Unix with dependency check, server start, and browser auto-open), Launch Verification, and Complete `USER_GUIDE.md` / `HOW_TO_USE.md`."
+                                    format!("Phase 1 (Steps 1–{}): Runnable Baseline Scaffolding & Core Architecture (Step 1 MUST scaffold package.json, index.html, vite.config.ts/framework config, main.tsx/index.js, App.tsx, and router/navigation skeleton; Steps 2–{} implement database schemas, shared types, global state stores, and project utilities).", p1_end, p1_end),
+                                    format!("Phase 2 (Steps {}–{}): Domain Business Logic, Service Layers, APIs, IPC Handlers, and State Bindings (connected directly to global app context and stores).", p1_end + 1, p2_end),
+                                    format!("Phase 3 (Steps {}–{}): High-Fidelity UI Views & Components (MANDATORY: Every component step must specify exact import & mounting instructions in App.tsx / AppRoutes.tsx / Navigation bar so all features are interactive and visible in the live application).", p2_end + 1, p3_end),
+                                    format!("Phase 4 (Steps {}–{}): End-to-End Integration, Error Boundaries, Automated Launcher Build (`run.bat` for Windows / `start.sh` for Unix with dependency check, server start, and browser auto-open), Launch Verification, and Complete `USER_GUIDE.md` / `HOW_TO_USE.md`.", p3_end + 1, target_steps)
                                 ],
                                 "rules": [
                                     "1. Runnable from Step 1: Step 1 MUST scaffold the complete runnable application baseline (package.json, entry point, build configuration, root App component, and routing) and verify npm run dev / npm run build.",
                                     "2. Mandatory Root Mounting (Zero Isolated Code): Every UI component and view step MUST include explicit instructions to import and mount it into App.tsx, AppRoutes.tsx, or the main navigation menu.",
                                     "3. Deep Step Specifications: Specify Exact Target Files, Concrete Exports & Interfaces, Design Specs (responsive layout, themes, error handling, micro-interactions), and Automated Verification Commands.",
                                     "4. Non-Overlapping Scopes: Assign distinct suggested_scope globs (e.g. 'src/components/Navigation/**', 'src-tauri/src/db/**') so parallel agents never collide.",
-                                    "5. Final Step Release Deliverable: The final step (Step N) MUST create a robust, production-grade launcher script (`run.bat` for Windows / `start.sh` for Unix) that checks dependencies, starts the dev/prod server, auto-opens the browser, verifies launch, and writes a comprehensive `USER_GUIDE.md` / `HOW_TO_USE.md`.",
-                                    "6. Phased Decomposition: You can submit in 25-step chunks using `masterplan_decompose(project_id='...', steps=[...], append=true)` or all steps at once."
+                                    format!("5. Final Step Release Deliverable: The final step (Step {}) MUST create a robust, production-grade launcher script (`run.bat` for Windows / `start.sh` for Unix) that checks dependencies, starts the dev/prod server, auto-opens the browser, verifies launch, and writes a comprehensive `USER_GUIDE.md` / `HOW_TO_USE.md`.", target_steps),
+                                    format!("6. Phased Decomposition: You can submit in batches using `masterplan_decompose(project_id='...', steps=[...], append=true)` or all {} steps at once.", target_steps)
                                 ],
                                 "step_schema_example": {
                                     "step_index": 1,
@@ -703,7 +709,7 @@ fn execute_mcp_tool(
                     } else {
                         (
                             "masterplan_claim_chunk",
-                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk.",
+                            "The masterplan is ORGANIZED. Claim chunks using masterplan_claim_chunk.".to_string(),
                             None
                         )
                     };

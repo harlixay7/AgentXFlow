@@ -392,9 +392,9 @@ Decomposition Strategy (4-Phase Full-Stack Architecture):
 
 Deep Specification Requirements:
 - For every step, provide deep, rich specifications: Exact Target Files, Concrete Interfaces, App Mounting/Routing, State Transitions, Non-Overlapping Scopes, and Test Verification.
-- You can submit in phased 25-step chunks using:
+- You can submit in phased batches using:
   masterplan_decompose(project_id="${projectId}", steps=[...], append=true)
-  or all steps at once.`;
+  or all ${targetSteps} steps at once.`;
 
     navigator.clipboard.writeText(prompt);
     setCopiedPrompt(true);
