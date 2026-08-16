@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.4] - 2026-08-16
+
+### Added
+- **Final Release Delivery Protocol (Step N/N)**:
+  - Coordinator core detects final chunk completion (`Step N/N`) and returns `next_action: "FINAL_RELEASE_DELIVERY"`.
+  - Mandates building the production executable, generating automated launch scripts (`run.bat` for Windows / `start.sh` for Unix), verifying launch, and writing a comprehensive `USER_GUIDE.md` / `HOW_TO_USE.md`.
+- **4-Phase Deep Architectural Decomposition & Phased Chunking**:
+  - Added `append: true` support to `masterplan_decompose` for phased 25-step chunking across 4 distinct phases (Foundation, Domain Logic, UI & Motion, Polish & Release).
+  - Rich prompt guidance in `masterplan_get` instructing architects to expand specifications with creative UX ideas, defensive error boundaries, state flows, and non-overlapping scopes.
+- **Clean Repository Reset on Masterplan Reset**:
+  - `reset_masterplan` cleanly resets the local Git repository (`git reset --hard HEAD`, `git clean -fd`, `git worktree prune`), cancels active tasks, wipes `.agentxflow/worktrees`, and clears all step records.
+- **Masterplan UI Vertical Scrolling**:
+  - Wrapped Masterplan Hub catalog and step inspection views in responsive `.view-content` flex scroll viewports for smooth vertical scrolling across any list size.
+
+---
+
 ## [0.4.3] - 2026-08-16
 
 ### Added
