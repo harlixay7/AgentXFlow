@@ -78,6 +78,18 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         json!({
+            "name": "masterplan_reset",
+            "description": "Reset a masterplan, canceling active tasks, clearing steps, wiping worktrees, and restoring the Git repository to HEAD.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Target project ID" },
+                    "masterplan_id": { "type": "string", "description": "Optional specific masterplan ID to reset" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        json!({
             "name": "masterplan_decompose",
             "description": "Decompose raw masterplan into structured execution steps. Returns compact summary by default.",
             "inputSchema": {

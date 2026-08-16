@@ -254,6 +254,14 @@ async fn test_full_e2e_mcp_workflow() {
     })).await;
     assert_eq!(step_res["status"], "COMPLETED");
 
+    // 15. Test masterplan_reset via MCP
+    let reset_res = send_rpc(&session_token, "masterplan_reset", json!({
+        "project_id": proj.id
+    })).await;
+    assert_eq!(reset_res["status"], "RESET");
+    let post_reset_steps = coordinator.list_masterplan_steps(&proj.id).unwrap_or_default();
+    assert_eq!(post_reset_steps.len(), 0);
+
     // Cleanup temp dir
     std::fs::remove_dir_all(&temp_repo).ok();
 }

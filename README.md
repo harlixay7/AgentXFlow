@@ -158,8 +158,9 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 | `masterplan_list` | _(none)_ | List all masterplans across all projects with status, step counts, and active handoffs. |
 | `masterplan_get` | `project_id` | Inspect masterplan state, raw specification text, project identity, and architect decomposition instructions. |
 | `masterplan_status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
+| `masterplan_reset` | `project_id`, `masterplan_id?` | Reset a masterplan, canceling active tasks, clearing steps, wiping worktrees, and cleanly restoring Git repository to HEAD. |
 | `prepare_masterplan` | `project_id`, `raw_text`, `target_step_count?`, `max_steps_per_agent?` | Atomically save, parse, structure, and prepare a masterplan for agents. |
-| `masterplan_decompose` | `project_id`, `steps` | Normalize raw masterplan text into structured, non-overlapping execution steps. |
+| `masterplan_decompose` | `project_id`, `steps`, `append?`, `idempotency_key?`, `compact?` | Normalize raw masterplan text into structured execution steps. Supports 4-phase decomposition with append mode and compact summary output. |
 | `masterplan_claim_chunk`| `project_id`, `agent_id`, `count?` | Claim next batch of steps (strictly capped by limit) and allocate an isolated Git worktree. |
 | `agent_register` | `name`, `agent_type` | Idempotently register agent session with a canonical IDE identity and get an authoritative session token. |
 | `agent_heartbeat` | `agent_id` | Refresh your session heartbeat and active lease timers. |

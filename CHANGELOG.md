@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Rich prompt guidance in `masterplan_get` instructing architects to expand specifications with creative UX ideas, defensive error boundaries, state flows, and non-overlapping scopes.
 - **Clean Repository Reset on Masterplan Reset**:
   - `reset_masterplan` cleanly resets the local Git repository (`git reset --hard HEAD`, `git clean -fd`, `git worktree prune`), cancels active tasks, wipes `.agentxflow/worktrees`, and clears all step records.
+  - Exposed `masterplan_reset` as a native MCP tool (`masterplan_reset(project_id="...", masterplan_id="...")`) with full JSON schema.
 - **Masterplan UI Vertical Scrolling**:
   - Wrapped Masterplan Hub catalog and step inspection views in responsive `.view-content` flex scroll viewports for smooth vertical scrolling across any list size.
 

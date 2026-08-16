@@ -765,6 +765,20 @@ fn execute_mcp_tool(
             }
         }
 
+        "masterplan_reset" | "masterplan.reset" => {
+            let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+            let masterplan_id = params.get("masterplan_id").and_then(|v| v.as_str());
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'".to_string());
+            }
+            state.coordinator.reset_masterplan(project_id, masterplan_id).map(|_| serde_json::json!({
+                "status": "RESET",
+                "project_id": project_id,
+                "masterplan_id": masterplan_id,
+                "message": "Masterplan reset successfully. Active tasks cancelled, steps cleared, worktrees wiped, and Git repository reset to HEAD."
+            }))
+        }
+
         "masterplan_claim_chunk" | "masterplan.claim_chunk" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
