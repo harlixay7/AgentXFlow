@@ -143,6 +143,7 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md).
 10. Milestone Handoff -> Inspect `next_action` in task_submit response:
                      - If `REPORT_TO_USER`: Interactive Milestone mode is active. Stop calling tools immediately, present a milestone walkthrough in chat, and wait for user confirmation.
                      - If `masterplan_claim_chunk`: Continuous Autonomous Swarm mode is active. Proceed immediately to claim the next chunk.
+                     - If `FINAL_RELEASE_DELIVERY`: All masterplan steps are completed! As the final agent submitting Step N/N, build the production executable, generate the automated launcher (`run.bat`/`start.sh`), test that the app starts cleanly, create `USER_GUIDE.md` explaining the entire app, and present the full walkthrough to the user.
 ```
 
 ---

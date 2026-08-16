@@ -86,6 +86,7 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
                     "project_id": { "type": "string", "description": "Project ID" },
                     "idempotency_key": { "type": "string", "description": "Optional client idempotency key (e.g. 'decompose:<plan_id>:<hash>') for retry protection" },
                     "compact": { "type": "boolean", "description": "When true (default), returns token-efficient summary instead of echoing all step records" },
+                    "append": { "type": "boolean", "description": "When true, appends/merges steps for phased multi-chunk decomposition (e.g. 25 steps per phase) without wiping existing steps" },
                     "steps": {
                         "type": "array",
                         "items": {

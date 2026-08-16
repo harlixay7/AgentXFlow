@@ -119,3 +119,16 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 12. **Fix Submission Rejections**: If `task_submit` returns validation errors, inspect `rejection_reasons`, address them inside your worktree, and call `task_submit` again.
 13. **Transparent Activity Heartbeats**: Every inbound MCP tool call automatically refreshes your agent heartbeat and active session lease. You do NOT need to run background heartbeat timers.
 14. **Parallel Swarm Collaboration**: Multiple agents can claim distinct chunks and work simultaneously in parallel Git worktrees without lock contention.
+15. **Final Step Release Delivery Protocol**: The agent assigned to the final masterplan chunk (containing Step N/N) must deliver the full release:
+    - Build the production bundle / executable.
+    - Create or verify an automated launcher script (`run.bat` for Windows / `start.sh` for Unix or tech-stack launcher).
+    - Test and verify that the application launches successfully.
+    - Create/update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the full app architecture, configuration, features, and step-by-step instructions on how to use the entire application.
+    - Present the complete application walkthrough to the user in chat.
+16. **4-Phase Deep Architectural Decomposition & Phased Chunking**: When decomposing masterplans (up to 100 steps), formulate deep, feature-rich specifications organized across 4 phases:
+    - Phase 1 (Steps 1–25): Core Foundation, Database Schema, Shared Types, Project Utilities.
+    - Phase 2 (Steps 26–50): Domain Business Logic, State Stores, APIs, Backend Handlers, and Workflows.
+    - Phase 3 (Steps 51–75): High-Fidelity UI Components, Responsive Layouts, Glassmorphism Styling, Spatial Motion, Keyboard Shortcuts, and Error Boundaries.
+    - Phase 4 (Steps 76–100): Integration, Edge Cases, Verification Suites, Production Launcher Build (`run.bat`), Launch Validation, and Complete `USER_GUIDE.md`.
+    - You can decompose in 25-step chunks using `masterplan_decompose(project_id="...", steps=[...], append=true)` to ensure high-depth prompts.
+17. **Clean Masterplan & Repository Reset**: When `reset_masterplan` is invoked, the coordinator cleans all steps, cancels active tasks, deletes temporary worktrees, and runs `git reset --hard HEAD` and `git clean -fd` to cleanly restore the repository.

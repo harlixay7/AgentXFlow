@@ -299,6 +299,25 @@ impl CoordinatorEngine {
         Ok(res)
     }
 
+    pub fn get_project(&self, project_id: &str) -> Result<Project, String> {
+        let conn = self.db.lock();
+        conn.query_row(
+            "SELECT id, name, path, master_spec, target_branch, created_at, updated_at FROM projects WHERE id = ?1",
+            [project_id],
+            |row| {
+                Ok(Project {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    master_spec: row.get(3)?,
+                    target_branch: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        ).map_err(|e| format!("Project '{}' not found: {}", project_id, e))
+    }
+
     // --- Tasks ---
     #[allow(clippy::too_many_arguments)]
     pub fn create_task_internal(
@@ -1914,6 +1933,7 @@ impl CoordinatorEngine {
         &self,
         project_id: &str,
         steps: Vec<DecomposedStepInput>,
+        append: Option<bool>,
     ) -> Result<Vec<MasterplanStep>, String> {
         if steps.is_empty() {
             return Err("Cannot decompose masterplan with empty step list".to_string());
@@ -1923,6 +1943,7 @@ impl CoordinatorEngine {
             .get_masterplan(project_id)?
             .ok_or_else(|| format!("No masterplan found for project '{}'", project_id))?;
 
+        let is_append = append.unwrap_or(false);
         let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
@@ -1976,8 +1997,10 @@ impl CoordinatorEngine {
             ));
         }
 
-        tx.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan.id])
-            .map_err(|e| e.to_string())?;
+        if !is_append {
+            tx.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan.id])
+                .map_err(|e| e.to_string())?;
+        }
 
         let mut inserted_steps = Vec::new();
 
@@ -1985,6 +2008,13 @@ impl CoordinatorEngine {
             let step_id = Uuid::new_v4().to_string();
             let suggested_scope = s.suggested_scope.unwrap_or_else(|| "src/**".to_string());
             let criteria = s.acceptance_criteria.unwrap_or_else(|| "All automated tests pass".to_string());
+
+            if is_append {
+                tx.execute(
+                    "DELETE FROM masterplan_steps WHERE masterplan_id = ?1 AND step_index = ?2",
+                    rusqlite::params![plan.id, s.step_index],
+                ).ok();
+            }
 
             tx.execute(
                 "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at)
@@ -2017,9 +2047,9 @@ impl CoordinatorEngine {
         tx.commit().map_err(|e| format!("Failed to commit masterplan decomposition: {}", e))?;
         drop(conn);
 
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_DECOMPOSED", json!({ "total_steps": inserted_steps.len(), "status": "RESORTED" }));
+        self.emit_event(Some(project_id), None, None, "MASTERPLAN_DECOMPOSED", json!({ "total_steps": inserted_steps.len(), "status": "RESORTED", "is_append": is_append }));
 
-        Ok(inserted_steps)
+        self.list_masterplan_steps_by_plan_id(&plan.id)
     }
 
     /// Transactional, race-safe chunk reservation with complete compensation and atomic scope acquisition
@@ -2133,6 +2163,23 @@ impl CoordinatorEngine {
             .map(|(.., crit)| crit.clone())
             .collect();
 
+        let is_final_chunk = {
+            let conn = self.db.lock();
+            let remaining_pending: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status = 'PENDING'",
+                [&plan.id],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            remaining_pending == 0
+        };
+
+        let mut final_desc = task_desc;
+        let mut final_criteria = criteria;
+        if is_final_chunk {
+            final_desc.push_str("\n\n=================================================================\nFINAL RELEASE DELIVERY REQUIREMENTS (Final Masterplan Chunk):\nAs the agent completing the final step(s) of this masterplan, you must perform the Final Release Delivery:\n1. Build the production bundle / executable.\n2. Create or verify the automated launcher script (`run.bat` for Windows / `start.sh` for Unix or tech-stack launcher).\n3. Test and verify that the application launches successfully.\n4. Create or update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the complete application architecture, configuration, and exact step-by-step instructions on how to use the entire application.\n5. Commit all launcher scripts, build artifacts, and guide documentation before calling `task_submit`.\n=================================================================");
+            final_criteria.push("Automated launcher script (e.g. run.bat) created and tested, and comprehensive USER_GUIDE.md created".to_string());
+        }
+
         // 3. Create and Claim Task with atomic scope lease acquisition and complete rollback on collision
         let mut created_task_id: Option<String> = None;
         let task_res = (|| -> Result<Task, String> {
@@ -2141,10 +2188,10 @@ impl CoordinatorEngine {
                 Some(&plan.id),
                 None,
                 &task_title,
-                &task_desc,
+                &final_desc,
                 "HIGH",
                 task_steps,
-                criteria,
+                final_criteria,
             )?;
             created_task_id = Some(task.id.clone());
 
@@ -2198,14 +2245,14 @@ impl CoordinatorEngine {
         }
     }
 
-    pub fn reset_masterplan(&self, project_id: &str) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
+    pub fn reset_masterplan(&self, project_id: &str, masterplan_id: Option<&str>) -> Result<(), String> {
+        let _now = Utc::now().to_rfc3339();
 
-        // 1. Invalidate and cancel all in-flight unmerged tasks for this project and release their scopes
+        // 1. Invalidate and cancel all in-flight / non-cancelled tasks for this project and release their scopes
         let active_tasks: Vec<String> = {
             let conn = self.db.lock();
             let mut stmt = conn.prepare(
-                "SELECT id FROM tasks WHERE project_id = ?1 AND state != 'DONE' AND state != 'CANCELLED'"
+                "SELECT id FROM tasks WHERE project_id = ?1 AND state != 'CANCELLED'"
             ).map_err(|e| e.to_string())?;
             let ids = stmt.query_map([project_id], |r| r.get::<_, String>(0))
                 .map_err(|e| e.to_string())?
@@ -2215,38 +2262,53 @@ impl CoordinatorEngine {
         };
 
         for tid in &active_tasks {
-            let _ = self.cancel_task(tid, None, Some("Masterplan was reset; active task invalidated"));
+            let _ = self.cancel_task(tid, None, Some("Masterplan was reset; task invalidated"));
         }
 
+        // 2. Fetch and delete the target masterplan(s) and all their associated steps
         let conn = self.db.lock();
-        let plan_opt: Option<(String, String)> = conn
-            .query_row(
-                "SELECT id, raw_text FROM masterplans WHERE project_id = ?1",
-                [project_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
+        let plan_ids: Vec<String> = if let Some(mp_id) = masterplan_id {
+            if !mp_id.trim().is_empty() {
+                vec![mp_id.to_string()]
+            } else {
+                let mut stmt = conn.prepare("SELECT id FROM masterplans WHERE project_id = ?1").map_err(|e| e.to_string())?;
+                let ids = stmt.query_map([project_id], |r| r.get(0)).map_err(|e| e.to_string())?.flatten().collect();
+                ids
+            }
+        } else {
+            let mut stmt = conn.prepare("SELECT id FROM masterplans WHERE project_id = ?1").map_err(|e| e.to_string())?;
+            let ids = stmt.query_map([project_id], |r| r.get(0)).map_err(|e| e.to_string())?.flatten().collect();
+            ids
+        };
 
-        if let Some((plan_id, raw_text)) = plan_opt {
-            // Archive prior plan before reset
-            let rev_id = Uuid::new_v4().to_string();
-            let rev_num: i32 = conn.query_row(
-                "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM masterplan_revisions WHERE masterplan_id = ?1",
-                [&plan_id],
-                |r| r.get(0),
-            ).unwrap_or(1);
-
-            conn.execute(
-                "INSERT INTO masterplan_revisions (id, masterplan_id, project_id, revision_number, raw_text, reason, steps_snapshot_json, archived_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'Masterplan reset to empty', '[]', ?6)",
-                rusqlite::params![rev_id, plan_id, project_id, rev_num, raw_text, now],
-            ).ok();
-
-            conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan_id]).map_err(|e| e.to_string())?;
-            conn.execute("DELETE FROM masterplans WHERE id = ?1", [&plan_id]).map_err(|e| e.to_string())?;
+        for pid in &plan_ids {
+            conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [pid]).ok();
+            conn.execute("DELETE FROM masterplans WHERE id = ?1", [pid]).ok();
         }
         drop(conn);
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_RESET", json!({ "project_id": project_id }));
+
+        // 3. Clean up worktrees and cleanly reset the project's Git repository
+        if let Ok(proj) = self.get_project(project_id) {
+            let repo_path = Path::new(&proj.path);
+            let wt_dir = repo_path.join(".agentxflow").join("worktrees");
+            if wt_dir.exists() {
+                let _ = std::fs::remove_dir_all(&wt_dir);
+                let _ = std::fs::create_dir_all(&wt_dir);
+            }
+
+            // Clean Git repo: git reset --hard HEAD, git clean -fd, git worktree prune
+            let run_git = |args: &[&str]| {
+                let _ = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repo_path)
+                    .output();
+            };
+            run_git(&["reset", "--hard", "HEAD"]);
+            run_git(&["clean", "-fd"]);
+            run_git(&["worktree", "prune"]);
+        }
+
+        self.emit_event(Some(project_id), None, None, "MASTERPLAN_RESET", json!({ "project_id": project_id, "masterplan_id": masterplan_id }));
         Ok(())
     }
 
@@ -2531,7 +2593,7 @@ impl CoordinatorEngine {
     ) -> Result<PreparedMasterplanSnapshot, String> {
         let plan = self.create_or_update_masterplan(project_id, raw_text, target_step_count, max_steps_per_agent)?;
         let parsed_steps = self.parse_masterplan_text_to_steps(raw_text, target_step_count)?;
-        let steps = self.decompose_masterplan(project_id, parsed_steps)?;
+        let steps = self.decompose_masterplan(project_id, parsed_steps, None)?;
 
         let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
         let handoff_prompt = format!(

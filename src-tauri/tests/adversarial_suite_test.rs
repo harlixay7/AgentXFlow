@@ -326,7 +326,7 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
         DecomposedStepInput { step_index: 2, title: "S2".into(), description: "D2".into(), suggested_scope: Some("src/mp/step2/**".into()), acceptance_criteria: None },
         DecomposedStepInput { step_index: 3, title: "S3".into(), description: "D3".into(), suggested_scope: Some("src/mp/step3/**".into()), acceptance_criteria: None },
         DecomposedStepInput { step_index: 4, title: "S4".into(), description: "D4".into(), suggested_scope: Some("src/mp/step4/**".into()), acceptance_criteria: None },
-    ]).unwrap();
+    ], None).unwrap();
 
     let chunk1 = coordinator.claim_masterplan_chunk(&proj.id, &agent_c.id, Some(2));
     assert!(chunk1.is_ok(), "Agent C should claim first chunk: {:?}", chunk1.err());

@@ -92,7 +92,7 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     }
 
     let decomposed = engine
-        .decompose_masterplan(proj_id, steps_input)
+        .decompose_masterplan(proj_id, steps_input, None)
         .expect("Failed to decompose masterplan");
 
     assert_eq!(decomposed.len(), 12);
@@ -124,6 +124,7 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
             suggested_scope: None,
             acceptance_criteria: None,
         }],
+        None,
     );
     assert!(hostile_decompose.is_err(), "Re-decomposition must be blocked when steps are claimed");
 
@@ -165,7 +166,7 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     assert_eq!(re_agent1.session_token, agent1.session_token);
 
     println!("[TEST] 10. Resetting masterplan...");
-    let reset_res = engine.reset_masterplan(proj_id);
+    let reset_res = engine.reset_masterplan(proj_id, None);
     assert!(reset_res.is_ok(), "Resetting masterplan must succeed without deadlock: {:?}", reset_res.err());
 
     let plan_after_reset = engine.get_masterplan(proj_id).unwrap();

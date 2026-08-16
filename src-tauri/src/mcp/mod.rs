@@ -538,20 +538,20 @@ fn execute_mcp_tool(
                     let completed_in_plan = steps.iter().filter(|s| s.status == "COMPLETED").count();
                     let total_steps = steps.len();
 
-                    let (next_action, instruction) = if require_approval {
+                    let (next_action, instruction) = if remaining_pending == 0 && (completed_in_plan >= total_steps || total_steps > 0) {
+                        (
+                            "FINAL_RELEASE_DELIVERY",
+                            "🎉 ALL MASTERPLAN STEPS COMPLETED! As the final agent completing the last chunk (Step N/N), you must perform the Final Release Delivery:\n1. Build the production bundle / executable (e.g. npm run build / cargo build --release).\n2. Create or verify the automated launcher script (`run.bat` for Windows / `start.sh` for Unix or project executable).\n3. Test and verify that the application launches successfully.\n4. Create/update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the full app architecture, configuration, features, and step-by-step instructions on how to use the entire application.\n5. Present a full application walkthrough to the user in chat."
+                        )
+                    } else if require_approval {
                         (
                             "REPORT_TO_USER",
                             "Milestone completed successfully: All chunk steps verified and enqueued for merge. Interactive Milestone Mode is active. Stop calling MCP tools now. Present a comprehensive milestone walkthrough and test summary to the user in this IDE chat, and wait for the user to confirm/prompt before claiming the next chunk."
                         )
-                    } else if remaining_pending > 0 {
+                    } else {
                         (
                             "masterplan_claim_chunk",
                             "Chunk verified and enqueued for merge. Continuous Autonomous Swarm Mode is active: proceed immediately to claim the next available chunk using 'masterplan_claim_chunk'."
-                        )
-                    } else {
-                        (
-                            "all_steps_completed",
-                            "All masterplan steps have been claimed and completed. No further steps remain in the masterplan."
                         )
                     };
 
@@ -648,9 +648,16 @@ fn execute_mcp_tool(
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_text = params.get("raw_text").and_then(|v| v.as_str()).unwrap_or("");
             let target_step_count = params.get("target_step_count").and_then(|v| v.as_i64()).unwrap_or(20) as i32;
-            let max_steps_per_agent = params.get("max_steps_per_agent").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-            state.coordinator.prepare_masterplan(project_id, raw_text, target_step_count, max_steps_per_agent)
-                .map(|snap| serde_json::to_value(snap).unwrap())
+            let max_steps_per_agent = params.get("max_steps_per_agent").and_then(|v| v.as_i64()).unwrap_or(5) as i32;
+
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'".to_string());
+            }
+            if raw_text.trim().is_empty() {
+                return Err("Missing required parameter 'raw_text'".to_string());
+            }
+
+            state.coordinator.prepare_masterplan(project_id, raw_text, target_step_count, max_steps_per_agent).map(|snap| serde_json::to_value(snap).unwrap())
         }
 
         "masterplan_get" | "masterplan.get" => {
@@ -666,22 +673,28 @@ fn execute_mcp_tool(
                     let (next_action, instruction, architectural_guidelines) = if plan.status == "UNSORTED" {
                         (
                             "masterplan_decompose",
-                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array.",
+                            "The masterplan is UNSORTED. Read raw_text and call masterplan_decompose with the normalized steps array (either all steps at once or in phased 25-step chunks using append: true).",
                             Some(serde_json::json!({
                                 "role": "Master Architect / Planner",
-                                "objective": "Decompose raw master specification into exhaustive, production-grade implementation steps.",
+                                "objective": "Decompose raw master specification into an exhaustive, production-grade 4-phase implementation blueprint.",
+                                "phased_decomposition_strategy": [
+                                    "Phase 1 (Steps 1–25): Core Architecture, Database Schema, Types/Interfaces, Utility Libraries, Configuration, and Foundation.",
+                                    "Phase 2 (Steps 26–50): Domain Business Logic, State Stores, Service Layers, APIs, IPC Handlers, and Core Workflows.",
+                                    "Phase 3 (Steps 51–75): High-Fidelity UI Components, Responsive Layouts, Glassmorphism Styling, Spatial Motion, Keyboard Shortcuts, and Error Boundaries.",
+                                    "Phase 4 (Steps 76–100): Polish, Edge Cases, Automated Machine Verification Suites, Launcher Build (`run.bat` / platform executable), Launch Validation, and Complete `USER_GUIDE.md` / `HOW_TO_USE.md`."
+                                ],
                                 "rules": [
-                                    "1. File Structure: Design a clean, modular folder tree tailored to the project stack (e.g. React/Vite/Tauri/Rust).",
+                                    "1. File Structure: Design a clean, modular folder tree tailored to the project stack.",
                                     "2. Step Granularity: Each step must be a standalone, high-fidelity milestone specifying: Exact Target Files, Concrete Exports & Interfaces, Design & UX Standard, Non-Overlapping Scope globs, and Automated Verification Commands.",
-                                    "3. Non-Overlapping Scopes: Assign distinct suggested_scope globs (e.g. 'src/components/Navigation/**', 'src-tauri/src/db/**') so parallel agents never collide.",
-                                    "4. Professional UX Standard: Mandate responsive layouts, modern design tokens, proper state management, dark/light themes, keyboard accessibility, and zero toy placeholders or empty stubs.",
-                                    "5. Zero Cliché Tropes: Avoid excessive purple glows or generic vibe fluff; prioritize crisp contrast, high density, and functional excellence.",
-                                    "6. Target Step Count: Decompose into the target step count (default 20 steps) to allow maximum parallelization across agents."
+                                    "3. Deep Feature Expansion: Expand specification with creative UX ideas, robust error handling, micro-interactions, state models, and defensive validations.",
+                                    "4. Non-Overlapping Scopes: Assign distinct suggested_scope globs (e.g. 'src/components/Navigation/**', 'src-tauri/src/db/**') so parallel agents never collide.",
+                                    "5. Final Step Release Deliverable: The final step (Step N) MUST mandate creating a launcher script (run.bat/start.sh), testing launch, and writing a comprehensive USER_GUIDE.md explaining how to use the entire application.",
+                                    "6. Chunks & Phasing: You can decompose in 25-step chunks using `masterplan_decompose(project_id='...', steps=[...], append=true)` or all steps at once."
                                 ],
                                 "step_schema_example": {
                                     "step_index": 1,
-                                    "title": "Module Name: Feature Implementation",
-                                    "description": "Comprehensive specification including:\n- Target Files: [exact file paths]\n- Exports & Types: [interface/function signatures]\n- Design Specs: [UI layout, theme tokens, error boundaries]\n- Features: [core business logic and state flows]",
+                                    "title": "Module Name: Feature Implementation & State Engine",
+                                    "description": "Comprehensive specification including:\n- Target Files: [exact file paths]\n- Exports & Types: [interface/function signatures]\n- Design Specs: [UI layout, theme tokens, error boundaries, micro-interactions]\n- Core Logic: [state hooks, data transformations, edge cases]",
                                     "suggested_scope": "src/components/feature/**",
                                     "acceptance_criteria": "Code compiles cleanly, exports match interfaces, and tests pass via: npm run build / cargo test"
                                 }
@@ -720,23 +733,34 @@ fn execute_mcp_tool(
             match state.coordinator.get_masterplan(project_id) {
                 Ok(Some(plan)) => {
                     let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
+                    let total = steps.len();
                     let pending = steps.iter().filter(|s| s.status == "PENDING").count();
-                    let claimed = steps.iter().filter(|s| s.status == "CLAIMED" || s.status == "IN_PROGRESS").count();
+                    let claimed = steps.iter().filter(|s| s.status == "CLAIMED").count();
                     let completed = steps.iter().filter(|s| s.status == "COMPLETED").count();
                     Ok(serde_json::json!({
-                        "status": plan.status,
                         "masterplan_id": plan.id,
-                        "title": plan.title,
-                        "is_active": plan.is_active,
-                        "total_steps": steps.len(),
-                        "pending_steps": pending,
-                        "claimed_steps": claimed,
-                        "completed_steps": completed,
-                        "max_steps_per_agent": plan.max_steps_per_agent,
-                        "steps": steps,
+                        "status": plan.status,
+                        "require_milestone_approval": plan.require_milestone_approval,
+                        "stats": {
+                            "total_steps": total,
+                            "pending_steps": pending,
+                            "claimed_steps": claimed,
+                            "completed_steps": completed,
+                        },
+                        "next_action": if total == 0 {
+                            "prepare_masterplan"
+                        } else if plan.status == "UNSORTED" {
+                            "masterplan_decompose"
+                        } else if pending > 0 {
+                            "masterplan_claim_chunk"
+                        } else if claimed > 0 {
+                            "AWAIT_CHUNK_COMPLETION"
+                        } else {
+                            "FINAL_RELEASE_DELIVERY"
+                        }
                     }))
                 }
-                Ok(None) => Err(format!("No active masterplan is currently published for project '{}'. In Masterplan Hub, toggle ON a masterplan to enable it for AI agents.", project_id)),
+                Ok(None) => Err(format!("No active masterplan found for project '{}'", project_id)),
                 Err(e) => Err(e),
             }
         }
@@ -744,39 +768,33 @@ fn execute_mcp_tool(
         "masterplan_claim_chunk" | "masterplan.claim_chunk" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let count = params.get("count").and_then(|v| v.as_i64()).map(|n| n as i32);
+
+            if project_id.trim().is_empty() {
+                return Err("Missing required parameter 'project_id'".to_string());
+            }
             let agent_id = resolve_agent_id(raw_agent_id)?;
-            let count_opt = params
-                .get("chunk_size")
-                .or_else(|| params.get("count"))
-                .and_then(|v| v.as_i64())
-                .map(|n| n as i32);
-            let requested_cnt = count_opt.unwrap_or(4);
-            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count_opt).map(|chunk| {
+
+            state.coordinator.claim_masterplan_chunk(project_id, &agent_id, count).map(|chunk| {
                 let steps = state.coordinator.list_masterplan_steps(project_id).unwrap_or_default();
-                let claimed_step_ids: Vec<String> = steps
-                    .iter()
-                    .filter(|s| s.claimed_task_id.as_deref() == Some(&chunk.id))
-                    .map(|s| s.id.clone())
-                    .collect();
-                let claimed_cnt = claimed_step_ids.len();
-                let max_cap = state.coordinator.get_masterplan(project_id).ok().flatten().map(|p| p.max_steps_per_agent).unwrap_or(4);
-                let total_agent_active = steps.iter().filter(|s| s.claimed_agent_id.as_deref() == Some(&agent_id) && s.status == "CLAIMED").count();
-                let remaining_capacity = (max_cap as usize).saturating_sub(total_agent_active);
+                let remaining_pending = steps.iter().filter(|s| s.status == "PENDING").count();
+                let completed_in_plan = steps.iter().filter(|s| s.status == "COMPLETED").count();
+                let total_steps = steps.len();
 
                 serde_json::json!({
                     "id": chunk.id,
                     "task_id": chunk.id,
-                    "task": chunk,
-                    "project_id": chunk.project_id,
+                    "task_title": chunk.title,
                     "title": chunk.title,
-                    "description": chunk.description,
-                    "requested_count": requested_cnt,
-                    "claimed_count": claimed_cnt,
-                    "remaining_capacity": remaining_capacity,
-                    "claimed_step_ids": claimed_step_ids,
                     "state": chunk.state.as_str(),
                     "worktree_path": chunk.worktree_path,
+                    "assigned_agent": agent_id,
                     "branch_name": chunk.branch_name,
+                    "masterplan_progress": {
+                        "completed_steps": completed_in_plan,
+                        "remaining_pending_steps": remaining_pending,
+                        "total_steps": total_steps
+                    },
                     "base_sha": chunk.base_sha,
                     "message": "Chunk claimed successfully with exclusive write scope leases."
                 })
@@ -786,24 +804,29 @@ fn execute_mcp_tool(
         "masterplan_decompose" | "masterplan.decompose" => {
             let project_id = params.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
             let compact = params.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
+            let append = params.get("append").and_then(|v| v.as_bool());
             let steps_val = params.get("steps").cloned().unwrap_or(serde_json::json!([]));
             let steps_res: Result<Vec<crate::models::DecomposedStepInput>, _> = serde_json::from_value(steps_val);
             match steps_res {
                 Ok(steps) => {
                     let step_count = steps.len();
-                    match state.coordinator.decompose_masterplan(project_id, steps) {
+                    match state.coordinator.decompose_masterplan(project_id, steps, append) {
                         Ok(decomposed) => {
                             let plan = state.coordinator.get_masterplan(project_id).ok().flatten();
                             let plan_id = plan.as_ref().map(|p| p.id.as_str()).unwrap_or("");
+                            let total_steps = decomposed.len();
                             if compact {
                                 Ok(serde_json::json!({
                                     "status": "RESORTED",
                                     "masterplan_id": plan_id,
                                     "project_id": project_id,
                                     "step_count": step_count,
-                                    "pending_steps": step_count,
+                                    "batch_step_count": step_count,
+                                    "total_steps": total_steps,
+                                    "pending_steps": total_steps,
+                                    "is_append": append.unwrap_or(false),
                                     "next_action": "masterplan_claim_chunk",
-                                    "instruction": format!("Masterplan successfully decomposed into {} structured steps. Call 'masterplan_claim_chunk' to claim your assigned chunk.", step_count)
+                                    "instruction": format!("Masterplan steps successfully structured (total {} steps in plan). Call 'masterplan_claim_chunk' to claim your assigned chunk.", total_steps)
                                 }))
                             } else {
                                 Ok(serde_json::to_value(decomposed).unwrap())

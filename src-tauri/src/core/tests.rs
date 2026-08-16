@@ -191,7 +191,7 @@ pub mod tests {
         assert!(!claimed_chunk.is_stale);
 
         // 3. Reset masterplan
-        assert!(engine.reset_masterplan(&proj_id).is_ok());
+        assert!(engine.reset_masterplan(&proj_id, None).is_ok());
 
         // 4. Verify claimed task is now marked CANCELLED & is_stale = true, and its scopes released
         let task_after = engine.get_task(&claimed_chunk.id).unwrap();
@@ -224,7 +224,7 @@ pub mod tests {
                 suggested_scope: Some("src/**".to_string()),
                 acceptance_criteria: Some("Pass".to_string()),
             }
-        ]);
+        ], None);
         assert!(decomp_res.is_err(), "Decomposing while active tasks are running must be blocked");
 
         // Cancel the active task
@@ -239,7 +239,7 @@ pub mod tests {
                 suggested_scope: Some("src/**".to_string()),
                 acceptance_criteria: Some("Pass".to_string()),
             }
-        ]);
+        ], None);
         assert!(decomp_res2.is_ok(), "Decomposing after cancelling active task must succeed");
     }
 

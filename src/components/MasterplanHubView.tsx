@@ -299,11 +299,12 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   };
 
   const handleResetPlan = async () => {
-    if (!window.confirm('Reset this masterplan? All decomposed steps will be removed and the plan will return to UNSORTED.')) {
+    if (!window.confirm('Reset this masterplan? All decomposed steps will be removed, active tasks cancelled, temporary worktrees wiped, and the Git repository cleanly reset to HEAD.')) {
       return;
     }
     try {
-      await invoke('reset_masterplan', { projectId });
+      await coordinatorApi.resetMasterplan(projectId, selectedPlan?.id);
+      setActivePlanId(null);
       setSelectedPlan(null);
       setSteps([]);
       setIsEditing(true);
@@ -356,10 +357,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
     });
 
     try {
-      await invoke('decompose_masterplan', {
-        projectId,
-        steps: generatedSteps,
-      });
+      await coordinatorApi.decomposeMasterplan(projectId, generatedSteps);
       setIsEditing(false);
       await fetchAllPlans();
       onRefreshTasks();
@@ -371,12 +369,29 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
   const handleCopyMcpPrompt = () => {
     const projName = project?.name || 'Project';
     const projPath = project?.path || 'repository';
-    const prompt = `Decompose masterplan for project ${projectId} (${projName}) at ${projPath} using MCP tool masterplan_decompose.
+    const targetSteps = targetStepCount || 20;
+    const p1End = Math.max(1, Math.round(targetSteps * 0.25));
+    const p2End = Math.max(p1End + 1, Math.round(targetSteps * 0.5));
+    const p3End = Math.max(p2End + 1, Math.round(targetSteps * 0.75));
 
-Instructions:
-1. Call agentxflow_current_context() or masterplan_get(project_id="${projectId}")
-2. Read the raw specification text
-3. Call masterplan_decompose(project_id="${projectId}", steps=[...]) with ${targetStepCount} structured steps.`;
+    const prompt = `Role: Lead Architect & AI Planner
+Project: ${projName} (ID: ${projectId})
+Repository Path: ${projPath}
+Target Step Count: ${targetSteps} Execution Steps
+
+Decompose the masterplan blueprint into ${targetSteps} exhaustive, production-grade milestones using MCP tool: masterplan_decompose.
+
+Decomposition Strategy (4-Phase Architecture):
+1. Phase 1 (Steps 1–${p1End}): Core Foundation, Database Schemas, Shared Types & Interfaces, Utilities, and Infrastructure.
+2. Phase 2 (Steps ${p1End + 1}–${p2End}): Domain Business Logic, State Stores, Service Layers, APIs, IPC Handlers, and Workflows.
+3. Phase 3 (Steps ${p2End + 1}–${p3End}): High-Fidelity UI Components, Responsive Layouts, Glassmorphism Styling, Spatial Motion, Keyboard Navigation, and Error Boundaries.
+4. Phase 4 (Steps ${p3End + 1}–${targetSteps}): Integration, Edge-Case Handling, Automated Verification Suites, and Final Step ${targetSteps}: Build Production Executable/Bundle, Create Automated Launcher Script (run.bat / start.sh), Test Launch, and Write Complete USER_GUIDE.md.
+
+Deep Specification Requirements:
+- For every step, provide deep, rich specifications: Exact Target Files, Concrete Interfaces, State Transitions, Non-Overlapping Scopes, and Test Verification.
+- You can submit in phased 25-step chunks using:
+  masterplan_decompose(project_id="${projectId}", steps=[...], append=true)
+  or all steps at once.`;
 
     navigator.clipboard.writeText(prompt);
     setCopiedPrompt(true);
@@ -454,15 +469,16 @@ Instructions:
   // ==========================================
   if (!activePlanId || !selectedPlan) {
     return (
-      <div className="view-content animate-fade-in" style={{ padding: '1.5rem 2rem', maxWidth: '1400px', margin: '0 auto' }}>
-        {/* Top Header */}
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            marginBottom: '1.75rem',
-            paddingBottom: '1.25rem',
+      <div className="view-content" style={{ flex: 1, height: '100%', overflowY: 'auto', overflowX: 'hidden' }}>
+        <div className="animate-fade-in" style={{ padding: '1.5rem 2rem', maxWidth: '1400px', margin: '0 auto', width: '100%' }}>
+          {/* Top Header */}
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '1.75rem',
+              paddingBottom: '1.25rem',
             borderBottom: '1px solid var(--border-color)',
           }}
         >
@@ -938,6 +954,7 @@ Instructions:
             </div>
           </div>
         )}
+        </div>
       </div>
     );
   }
@@ -946,9 +963,10 @@ Instructions:
   // VIEW 2: Detailed Masterplan Inspection & Step Hub
   // ==========================================
   return (
-    <div className="view-content animate-fade-in" style={{ padding: '1.5rem 2rem', maxWidth: '1400px', margin: '0 auto' }}>
-      {/* Back to Catalog Bar */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+    <div className="view-content" style={{ flex: 1, height: '100%', overflowY: 'auto', overflowX: 'hidden' }}>
+      <div className="animate-fade-in" style={{ padding: '1.5rem 2rem', maxWidth: '1400px', margin: '0 auto', width: '100%' }}>
+        {/* Back to Catalog Bar */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
         <button
           onClick={handleBackToCatalog}
           className="btn btn-secondary"
@@ -1487,6 +1505,7 @@ Instructions:
           </div>
         </>
       )}
+      </div>
     </div>
   );
 };

@@ -348,8 +348,9 @@ fn decompose_masterplan(
     state: State<'_, Arc<AppState>>,
     project_id: String,
     steps: Vec<crate::models::DecomposedStepInput>,
+    append: Option<bool>,
 ) -> Result<Vec<MasterplanStep>, String> {
-    state.coordinator.decompose_masterplan(&project_id, steps)
+    state.coordinator.decompose_masterplan(&project_id, steps, append)
 }
 
 #[tauri::command]
@@ -428,8 +429,9 @@ fn claim_masterplan_chunk(
 fn reset_masterplan(
     state: State<'_, Arc<AppState>>,
     project_id: String,
+    masterplan_id: Option<String>,
 ) -> Result<(), String> {
-    state.coordinator.reset_masterplan(&project_id)
+    state.coordinator.reset_masterplan(&project_id, masterplan_id.as_deref())
 }
 
 #[tauri::command]
