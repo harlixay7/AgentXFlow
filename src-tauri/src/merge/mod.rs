@@ -1,6 +1,6 @@
 use chrono::Utc;
 use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::db::DbPool;
@@ -286,14 +286,12 @@ impl MergeEngine {
                     &["update-ref", &format!("refs/heads/{}", item.target_branch), &integration_head, &target_sha_before],
                 )?;
 
-                // 7. Safely synchronize root working tree if target branch is currently checked out
+                // 7. Synchronize primary repository working directory on disk if target branch is currently checked out
                 if let Ok(current_branch) = self.git.get_current_branch(repo_path) {
                     if current_branch == item.target_branch {
-                        if self.git.check_worktree_cleanliness(repo_path).is_ok() {
-                            self.git.run_git_cmd(repo_path, &["merge", "--ff-only", &integration_head]).ok();
-                        } else {
-                            warn!("User root repo has uncommitted edits on {}. Ref was advanced, working copy left untouched.", item.target_branch);
-                        }
+                        info!("Synchronizing primary repository working directory on disk to newly merged HEAD: {}", integration_head);
+                        let _ = self.git.run_git_cmd(repo_path, &["reset", "--hard", "HEAD"]);
+                        let _ = self.git.run_git_cmd(repo_path, &["clean", "-fd"]);
                     }
                 }
 

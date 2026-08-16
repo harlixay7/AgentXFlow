@@ -381,14 +381,17 @@ Target Step Count: ${targetSteps} Execution Steps
 
 Decompose the masterplan blueprint into ${targetSteps} exhaustive, production-grade milestones using MCP tool: masterplan_decompose.
 
-Decomposition Strategy (4-Phase Architecture):
-1. Phase 1 (Steps 1–${p1End}): Core Foundation, Database Schemas, Shared Types & Interfaces, Utilities, and Infrastructure.
-2. Phase 2 (Steps ${p1End + 1}–${p2End}): Domain Business Logic, State Stores, Service Layers, APIs, IPC Handlers, and Workflows.
-3. Phase 3 (Steps ${p2End + 1}–${p3End}): High-Fidelity UI Components, Responsive Layouts, Glassmorphism Styling, Spatial Motion, Keyboard Navigation, and Error Boundaries.
-4. Phase 4 (Steps ${p3End + 1}–${targetSteps}): Integration, Edge-Case Handling, Automated Verification Suites, and Final Step ${targetSteps}: Build Production Executable/Bundle, Create Automated Launcher Script (run.bat / start.sh), Test Launch, and Write Complete USER_GUIDE.md.
+Decomposition Strategy (4-Phase Full-Stack Architecture):
+1. Phase 1 (Steps 1–${p1End}): Runnable Baseline Scaffolding & Core Architecture
+   - Step 1 MUST scaffold the runnable project root (package.json, index.html, vite.config.ts/framework config, main.tsx/index.js, App.tsx, and router/navigation skeleton). Verify npm run dev & npm run build.
+   - Steps 2–${p1End}: Database schemas, shared types, global state stores, and project utilities.
+2. Phase 2 (Steps ${p1End + 1}–${p2End}): Domain Business Logic, State Stores, Service Layers, APIs, IPC Handlers, and Workflows (all bound to global app state).
+3. Phase 3 (Steps ${p2End + 1}–${p3End}): High-Fidelity UI Views & Components
+   - MANDATORY: Every UI component step MUST include explicit import and mounting instructions in App.tsx / AppRoutes.tsx / Navigation bar so all features are interactive and visible in the live application (zero isolated/orphaned code).
+4. Phase 4 (Steps ${p3End + 1}–${targetSteps}): End-to-End Integration, Error Boundaries, Automated Verification Suites, and Final Step ${targetSteps}: Build Production Executable/Bundle, Create Automated Launcher Script (run.bat for Windows / start.sh for Unix with dependency install check, server start, and browser auto-open), Test Launch, and Write Complete USER_GUIDE.md / HOW_TO_USE.md.
 
 Deep Specification Requirements:
-- For every step, provide deep, rich specifications: Exact Target Files, Concrete Interfaces, State Transitions, Non-Overlapping Scopes, and Test Verification.
+- For every step, provide deep, rich specifications: Exact Target Files, Concrete Interfaces, App Mounting/Routing, State Transitions, Non-Overlapping Scopes, and Test Verification.
 - You can submit in phased 25-step chunks using:
   masterplan_decompose(project_id="${projectId}", steps=[...], append=true)
   or all steps at once.`;

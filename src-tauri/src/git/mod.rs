@@ -75,6 +75,13 @@ impl GitService {
         std::fs::create_dir_all(repo_path).map_err(|e| format!("Failed to create folder {:?}: {}", repo_path, e))?;
         self.run_git_cmd(repo_path, &["init"])?;
         self.run_git_cmd(repo_path, &["checkout", "-b", "main"]).ok();
+
+        let gitignore = repo_path.join(".gitignore");
+        if !gitignore.exists() {
+            let _ = std::fs::write(&gitignore, ".agentxflow/\n");
+            self.run_git_cmd(repo_path, &["add", ".gitignore"]).ok();
+        }
+
         if self.run_git_cmd(repo_path, &["rev-parse", "HEAD"]).is_err() {
             self.run_git_cmd(repo_path, &["commit", "--allow-empty", "-m", "Initial commit"]).ok();
         }

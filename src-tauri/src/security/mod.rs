@@ -48,6 +48,9 @@ impl SecurityManager {
     }
 
     fn generate_and_save_token(path: &Path) -> Result<String, CoordinatorError> {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let raw = format!("{}-{}-{}", Uuid::new_v4(), Uuid::new_v4(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
         let mut hasher = Sha256::new();
         hasher.update(raw.as_bytes());
@@ -70,6 +73,9 @@ impl SecurityManager {
         let new_token = format!("axf_live_{}", hex::encode(hasher.finalize()));
 
         if let Some(ref path) = self.token_file {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             fs::write(path, &new_token)
                 .map_err(|e| CoordinatorError::Io(format!("Failed to persist rotated auth.token: {}", e)))?;
         }

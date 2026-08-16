@@ -121,15 +121,16 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 13. **Transparent Activity Heartbeats**: Every inbound MCP tool call automatically refreshes your agent heartbeat and active session lease. You do NOT need to run background heartbeat timers.
 14. **Parallel Swarm Collaboration**: Multiple agents can claim distinct chunks and work simultaneously in parallel Git worktrees without lock contention.
 15. **Final Step Release Delivery Protocol**: The agent assigned to the final masterplan chunk (containing Step N/N) must deliver the full release:
-    - Build the production bundle / executable.
-    - Create or verify an automated launcher script (`run.bat` for Windows / `start.sh` for Unix or tech-stack launcher).
+    - Build the production bundle / executable (`npm run build` / `cargo build --release`).
+    - Create a robust, automated launcher script (`run.bat` for Windows / `start.sh` for Unix) that automatically checks and installs dependencies (e.g. `if not exist node_modules call npm install`), starts the server, and auto-opens the browser (`start http://localhost:<port>`).
     - Test and verify that the application launches successfully.
-    - Create/update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the full app architecture, configuration, features, and step-by-step instructions on how to use the entire application.
+    - Create/update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the full app architecture, configuration, features, navigation map, and step-by-step instructions on how to use the entire application.
     - Present the complete application walkthrough to the user in chat.
-16. **4-Phase Deep Architectural Decomposition & Phased Chunking**: When decomposing masterplans (up to 100 steps), formulate deep, feature-rich specifications organized across 4 phases:
-    - Phase 1 (Steps 1–25): Core Foundation, Database Schema, Shared Types, Project Utilities.
-    - Phase 2 (Steps 26–50): Domain Business Logic, State Stores, APIs, Backend Handlers, and Workflows.
-    - Phase 3 (Steps 51–75): High-Fidelity UI Components, Responsive Layouts, Glassmorphism Styling, Spatial Motion, Keyboard Shortcuts, and Error Boundaries.
-    - Phase 4 (Steps 76–100): Integration, Edge Cases, Verification Suites, Production Launcher Build (`run.bat`), Launch Validation, and Complete `USER_GUIDE.md`.
+16. **4-Phase Deep Architectural Decomposition & Full-Stack Integration**: When decomposing masterplans (up to 100 steps), formulate deep, feature-rich specifications organized across 4 phases:
+    - Phase 1 (Steps 1–25): Runnable Baseline Scaffolding & Core Architecture (Step 1 MUST scaffold the runnable project root: `package.json`, `index.html`, `vite.config.ts`, `main.tsx`/`index.js`, `App.tsx`, and router/navigation skeleton; Steps 2–25 implement database schemas, shared types, global state stores, and project utilities).
+    - Phase 2 (Steps 26–50): Domain Business Logic, State Stores, APIs, Backend Handlers, and Workflows (bound to global app state).
+    - Phase 3 (Steps 51–75): High-Fidelity UI Views & Components (MANDATORY: Every component step must specify exact import & mounting instructions in `App.tsx` / `AppRoutes.tsx` / Navigation bar so all features are interactive and visible in the live application—zero isolated/orphaned code).
+    - Phase 4 (Steps 76–100): Integration, Edge Cases, Verification Suites, Production Launcher Build (`run.bat` / `start.sh`), Launch Validation, and Complete `USER_GUIDE.md` / `HOW_TO_USE.md`.
     - You can decompose in 25-step chunks using `masterplan_decompose(project_id="...", steps=[...], append=true)` to ensure high-depth prompts.
 17. **Clean Masterplan & Repository Reset**: When `reset_masterplan` is invoked, the coordinator cleans all steps, cancels active tasks, deletes temporary worktrees, and runs `git reset --hard HEAD` and `git clean -fd` to cleanly restore the repository.
+18. **Real-Time Primary Working Directory Synchronization**: Every task merge processed by the serialized FIFO merge queue automatically synchronizes the primary repository working directory on disk (`git reset --hard HEAD` and `git clean -fd`), ensuring all merged files immediately appear in the user's workspace in real time.

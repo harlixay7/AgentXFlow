@@ -44,7 +44,7 @@ fn create_real_git_project() -> PathBuf {
     ).unwrap();
 
     let gitignore = repo_dir.join(".gitignore");
-    std::fs::write(&gitignore, "target/\nCargo.lock\n").unwrap();
+    std::fs::write(&gitignore, "target/\nCargo.lock\n.agentxflow/\ncoordinator.db*\n").unwrap();
 
     run_cmd(&["add", "."]);
     run_cmd(&["commit", "-m", "Initial baseline commit"]);

@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Clean Repository Reset on Masterplan Reset**:
   - `reset_masterplan` cleanly resets the local Git repository (`git reset --hard HEAD`, `git clean -fd`, `git worktree prune`), cancels active tasks, wipes `.agentxflow/worktrees`, and clears all step records.
   - Exposed `masterplan_reset` as a native MCP tool (`masterplan_reset(project_id="...", masterplan_id="...")`) with full JSON schema.
+- **Real-Time Primary Workspace Synchronization**:
+  - Automatically synchronizes the primary repository working directory on disk (`git reset --hard HEAD` and `git clean -fd`) immediately upon merge queue integration, guaranteeing that all merged files appear in the user's workspace in real time.
+- **Full-Stack Baseline & Root Mounting Rules**:
+  - Architect decomposition now enforces Step 1 runnable baseline scaffolding (`package.json`, `index.html`, `vite.config.ts`, `main.tsx`, `App.tsx`, router) and mandatory mounting of all UI components into `App.tsx`/routes across all phases to eliminate isolated/orphaned code.
 - **Masterplan UI Vertical Scrolling**:
   - Wrapped Masterplan Hub catalog and step inspection views in responsive `.view-content` flex scroll viewports for smooth vertical scrolling across any list size.
 

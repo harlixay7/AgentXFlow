@@ -678,23 +678,23 @@ fn execute_mcp_tool(
                                 "role": "Master Architect / Planner",
                                 "objective": "Decompose raw master specification into an exhaustive, production-grade 4-phase implementation blueprint.",
                                 "phased_decomposition_strategy": [
-                                    "Phase 1 (Steps 1–25): Core Architecture, Database Schema, Types/Interfaces, Utility Libraries, Configuration, and Foundation.",
-                                    "Phase 2 (Steps 26–50): Domain Business Logic, State Stores, Service Layers, APIs, IPC Handlers, and Core Workflows.",
-                                    "Phase 3 (Steps 51–75): High-Fidelity UI Components, Responsive Layouts, Glassmorphism Styling, Spatial Motion, Keyboard Shortcuts, and Error Boundaries.",
-                                    "Phase 4 (Steps 76–100): Polish, Edge Cases, Automated Machine Verification Suites, Launcher Build (`run.bat` / platform executable), Launch Validation, and Complete `USER_GUIDE.md` / `HOW_TO_USE.md`."
+                                    "Phase 1 (Steps 1–25): Runnable Baseline Scaffolding & Core Architecture (Step 1 MUST scaffold package.json, index.html, vite.config.ts/framework config, main.tsx/index.js, App.tsx, and router/navigation skeleton; Steps 2–25 implement database schemas, shared types, global state stores, and project utilities).",
+                                    "Phase 2 (Steps 26–50): Domain Business Logic, Service Layers, APIs, IPC Handlers, and State Bindings (connected directly to global app context and stores).",
+                                    "Phase 3 (Steps 51–75): High-Fidelity UI Views & Components (MANDATORY: Every component step must specify exact import & mounting instructions in App.tsx / AppRoutes.tsx / Navigation bar so all features are interactive and visible in the live application).",
+                                    "Phase 4 (Steps 76–100): End-to-End Integration, Error Boundaries, Automated Launcher Build (`run.bat` for Windows / `start.sh` for Unix with dependency check, server start, and browser auto-open), Launch Verification, and Complete `USER_GUIDE.md` / `HOW_TO_USE.md`."
                                 ],
                                 "rules": [
-                                    "1. File Structure: Design a clean, modular folder tree tailored to the project stack.",
-                                    "2. Step Granularity: Each step must be a standalone, high-fidelity milestone specifying: Exact Target Files, Concrete Exports & Interfaces, Design & UX Standard, Non-Overlapping Scope globs, and Automated Verification Commands.",
-                                    "3. Deep Feature Expansion: Expand specification with creative UX ideas, robust error handling, micro-interactions, state models, and defensive validations.",
+                                    "1. Runnable from Step 1: Step 1 MUST scaffold the complete runnable application baseline (package.json, entry point, build configuration, root App component, and routing) and verify npm run dev / npm run build.",
+                                    "2. Mandatory Root Mounting (Zero Isolated Code): Every UI component and view step MUST include explicit instructions to import and mount it into App.tsx, AppRoutes.tsx, or the main navigation menu.",
+                                    "3. Deep Step Specifications: Specify Exact Target Files, Concrete Exports & Interfaces, Design Specs (responsive layout, themes, error handling, micro-interactions), and Automated Verification Commands.",
                                     "4. Non-Overlapping Scopes: Assign distinct suggested_scope globs (e.g. 'src/components/Navigation/**', 'src-tauri/src/db/**') so parallel agents never collide.",
-                                    "5. Final Step Release Deliverable: The final step (Step N) MUST mandate creating a launcher script (run.bat/start.sh), testing launch, and writing a comprehensive USER_GUIDE.md explaining how to use the entire application.",
-                                    "6. Chunks & Phasing: You can decompose in 25-step chunks using `masterplan_decompose(project_id='...', steps=[...], append=true)` or all steps at once."
+                                    "5. Final Step Release Deliverable: The final step (Step N) MUST create a robust, production-grade launcher script (`run.bat` for Windows / `start.sh` for Unix) that checks dependencies, starts the dev/prod server, auto-opens the browser, verifies launch, and writes a comprehensive `USER_GUIDE.md` / `HOW_TO_USE.md`.",
+                                    "6. Phased Decomposition: You can submit in 25-step chunks using `masterplan_decompose(project_id='...', steps=[...], append=true)` or all steps at once."
                                 ],
                                 "step_schema_example": {
                                     "step_index": 1,
                                     "title": "Module Name: Feature Implementation & State Engine",
-                                    "description": "Comprehensive specification including:\n- Target Files: [exact file paths]\n- Exports & Types: [interface/function signatures]\n- Design Specs: [UI layout, theme tokens, error boundaries, micro-interactions]\n- Core Logic: [state hooks, data transformations, edge cases]",
+                                    "description": "Comprehensive specification including:\n- Target Files: [exact file paths]\n- Exports & Types: [interface/function signatures]\n- App Integration: [exact import & mounting in App.tsx / routes / navigation]\n- Design Specs: [UI layout, theme tokens, error boundaries, micro-interactions]\n- Core Logic: [state hooks, data transformations, edge cases]",
                                     "suggested_scope": "src/components/feature/**",
                                     "acceptance_criteria": "Code compiles cleanly, exports match interfaces, and tests pass via: npm run build / cargo test"
                                 }

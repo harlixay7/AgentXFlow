@@ -172,9 +172,9 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 - **Attempt-Scoped Auditing**: Scope violations are bound to your active `attempt_id`. Acquiring missing scope leases cleanly clears violations on subsequent re-runs and submissions.
 - **Hybrid Milestone Handoff**: When `require_milestone_approval` is enabled in the UI (Interactive Milestone Mode), agents pause after each chunk, report back in IDE chat, and await user instructions. In Continuous Autonomous Swarm Mode, agents claim subsequent chunks immediately.
 - **Transparent Activity Heartbeats**: Incoming MCP tool calls automatically refresh your agent session liveness timestamp. No background timer loops are needed.
-- **Parallel Swarm Multi-Agent Execution**: Agents can work simultaneously on separate chunks in independent Git worktrees.
-- **Final Step Release Delivery**: The agent completing the final step (Step N/N) must build the executable, create an automated launcher script (`run.bat` / `start.sh`), verify launch, and write a full `USER_GUIDE.md` / `HOW_TO_USE.md`.
-- **4-Phase Deep Architectural Decomposition**: Plans can be decomposed in 4 structured phases (Phase 1 Foundation [1-25], Phase 2 Logic & APIs [26-50], Phase 3 UI & Motion [51-75], Phase 4 Polish, Verification, Launchers & Docs [76-100]) using `append: true`.
+- **Final Step Release Delivery**: The agent completing the final step (Step N/N) must build the production bundle (`npm run build` / `cargo build --release`), create an automated launcher script (`run.bat` / `start.sh`) with dependency installation checks and browser auto-launch, verify that the app starts cleanly, and write a full `USER_GUIDE.md` / `HOW_TO_USE.md`.
+- **4-Phase Deep Architectural Decomposition**: Plans are organized into 4 full-stack phases (Phase 1 Runnable Baseline & Scaffolding [1-25], Phase 2 Domain Logic & Store Bindings [26-50], Phase 3 High-Fidelity UI Mounted into App.tsx/routes [51-75], Phase 4 Polish, Verification, Launchers & Docs [76-100]) using `append: true`.
+- **Real-Time Primary Workspace Synchronization**: Every merged task is automatically synchronized to the primary project directory on disk via `git reset --hard HEAD` and `git clean -fd`.
 
 ---
 
