@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use chrono::Utc;
-use uuid::Uuid;
 use crate::db::DbPool;
 use crate::models::TaskDependency;
+use chrono::Utc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use tracing::warn;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct DagEngine {
@@ -26,7 +27,10 @@ impl DagEngine {
 
         // Check for cycle before adding
         if self.would_create_cycle(task_id, depends_on_task_id)? {
-            return Err(format!("Adding dependency from '{}' to '{}' would create a circular dependency cycle", task_id, depends_on_task_id));
+            return Err(format!(
+                "Adding dependency from '{}' to '{}' would create a circular dependency cycle",
+                task_id, depends_on_task_id
+            ));
         }
 
         let conn = self.db.lock();
@@ -50,8 +54,11 @@ impl DagEngine {
 
     pub fn remove_dependency(&self, dependency_id: &str) -> Result<(), String> {
         let conn = self.db.lock();
-        conn.execute("DELETE FROM task_dependencies WHERE id = ?1", [dependency_id])
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM task_dependencies WHERE id = ?1",
+            [dependency_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -80,11 +87,28 @@ impl DagEngine {
         Ok(res)
     }
 
-    /// Returns true if all dependencies for the task have state == 'DONE'
+    /// Returns true if all blocking dependencies for the task have state == 'DONE'.
+    /// BLOCKS and PARENT_CHILD gate scheduling; RELATED_TO is informational and never
+    /// blocks. Any other stored dependency_type is treated as blocking (conservative).
     pub fn are_dependencies_satisfied(&self, task_id: &str) -> Result<bool, String> {
         let conn = self.db.lock();
+
+        let unknown_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?1 AND dependency_type NOT IN ('BLOCKS', 'PARENT_CHILD', 'RELATED_TO')",
+                [task_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if unknown_count > 0 {
+            warn!(
+                "task '{}' has {} dependencies with an unknown dependency_type; treating them as blocking",
+                task_id, unknown_count
+            );
+        }
+
         let mut stmt = conn
-            .prepare("SELECT t.state FROM task_dependencies d JOIN tasks t ON d.depends_on_task_id = t.id WHERE d.task_id = ?1")
+            .prepare("SELECT t.state FROM task_dependencies d JOIN tasks t ON d.depends_on_task_id = t.id WHERE d.task_id = ?1 AND d.dependency_type != 'RELATED_TO'")
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
@@ -109,7 +133,9 @@ impl DagEngine {
 
         let mut adj: HashMap<String, Vec<String>> = HashMap::new();
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| e.to_string())?;
 
         for (u, v) in rows.flatten() {
@@ -117,7 +143,9 @@ impl DagEngine {
         }
 
         // Add hypothetical edge: task_id -> depends_on_task_id
-        adj.entry(task_id.to_string()).or_default().push(depends_on_task_id.to_string());
+        adj.entry(task_id.to_string())
+            .or_default()
+            .push(depends_on_task_id.to_string());
 
         // Check if depends_on_task_id can reach task_id
         let mut visited = HashSet::new();

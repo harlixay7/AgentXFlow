@@ -1,6 +1,8 @@
 use chrono::Utc;
 use rusqlite::{Connection, Result, Transaction};
+use sha2::{Digest, Sha256};
 use tracing::info;
+use uuid::Uuid;
 
 pub struct Migration {
     pub version: i32,
@@ -15,7 +17,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;"
+         PRAGMA foreign_keys = ON;",
     )?;
 
     // Ensure migration history tracker table exists
@@ -24,7 +26,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
             version INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             applied_at TEXT NOT NULL
-        );"
+        );",
     )?;
 
     let migrations = get_all_migrations();
@@ -37,16 +39,36 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         )?;
 
         if !already_applied {
-            info!("Applying database migration #{:04}: {}...", m.version, m.name);
-            let tx = conn.transaction()?;
-            (m.run)(&tx)?;
-            let now = Utc::now().to_rfc3339();
-            tx.execute(
-                "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![m.version, m.name, now],
-            )?;
-            tx.commit()?;
-            info!("Migration #{:04}: {} successfully applied.", m.version, m.name);
+            info!(
+                "Applying database migration #{:04}: {}...",
+                m.version, m.name
+            );
+            // Migrations v13 and v14 rebuild tables (DROP TABLE + RENAME). PRAGMA
+            // foreign_keys is a no-op inside a transaction, so FK enforcement must be
+            // disabled around the rebuild transaction (and re-enabled immediately after,
+            // success or failure) to keep the DROP from cascade-deleting child rows in
+            // tables that reference the rebuilt table's primary key.
+            if m.version == 13 || m.version == 14 {
+                conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+            }
+            let run_result = (|| -> Result<()> {
+                let tx = conn.transaction()?;
+                (m.run)(&tx)?;
+                let now = Utc::now().to_rfc3339();
+                tx.execute(
+                    "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![m.version, m.name, now],
+                )?;
+                tx.commit()
+            })();
+            if m.version == 13 || m.version == 14 {
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            }
+            run_result?;
+            info!(
+                "Migration #{:04}: {} successfully applied.",
+                m.version, m.name
+            );
         }
     }
 
@@ -118,7 +140,47 @@ fn get_all_migrations() -> Vec<Migration> {
             name: "multiple_masterplans_and_active_toggle",
             run: migration_0011_multiple_masterplans_and_active_toggle,
         },
+        Migration {
+            version: 12,
+            name: "timeout_evidence",
+            run: migration_0012_timeout_evidence,
+        },
+        Migration {
+            version: 13,
+            name: "task_state_check",
+            run: migration_0013_task_state_check,
+        },
+        Migration {
+            version: 14,
+            name: "proof_bundles_append_only",
+            run: migration_0014_proof_bundles_append_only,
+        },
+        Migration {
+            version: 15,
+            name: "masterplan_operations_idempotency",
+            run: migration_0015_masterplan_operations,
+        },
+        Migration {
+            version: 16,
+            name: "rotate_session_tokens",
+            run: migration_0016_rotate_session_tokens,
+        },
     ]
+}
+
+/// Cryptographically unpredictable session token (D11), using the same
+/// construction as the master MCP token (security/mod.rs): two random UUIDs
+/// plus nanos-of-now, SHA-256 hex, in the `axf_sess_` namespace (64 hex chars).
+fn generate_session_token() -> String {
+    let raw = format!(
+        "{}-{}-{}",
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("axf_sess_{}", hex::encode(hasher.finalize()))
 }
 
 fn migration_0001_core_entities(tx: &Transaction) -> Result<()> {
@@ -466,7 +528,7 @@ fn migration_0002_authoritative_session_security(tx: &Transaction) -> Result<()>
                 expires_at TEXT NOT NULL,
                 last_activity_at TEXT NOT NULL,
                 FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
-            );"
+            );",
         )?;
     } else if !session_cols.contains(&"session_token".to_string()) {
         info!("Upgrading legacy agent_sessions table schema to authoritative session format...");
@@ -480,7 +542,7 @@ fn migration_0002_authoritative_session_security(tx: &Transaction) -> Result<()>
                 expires_at TEXT NOT NULL,
                 last_activity_at TEXT NOT NULL,
                 FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
-             );"
+             );",
         )?;
     }
 
@@ -499,7 +561,7 @@ fn migration_0002_authoritative_session_security(tx: &Transaction) -> Result<()>
         "
         CREATE INDEX IF NOT EXISTS idx_agent_sessions_token ON agent_sessions(session_token);
         CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent ON agent_sessions(agent_id);
-        "
+        ",
     )?;
 
     Ok(())
@@ -575,7 +637,9 @@ fn migration_0004_claim_and_merge_metadata(tx: &Transaction) -> Result<()> {
         .unwrap_or_default();
 
     if !crit_cols.contains(&"is_locked".to_string()) {
-        tx.execute_batch("ALTER TABLE acceptance_criteria ADD COLUMN is_locked BOOLEAN NOT NULL DEFAULT 0;")?;
+        tx.execute_batch(
+            "ALTER TABLE acceptance_criteria ADD COLUMN is_locked BOOLEAN NOT NULL DEFAULT 0;",
+        )?;
     }
 
     // Ensure merge_queue table has active worker tracking
@@ -619,29 +683,37 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
                 finished_at TEXT,
                 FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
                 FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
-            );"
+            );",
         )?;
     } else {
         if !ta_cols.contains(&"attempt_number".to_string()) {
-            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;")?;
+            tx.execute_batch(
+                "ALTER TABLE task_attempts ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;",
+            )?;
         }
         if !ta_cols.contains(&"agent_id".to_string()) {
             tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN agent_id TEXT;")?;
         }
         if !ta_cols.contains(&"base_sha".to_string()) {
-            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE task_attempts ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !ta_cols.contains(&"head_sha".to_string()) {
             tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN head_sha TEXT;")?;
         }
         if !ta_cols.contains(&"status".to_string()) {
-            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';")?;
+            tx.execute_batch(
+                "ALTER TABLE task_attempts ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';",
+            )?;
         }
         if !ta_cols.contains(&"rejection_reasons".to_string()) {
             tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN rejection_reasons TEXT;")?;
         }
         if !ta_cols.contains(&"started_at".to_string()) {
-            tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN started_at TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE task_attempts ADD COLUMN started_at TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !ta_cols.contains(&"finished_at".to_string()) {
             tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN finished_at TEXT;")?;
@@ -676,7 +748,7 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
                 evaluated_at TEXT NOT NULL,
                 FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
                 FOREIGN KEY(attempt_id) REFERENCES task_attempts(id) ON DELETE CASCADE
-            );"
+            );",
         )?;
     } else {
         if !er_cols.contains(&"attempt_id".to_string()) {
@@ -686,7 +758,9 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
             tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN criterion_id TEXT;")?;
         }
         if !er_cols.contains(&"evaluator_name".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluator_name TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN evaluator_name TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !er_cols.contains(&"evaluator_type".to_string()) {
             tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluator_type TEXT NOT NULL DEFAULT 'COMMAND';")?;
@@ -695,28 +769,44 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
             tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluator_version TEXT NOT NULL DEFAULT '1.0.0';")?;
         }
         if !er_cols.contains(&"commit_sha".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN commit_sha TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN commit_sha TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !er_cols.contains(&"exit_code".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN exit_code INTEGER NOT NULL DEFAULT 0;")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN exit_code INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         if !er_cols.contains(&"stdout_output".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN stdout_output TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN stdout_output TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !er_cols.contains(&"stderr_output".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN stderr_output TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN stderr_output TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !er_cols.contains(&"output_sha256".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN output_sha256 TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN output_sha256 TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !er_cols.contains(&"duration_ms".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         if !er_cols.contains(&"passed".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN passed BOOLEAN NOT NULL DEFAULT 0;")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN passed BOOLEAN NOT NULL DEFAULT 0;",
+            )?;
         }
         if !er_cols.contains(&"evaluated_at".to_string()) {
-            tx.execute_batch("ALTER TABLE evaluator_results ADD COLUMN evaluated_at TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE evaluator_results ADD COLUMN evaluated_at TEXT NOT NULL DEFAULT '';",
+            )?;
         }
     }
 
@@ -741,7 +831,7 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
                 required BOOLEAN NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
-            );"
+            );",
         )?;
     } else {
         if !vp_cols.contains(&"project_id".to_string()) {
@@ -754,7 +844,9 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
             tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN check_type TEXT NOT NULL DEFAULT 'UNIT_TESTS';")?;
         }
         if !vp_cols.contains(&"command".to_string()) {
-            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN command TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE verification_profiles ADD COLUMN command TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         if !vp_cols.contains(&"args_json".to_string()) {
             tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN args_json TEXT NOT NULL DEFAULT '[]';")?;
@@ -763,10 +855,14 @@ fn migration_0005_task_attempts_and_machine_evaluators(tx: &Transaction) -> Resu
             tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 60;")?;
         }
         if !vp_cols.contains(&"required".to_string()) {
-            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN required BOOLEAN NOT NULL DEFAULT 1;")?;
+            tx.execute_batch(
+                "ALTER TABLE verification_profiles ADD COLUMN required BOOLEAN NOT NULL DEFAULT 1;",
+            )?;
         }
         if !vp_cols.contains(&"created_at".to_string()) {
-            tx.execute_batch("ALTER TABLE verification_profiles ADD COLUMN created_at TEXT NOT NULL DEFAULT '';")?;
+            tx.execute_batch(
+                "ALTER TABLE verification_profiles ADD COLUMN created_at TEXT NOT NULL DEFAULT '';",
+            )?;
         }
     }
 
@@ -830,13 +926,15 @@ fn migration_0006_task_masterplan_lifecycle_and_stale_invalidation(tx: &Transact
         "
         CREATE INDEX IF NOT EXISTS idx_tasks_project_masterplan ON tasks(project_id, masterplan_id);
         CREATE INDEX IF NOT EXISTS idx_tasks_state_stale ON tasks(state, is_stale);
-        "
+        ",
     )?;
 
     Ok(())
 }
 
-fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Transaction) -> Result<()> {
+fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(
+    tx: &Transaction,
+) -> Result<()> {
     // 1. Defensively normalize proof_bundles table
     tx.execute_batch(
         "
@@ -860,7 +958,7 @@ fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Tran
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
-        "
+        ",
     )?;
 
     let mut check_pb_stmt = tx.prepare("PRAGMA table_info(proof_bundles)")?;
@@ -877,34 +975,50 @@ fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Tran
         tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN attempt_id TEXT;")?;
     }
     if !pb_cols.contains(&"attempt_number".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;",
+        )?;
     }
     if !pb_cols.contains(&"prompt".to_string()) {
         tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN prompt TEXT NOT NULL DEFAULT '';")?;
     }
     if !pb_cols.contains(&"base_sha".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';",
+        )?;
     }
     if !pb_cols.contains(&"head_sha".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN head_sha TEXT NOT NULL DEFAULT '';")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN head_sha TEXT NOT NULL DEFAULT '';",
+        )?;
     }
     if !pb_cols.contains(&"files_changed_json".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN files_changed_json TEXT NOT NULL DEFAULT '[]';")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN files_changed_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
     }
     if !pb_cols.contains(&"diff_summary".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN diff_summary TEXT NOT NULL DEFAULT '';")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN diff_summary TEXT NOT NULL DEFAULT '';",
+        )?;
     }
     if !pb_cols.contains(&"verification_runs_json".to_string()) {
         tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN verification_runs_json TEXT NOT NULL DEFAULT '[]';")?;
     }
     if !pb_cols.contains(&"criteria_json".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
     }
     if !pb_cols.contains(&"steps_json".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
     }
     if !pb_cols.contains(&"generated_at".to_string()) {
-        tx.execute_batch("ALTER TABLE proof_bundles ADD COLUMN generated_at TEXT NOT NULL DEFAULT '';")?;
+        tx.execute_batch(
+            "ALTER TABLE proof_bundles ADD COLUMN generated_at TEXT NOT NULL DEFAULT '';",
+        )?;
     }
 
     // 2. Defensively normalize task_attempts table
@@ -916,10 +1030,14 @@ fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Tran
     drop(check_ta_stmt);
 
     if !ta_cols.contains(&"run_number".to_string()) {
-        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN run_number INTEGER NOT NULL DEFAULT 1;")?;
+        tx.execute_batch(
+            "ALTER TABLE task_attempts ADD COLUMN run_number INTEGER NOT NULL DEFAULT 1;",
+        )?;
     }
     if !ta_cols.contains(&"attempt_number".to_string()) {
-        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;")?;
+        tx.execute_batch(
+            "ALTER TABLE task_attempts ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1;",
+        )?;
     }
     if !ta_cols.contains(&"rejection_reasons".to_string()) {
         tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN rejection_reasons TEXT;")?;
@@ -960,7 +1078,7 @@ fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Tran
             evaluated_at TEXT NOT NULL,
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
-        "
+        ",
     )?;
 
     // 4. Ensure merge_queue table has all tracking columns
@@ -979,7 +1097,7 @@ fn migration_0007_normalize_proof_bundles_task_attempts_and_evaluators(tx: &Tran
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
         );
-        "
+        ",
     )?;
 
     let mut check_mq_stmt = tx.prepare("PRAGMA table_info(merge_queue)")?;
@@ -1024,7 +1142,9 @@ fn migration_0008_task_attempt_worktree_paths(tx: &Transaction) -> Result<()> {
     drop(check_ta_stmt);
 
     if !ta_cols.contains(&"worktree_path".to_string()) {
-        tx.execute_batch("ALTER TABLE task_attempts ADD COLUMN worktree_path TEXT NOT NULL DEFAULT '';")?;
+        tx.execute_batch(
+            "ALTER TABLE task_attempts ADD COLUMN worktree_path TEXT NOT NULL DEFAULT '';",
+        )?;
     }
 
     Ok(())
@@ -1060,24 +1180,59 @@ fn migration_0009_seed_canonical_ide_profiles_and_cleanup(tx: &Transaction) -> R
             last_activity_at TEXT NOT NULL,
             FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
         );
-        "
+        ",
     )?;
 
     let canonical_roster = [
-        ("antigravity", "Antigravity", "IDE", "Google Antigravity Advanced Agentic Coding Assistant"),
-        ("claude-code", "Claude Code", "CLI", "Anthropic Claude Code Agentic Terminal Engine"),
+        (
+            "antigravity",
+            "Antigravity",
+            "IDE",
+            "Google Antigravity Advanced Agentic Coding Assistant",
+        ),
+        (
+            "claude-code",
+            "Claude Code",
+            "CLI",
+            "Anthropic Claude Code Agentic Terminal Engine",
+        ),
         ("cursor", "Cursor", "IDE", "Cursor AI Coding Assistant"),
-        ("opencode", "OpenCode", "IDE", "OpenCode Multi-Agent Orchestrator"),
-        ("codex", "OpenAI Codex", "CLI", "OpenAI Codex Agentic Coding Engine"),
-        ("gemini-cli", "Gemini CLI", "CLI", "Google Gemini Developer CLI"),
-        ("copilot", "GitHub Copilot", "IDE", "GitHub Copilot / VS Code Agent"),
-        ("windsurf", "Windsurf", "IDE", "Codeium Windsurf AI Cascade IDE"),
+        (
+            "opencode",
+            "OpenCode",
+            "IDE",
+            "OpenCode Multi-Agent Orchestrator",
+        ),
+        (
+            "codex",
+            "OpenAI Codex",
+            "CLI",
+            "OpenAI Codex Agentic Coding Engine",
+        ),
+        (
+            "gemini-cli",
+            "Gemini CLI",
+            "CLI",
+            "Google Gemini Developer CLI",
+        ),
+        (
+            "copilot",
+            "GitHub Copilot",
+            "IDE",
+            "GitHub Copilot / VS Code Agent",
+        ),
+        (
+            "windsurf",
+            "Windsurf",
+            "IDE",
+            "Codeium Windsurf AI Cascade IDE",
+        ),
         ("junie", "Junie", "IDE", "JetBrains Junie AI Assistant"),
         ("aider", "Aider", "CLI", "Aider AI Pair Programmer"),
     ];
 
     for (id, name, agent_type, profile) in canonical_roster {
-        let token = format!("axf_sess_{}", id.replace('-', "_"));
+        let token = generate_session_token();
         tx.execute(
             "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at, session_token)
              VALUES (?1, ?2, ?3, ?4, 'IDLE', ?5, ?5, ?6)
@@ -1121,7 +1276,7 @@ fn migration_0010_masterplan_milestone_approval_toggle(tx: &Transaction) -> Resu
             updated_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
-        "
+        ",
     )?;
 
     let mut check_mp_stmt = tx.prepare("PRAGMA table_info(masterplans)")?;
@@ -1156,7 +1311,7 @@ fn migration_0011_multiple_masterplans_and_active_toggle(tx: &Transaction) -> Re
             updated_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
-        "
+        ",
     )?;
 
     let mut check_mp_stmt = tx.prepare("PRAGMA table_info(masterplans)")?;
@@ -1167,11 +1322,15 @@ fn migration_0011_multiple_masterplans_and_active_toggle(tx: &Transaction) -> Re
     drop(check_mp_stmt);
 
     if !mp_cols.contains(&"title".to_string()) {
-        tx.execute_batch("ALTER TABLE masterplans ADD COLUMN title TEXT NOT NULL DEFAULT 'Masterplan';")?;
+        tx.execute_batch(
+            "ALTER TABLE masterplans ADD COLUMN title TEXT NOT NULL DEFAULT 'Masterplan';",
+        )?;
     }
 
     if !mp_cols.contains(&"is_active".to_string()) {
-        tx.execute_batch("ALTER TABLE masterplans ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 0;")?;
+        tx.execute_batch(
+            "ALTER TABLE masterplans ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 0;",
+        )?;
         // Set the latest masterplan for each project to is_active = 1
         tx.execute_batch(
             "
@@ -1186,7 +1345,7 @@ fn migration_0011_multiple_masterplans_and_active_toggle(tx: &Transaction) -> Re
                     WHERE m2.project_id = m1.project_id
                 )
             );
-            "
+            ",
         )?;
     }
 
@@ -1195,35 +1354,350 @@ fn migration_0011_multiple_masterplans_and_active_toggle(tx: &Transaction) -> Re
     Ok(())
 }
 
+/// Adds durable structured timeout evidence to verification_runs for timed-out checks
+fn migration_0012_timeout_evidence(tx: &Transaction) -> Result<()> {
+    let mut check_stmt = tx.prepare("PRAGMA table_info(verification_runs)")?;
+    let vr_cols = check_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect::<Vec<String>>())
+        .unwrap_or_default();
+    drop(check_stmt);
+
+    if !vr_cols.is_empty() && !vr_cols.contains(&"timed_out".to_string()) {
+        tx.execute_batch(
+            "ALTER TABLE verification_runs ADD COLUMN timed_out INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Rebuilds `tasks` with a CHECK constraint on `state` so illegal state values are
+/// rejected at the database layer. Runs with PRAGMA foreign_keys disabled around the
+/// transaction (see run_migrations) so the DROP TABLE does not cascade-delete child
+/// rows in tables referencing tasks(id). Every index of the pre-v13 `tasks` table is
+/// recreated exactly; every row is preserved by the INSERT..SELECT. The column list
+/// is built defensively from the live schema (PRAGMA table_info) because legacy
+/// databases may be missing columns that migration 0001 declares or 0004/0006 add.
+fn migration_0013_task_state_check(tx: &Transaction) -> Result<()> {
+    let mut check_stmt = tx.prepare("PRAGMA table_info(tasks)")?;
+    let task_cols: Vec<String> = check_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    drop(check_stmt);
+
+    let new_schema_cols = [
+        "id",
+        "project_id",
+        "parent_id",
+        "epic_id",
+        "title",
+        "description",
+        "state",
+        "substate",
+        "priority",
+        "risk_score",
+        "estimated_scope",
+        "assigned_agent_id",
+        "assigned_profile_id",
+        "allocated_budget_usd",
+        "spent_budget_usd",
+        "worktree_path",
+        "branch_name",
+        "base_sha",
+        "head_sha",
+        "created_at",
+        "updated_at",
+        "attempt_count",
+        "masterplan_id",
+        "masterplan_revision_id",
+        "is_stale",
+    ];
+    let present_cols: Vec<&str> = new_schema_cols
+        .iter()
+        .copied()
+        .filter(|c| task_cols.iter().any(|t| t == c))
+        .collect();
+    let cols = present_cols.join(", ");
+
+    tx.execute_batch(&format!(
+        "
+        CREATE TABLE tasks_new (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            parent_id TEXT,
+            epic_id TEXT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'BACKLOG' CHECK (state IN ('BACKLOG','READY','RUNNING','CLAIMING','VERIFYING','VERIFIED','MERGE_READY','DONE','FAILED','BLOCKED','REVIEW','CANCELLED','WORKING','CLAIMED','ANALYZING','SCOPE_APPROVED')),
+            substate TEXT NOT NULL DEFAULT 'NONE',
+            priority TEXT NOT NULL DEFAULT 'MEDIUM',
+            risk_score REAL DEFAULT 0.0,
+            estimated_scope TEXT,
+            assigned_agent_id TEXT,
+            assigned_profile_id TEXT,
+            allocated_budget_usd REAL,
+            spent_budget_usd REAL DEFAULT 0.0,
+            worktree_path TEXT,
+            branch_name TEXT,
+            base_sha TEXT,
+            head_sha TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            masterplan_id TEXT,
+            masterplan_revision_id TEXT,
+            is_stale BOOLEAN NOT NULL DEFAULT 0,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(parent_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        INSERT INTO tasks_new ({cols}) SELECT {cols} FROM tasks;
+
+        DROP TABLE tasks;
+
+        ALTER TABLE tasks_new RENAME TO tasks;
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_project_state ON tasks(project_id, state);
+        CREATE INDEX IF NOT EXISTS idx_tasks_project_masterplan ON tasks(project_id, masterplan_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_state_stale ON tasks(state, is_stale);
+        "
+    ))?;
+
+    Ok(())
+}
+
+/// Rebuilds `proof_bundles` without the UNIQUE constraint on `proof_hash` so every
+/// verification attempt appends a new proof row instead of overwriting the prior
+/// per-attempt row (D10). The rebuild runs inside the PRAGMA foreign_keys OFF bracket
+/// in run_migrations (mirroring v13). No table references proof_bundles, so no child
+/// rows are at risk; the bracket is still used for consistency. Every row is preserved
+/// by the INSERT..SELECT; the task_id FK and both indexes of the pre-v14 table are
+/// recreated exactly. The column list is built defensively from the live schema
+/// (PRAGMA table_info) because legacy databases may be missing columns that migration
+/// 0003 declares or 0005/0007 add.
+fn migration_0014_proof_bundles_append_only(tx: &Transaction) -> Result<()> {
+    let mut check_stmt = tx.prepare("PRAGMA table_info(proof_bundles)")?;
+    let pb_cols: Vec<String> = check_stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    drop(check_stmt);
+
+    let new_schema_cols = [
+        "id",
+        "task_id",
+        "project_id",
+        "agent_id",
+        "attempt_id",
+        "attempt_number",
+        "prompt",
+        "base_sha",
+        "head_sha",
+        "files_changed_json",
+        "diff_summary",
+        "verification_runs_json",
+        "criteria_json",
+        "steps_json",
+        "proof_hash",
+        "generated_at",
+    ];
+    let present_cols: Vec<&str> = new_schema_cols
+        .iter()
+        .copied()
+        .filter(|c| pb_cols.iter().any(|t| t == c))
+        .collect();
+    let cols = present_cols.join(", ");
+
+    tx.execute_batch(&format!(
+        "
+        CREATE TABLE proof_bundles_new (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            agent_id TEXT,
+            attempt_id TEXT,
+            attempt_number INTEGER NOT NULL DEFAULT 1,
+            prompt TEXT NOT NULL,
+            base_sha TEXT NOT NULL,
+            head_sha TEXT NOT NULL,
+            files_changed_json TEXT NOT NULL,
+            diff_summary TEXT NOT NULL,
+            verification_runs_json TEXT NOT NULL,
+            criteria_json TEXT NOT NULL,
+            steps_json TEXT NOT NULL,
+            proof_hash TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        INSERT INTO proof_bundles_new ({cols}) SELECT {cols} FROM proof_bundles;
+
+        DROP TABLE proof_bundles;
+
+        ALTER TABLE proof_bundles_new RENAME TO proof_bundles;
+
+        CREATE INDEX IF NOT EXISTS idx_proof_bundles_task_sha ON proof_bundles(task_id, head_sha);
+        CREATE INDEX IF NOT EXISTS idx_proof_bundles_task_attempt ON proof_bundles(task_id, attempt_number);
+        "
+    ))?;
+
+    Ok(())
+}
+
+/// Idempotency key table for decompose retries (D22): stores the result of a
+/// decompose operation keyed by a client-supplied idempotency key. If the same
+/// key is reused with the same masterplan_id, the stored steps are returned
+/// without re-decomposing. A key reused with a *different* masterplan_id is
+/// rejected to prevent cross-plan key scoping violations.
+fn migration_0015_masterplan_operations(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS masterplan_operations (
+            idempotency_key TEXT PRIMARY KEY,
+            masterplan_id TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// D11: stored session tokens were deterministic (`axf_sess_<agent_id>`), so any
+/// actor knowing a public agent id could authenticate as that agent. Rotate every
+/// stored token to a fresh random value (one per row, both tables). Randomness is
+/// generated at migration time inside the migration transaction; the
+/// `agent_sessions.session_token UNIQUE` constraint is preserved because random
+/// tokens cannot collide. Existing clients holding pre-upgrade tokens must
+/// re-register (the registration response returns the fresh token).
+fn migration_0016_rotate_session_tokens(tx: &Transaction) -> Result<()> {
+    // Defensive table checks: real databases always carry these tables (migration
+    // v1/v2), but synthetic upgrade-test fixtures may omit them.
+    let table_exists = |name: &str| -> Result<bool> {
+        tx.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+    };
+
+    if table_exists("agents")? {
+        let mut agent_stmt = tx.prepare("SELECT id FROM agents")?;
+        let agent_ids: Vec<String> = agent_stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+        drop(agent_stmt);
+
+        for agent_id in agent_ids {
+            tx.execute(
+                "UPDATE agents SET session_token = ?1 WHERE id = ?2",
+                rusqlite::params![generate_session_token(), agent_id],
+            )?;
+        }
+    }
+
+    if table_exists("agent_sessions")? {
+        let mut sess_stmt = tx.prepare("SELECT id FROM agent_sessions")?;
+        let sess_ids: Vec<String> = sess_stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+        drop(sess_stmt);
+
+        for sess_id in sess_ids {
+            tx.execute(
+                "UPDATE agent_sessions SET session_token = ?1 WHERE id = ?2",
+                rusqlite::params![generate_session_token(), sess_id],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Verifies that all required database tables and columns exist before accepting coordinator traffic
 pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
     // 1. Verify proof_bundles
-    let mut check_pb = conn.prepare("PRAGMA table_info(proof_bundles)").map_err(|e| e.to_string())?;
-    let pb_cols: Vec<String> = check_pb.query_map([], |r| r.get(1)).map_err(|e| e.to_string())?.flatten().collect();
+    let mut check_pb = conn
+        .prepare("PRAGMA table_info(proof_bundles)")
+        .map_err(|e| e.to_string())?;
+    let pb_cols: Vec<String> = check_pb
+        .query_map([], |r| r.get(1))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
     drop(check_pb);
-    for col in &["id", "task_id", "project_id", "attempt_number", "verification_runs_json", "criteria_json", "steps_json", "proof_hash", "generated_at"] {
+    for col in &[
+        "id",
+        "task_id",
+        "project_id",
+        "attempt_number",
+        "verification_runs_json",
+        "criteria_json",
+        "steps_json",
+        "proof_hash",
+        "generated_at",
+    ] {
         if !pb_cols.iter().any(|c| c == col) {
-            return Err(format!("Schema verification failed: column '{}' missing from proof_bundles", col));
+            return Err(format!(
+                "Schema verification failed: column '{}' missing from proof_bundles",
+                col
+            ));
         }
     }
 
     // 2. Verify task_attempts
-    let mut check_ta = conn.prepare("PRAGMA table_info(task_attempts)").map_err(|e| e.to_string())?;
-    let ta_cols: Vec<String> = check_ta.query_map([], |r| r.get(1)).map_err(|e| e.to_string())?.flatten().collect();
+    let mut check_ta = conn
+        .prepare("PRAGMA table_info(task_attempts)")
+        .map_err(|e| e.to_string())?;
+    let ta_cols: Vec<String> = check_ta
+        .query_map([], |r| r.get(1))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
     drop(check_ta);
-    for col in &["id", "task_id", "attempt_number", "run_number", "worktree_path", "status", "started_at"] {
+    for col in &[
+        "id",
+        "task_id",
+        "attempt_number",
+        "run_number",
+        "worktree_path",
+        "status",
+        "started_at",
+    ] {
         if !ta_cols.iter().any(|c| c == col) {
-            return Err(format!("Schema verification failed: column '{}' missing from task_attempts", col));
+            return Err(format!(
+                "Schema verification failed: column '{}' missing from task_attempts",
+                col
+            ));
         }
     }
 
     // 3. Verify evaluator_results
-    let mut check_er = conn.prepare("PRAGMA table_info(evaluator_results)").map_err(|e| e.to_string())?;
-    let er_cols: Vec<String> = check_er.query_map([], |r| r.get(1)).map_err(|e| e.to_string())?.flatten().collect();
+    let mut check_er = conn
+        .prepare("PRAGMA table_info(evaluator_results)")
+        .map_err(|e| e.to_string())?;
+    let er_cols: Vec<String> = check_er
+        .query_map([], |r| r.get(1))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
     drop(check_er);
-    for col in &["id", "task_id", "attempt_id", "evaluator_name", "passed", "evaluated_at"] {
+    for col in &[
+        "id",
+        "task_id",
+        "attempt_id",
+        "evaluator_name",
+        "passed",
+        "evaluated_at",
+    ] {
         if !er_cols.iter().any(|c| c == col) {
-            return Err(format!("Schema verification failed: column '{}' missing from evaluator_results", col));
+            return Err(format!(
+                "Schema verification failed: column '{}' missing from evaluator_results",
+                col
+            ));
         }
     }
 

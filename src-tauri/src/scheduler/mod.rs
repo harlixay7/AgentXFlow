@@ -1,8 +1,8 @@
-use tracing::info;
 use crate::dag::DagEngine;
 use crate::db::DbPool;
 use crate::models::{Task, TaskState};
 use crate::scope::ScopeManager;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -57,7 +57,10 @@ impl SchedulerEngine {
             .unwrap_or(0);
 
         if active_count >= self.config.max_active_agents {
-            info!("Max active agent concurrency limit ({}/{}) reached for project '{}'", active_count, self.config.max_active_agents, project_id);
+            info!(
+                "Max active agent concurrency limit ({}/{}) reached for project '{}'",
+                active_count, self.config.max_active_agents, project_id
+            );
             return Ok(Vec::new());
         }
 

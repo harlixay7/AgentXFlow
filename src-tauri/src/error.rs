@@ -18,7 +18,9 @@ pub enum CoordinatorError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),
 
-    #[error("Task ownership violation: Task {task_id} is owned by agent {owner_id}, not {caller_id}")]
+    #[error(
+        "Task ownership violation: Task {task_id} is owned by agent {owner_id}, not {caller_id}"
+    )]
     TaskOwnershipViolation {
         task_id: String,
         owner_id: String,
@@ -43,10 +45,7 @@ pub enum CoordinatorError {
     ScopeViolation { violations: Vec<String> },
 
     #[error("Worktree is dirty or contains uncommitted changes at {path}: {details:?}")]
-    DirtyWorktree {
-        path: String,
-        details: Vec<String>,
-    },
+    DirtyWorktree { path: String, details: Vec<String> },
 
     #[error("Verification check '{check}' failed with exit code {exit_code}: {details}")]
     VerificationFailed {
@@ -76,10 +75,7 @@ pub enum CoordinatorError {
     },
 
     #[error("Post-merge integration test failed with exit code {exit_code}: {details}")]
-    PostMergeVerificationFailed {
-        exit_code: i32,
-        details: String,
-    },
+    PostMergeVerificationFailed { exit_code: i32, details: String },
 
     #[error("Acceptance criterion '{criterion}' is incomplete or unsatisfied")]
     UnsatisfiedCriterion { criterion: String },

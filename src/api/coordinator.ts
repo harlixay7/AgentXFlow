@@ -167,6 +167,18 @@ export const coordinatorApi = {
     return await invoke('list_agents');
   },
 
+  async unregisterAgent(agentId: string): Promise<void> {
+    return await invoke('unregister_agent', { agentId });
+  },
+
+  async unclaimAgentTasks(agentId: string): Promise<string[]> {
+    return await invoke('unclaim_agent_tasks', { agentId });
+  },
+
+  async forceAgentIdle(agentId: string): Promise<void> {
+    return await invoke('force_agent_idle', { agentId });
+  },
+
   async listAllMasterplans(): Promise<import('../types').MasterplanSummary[]> {
     if (!isTauri) return [];
     return await invoke('list_all_masterplans');
@@ -276,6 +288,28 @@ export const coordinatorApi = {
       throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
     }
     return await invoke('set_masterplan_milestone_approval', { projectId, requireApproval });
+  },
+
+  async resetMasterplan(projectId: string, masterplanId?: string): Promise<void> {
+    if (!isTauri) {
+      throw new Error('Coordinator backend is available only inside the AgentXFlow desktop app.');
+    }
+    return await invoke('reset_masterplan', { projectId, masterplanId });
+  },
+
+  async decomposeMasterplan(
+    projectId: string,
+    steps: Array<{
+      step_index: number;
+      title: string;
+      description: string;
+      suggested_scope?: string;
+      acceptance_criteria?: string;
+    }>,
+    append?: boolean
+  ): Promise<import('../types').MasterplanStep[]> {
+    if (!isTauri) return [];
+    return await invoke('decompose_masterplan', { projectId, steps, append });
   },
 };
 

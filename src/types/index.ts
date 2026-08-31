@@ -112,12 +112,16 @@ export interface AgentCapabilitySet {
 export interface Agent {
   id: string;
   name: string;
-  agent_type: 'Codex' | 'OpenCode' | 'Claude' | 'Antigravity' | 'Generic';
-  profile: 'Planner' | 'Implementer' | 'Reviewer' | 'Tester' | 'Security' | 'MergeResolver';
+  agent_type: 'Codex' | 'OpenCode' | 'Claude' | 'Antigravity' | 'Generic' | string;
+  profile: 'Planner' | 'Implementer' | 'Reviewer' | 'Tester' | 'Security' | 'MergeResolver' | string;
   status: 'IDLE' | 'WORKING' | 'BLOCKED' | 'DISCONNECTED';
   capabilities: AgentCapabilitySet;
   last_heartbeat: string;
   created_at: string;
+  session_token?: string;
+  active_task_id?: string;
+  active_task_title?: string;
+  last_seen_seconds?: number;
 }
 
 export interface ScopeLease {

@@ -42,7 +42,9 @@ impl GitService {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let output = child.wait_with_output().map_err(|e| format!("Failed to read git output: {}", e))?;
+                    let output = child
+                        .wait_with_output()
+                        .map_err(|e| format!("Failed to read git output: {}", e))?;
                     if status.success() {
                         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
                     } else {
@@ -71,12 +73,57 @@ impl GitService {
             .unwrap_or(false)
     }
 
+    /// A path is "managed" by AgentXFlow only if it lives under a managed root AND is a
+    /// registered git worktree of `repo_path`. Managed roots are the coordinator worktree pool
+    /// (data_dir/AgentXFlow/worktrees) and the legacy <repo>/.agentxflow directory.
+    /// Falls back to the `task-<id>` leaf convention only when git registration cannot be
+    /// confirmed (e.g. worktree metadata was already pruned).
+    pub fn is_managed_worktree(
+        &self,
+        repo_path: &Path,
+        managed_roots: &[PathBuf],
+        candidate: &Path,
+    ) -> bool {
+        let Some(root) = managed_roots.iter().find(|r| candidate.starts_with(r)) else {
+            return false;
+        };
+        if let Ok(list) = self.run_git_cmd(repo_path, &["worktree", "list", "--porcelain"]) {
+            let registered = list.lines().any(|l| {
+                l.strip_prefix("worktree ")
+                    .map(|p| Path::new(p) == candidate)
+                    .unwrap_or(false)
+            });
+            if registered {
+                return true;
+            }
+        }
+        let leaf_ok = candidate
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("task-"))
+            .unwrap_or(false);
+        leaf_ok && candidate.parent() == Some(root)
+    }
+
     pub fn init_repo(&self, repo_path: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(repo_path).map_err(|e| format!("Failed to create folder {:?}: {}", repo_path, e))?;
+        std::fs::create_dir_all(repo_path)
+            .map_err(|e| format!("Failed to create folder {:?}: {}", repo_path, e))?;
         self.run_git_cmd(repo_path, &["init"])?;
-        self.run_git_cmd(repo_path, &["checkout", "-b", "main"]).ok();
+        self.run_git_cmd(repo_path, &["checkout", "-b", "main"])
+            .ok();
+
+        let gitignore = repo_path.join(".gitignore");
+        if !gitignore.exists() {
+            let _ = std::fs::write(&gitignore, ".agentxflow/\n");
+            self.run_git_cmd(repo_path, &["add", ".gitignore"]).ok();
+        }
+
         if self.run_git_cmd(repo_path, &["rev-parse", "HEAD"]).is_err() {
-            self.run_git_cmd(repo_path, &["commit", "--allow-empty", "-m", "Initial commit"]).ok();
+            self.run_git_cmd(
+                repo_path,
+                &["commit", "--allow-empty", "-m", "Initial commit"],
+            )
+            .ok();
         }
         Ok(())
     }
@@ -108,15 +155,23 @@ impl GitService {
         base_branch: &str,
     ) -> Result<PathBuf, String> {
         if let Some(parent) = worktree_dir.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create worktree parent directory: {}", e))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create worktree parent directory: {}", e))?;
         }
 
-        info!("Creating git worktree at {:?} for branch {}", worktree_dir, branch_name);
+        info!(
+            "Creating git worktree at {:?} for branch {}",
+            worktree_dir, branch_name
+        );
 
-        let branch_exists = self.run_git_cmd(repo_path, &["rev-parse", "--verify", branch_name]).is_ok();
+        let branch_exists = self
+            .run_git_cmd(repo_path, &["rev-parse", "--verify", branch_name])
+            .is_ok();
 
         let mut args = vec!["worktree", "add"];
-        let worktree_str = worktree_dir.to_str().ok_or("Invalid UTF-8 in worktree path")?;
+        let worktree_str = worktree_dir
+            .to_str()
+            .ok_or("Invalid UTF-8 in worktree path")?;
 
         if branch_exists {
             args.push(worktree_str);
@@ -147,23 +202,48 @@ impl GitService {
         if !integration_dir.exists() {
             std::fs::create_dir_all(&integration_dir).map_err(|e| e.to_string())?;
             let integration_str = integration_dir.to_str().ok_or("Invalid UTF-8 path")?;
-            
+
             // Check if detached integration worktree can be added
-            let res = self.run_git_cmd(repo_path, &["worktree", "add", "--detach", integration_str, target_branch]);
-            if let Err(e) = res {
-                warn!("Integration worktree add notice: {}", e);
-            }
+            self.run_git_cmd(
+                repo_path,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    integration_str,
+                    target_branch,
+                ],
+            )?;
         }
 
         Ok(integration_dir)
     }
 
-    pub fn remove_worktree(&self, repo_path: &Path, worktree_dir: &Path) -> Result<(), String> {
-        let worktree_str = worktree_dir.to_str().ok_or("Invalid UTF-8 in worktree path")?;
+    pub fn remove_worktree(
+        &self,
+        repo_path: &Path,
+        managed_roots: &[PathBuf],
+        worktree_dir: &Path,
+    ) -> Result<(), String> {
+        if !self.is_managed_worktree(repo_path, managed_roots, worktree_dir) {
+            warn!(
+                "Refusing to remove unmanaged path {:?}: not a registered worktree of {:?}",
+                worktree_dir, repo_path
+            );
+            return Ok(());
+        }
+        let worktree_str = worktree_dir
+            .to_str()
+            .ok_or("Invalid UTF-8 in worktree path")?;
         info!("Removing git worktree at {:?}", worktree_dir);
 
-        if let Err(e) = self.run_git_cmd(repo_path, &["worktree", "remove", "--force", worktree_str]) {
-            error!("Git worktree remove returned error: {}. Cleaning directory directly.", e);
+        if let Err(e) =
+            self.run_git_cmd(repo_path, &["worktree", "remove", "--force", worktree_str])
+        {
+            error!(
+                "Git worktree remove returned error: {}. Cleaning directory directly.",
+                e
+            );
         }
 
         self.run_git_cmd(repo_path, &["worktree", "prune"]).ok();
@@ -199,12 +279,32 @@ impl GitService {
         }
     }
 
-    pub fn get_diff(&self, repo_path: &Path, base_ref: &str, target_ref: &str) -> Result<String, String> {
-        self.run_git_cmd(repo_path, &["diff", &format!("{}...{}", base_ref, target_ref)])
+    pub fn get_diff(
+        &self,
+        repo_path: &Path,
+        base_ref: &str,
+        target_ref: &str,
+    ) -> Result<String, String> {
+        self.run_git_cmd(
+            repo_path,
+            &["diff", &format!("{}...{}", base_ref, target_ref)],
+        )
     }
 
-    pub fn get_changed_files(&self, repo_path: &Path, base_ref: &str, target_ref: &str) -> Result<Vec<String>, String> {
-        let output = self.run_git_cmd(repo_path, &["diff", "--name-only", &format!("{}...{}", base_ref, target_ref)])?;
+    pub fn get_changed_files(
+        &self,
+        repo_path: &Path,
+        base_ref: &str,
+        target_ref: &str,
+    ) -> Result<Vec<String>, String> {
+        let output = self.run_git_cmd(
+            repo_path,
+            &[
+                "diff",
+                "--name-only",
+                &format!("{}...{}", base_ref, target_ref),
+            ],
+        )?;
         let files = output
             .lines()
             .map(|l| l.trim().to_string())
@@ -235,28 +335,41 @@ impl GitService {
         }
     }
 
-    pub fn get_worktree_mutations(&self, worktree_dir: &Path, base_sha: &str) -> Result<Vec<String>, String> {
+    pub fn get_worktree_mutations(
+        &self,
+        worktree_dir: &Path,
+        base_sha: &str,
+    ) -> Result<Vec<String>, String> {
         let mut changed_set = std::collections::HashSet::new();
 
-        // 1. Committed diff between base_sha and worktree HEAD
-        if let Ok(committed_output) = self.run_git_cmd(worktree_dir, &["diff", "--name-only", base_sha, "HEAD"]) {
-            for line in committed_output.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    changed_set.insert(trimmed.to_string());
-                }
+        // 1. Committed diff between base_sha and worktree HEAD.
+        //    Fail closed: if the diff cannot be computed the change set is unknown.
+        let committed_output = self
+            .run_git_cmd(worktree_dir, &["diff", "--name-only", base_sha, "HEAD"])
+            .map_err(|e| {
+                format!(
+                    "Failed to compute committed diff against base '{}': {}",
+                    base_sha, e
+                )
+            })?;
+        for line in committed_output.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                changed_set.insert(trimmed.to_string());
             }
         }
 
-        // 2. Uncommitted staged and unstaged changes
-        if let Ok(status_output) = self.run_git_cmd(worktree_dir, &["status", "--porcelain"]) {
-            for line in status_output.lines() {
-                let trimmed = line.trim();
-                if trimmed.len() > 3 {
-                    let file_path = trimmed[3..].trim();
-                    if !file_path.is_empty() {
-                        changed_set.insert(file_path.to_string());
-                    }
+        // 2. Uncommitted staged and unstaged changes.
+        //    Fail closed: if the status cannot be queried the change set is unknown.
+        let status_output = self
+            .run_git_cmd(worktree_dir, &["status", "--porcelain"])
+            .map_err(|e| format!("Failed to query worktree status for mutation audit: {}", e))?;
+        for line in status_output.lines() {
+            let trimmed = line.trim();
+            if trimmed.len() > 3 {
+                let file_path = trimmed[3..].trim();
+                if !file_path.is_empty() {
+                    changed_set.insert(file_path.to_string());
                 }
             }
         }
@@ -276,8 +389,17 @@ impl GitService {
     /// Auto-inspects repository structure for the V2 Import Wizard
     pub fn inspect_repository(&self, repo_path: &Path) -> RepoInspectionResult {
         let is_git = self.is_git_repo(repo_path);
-        let active_branch = if is_git { self.get_current_branch(repo_path).ok() } else { None };
-        let remote_url = if is_git { self.run_git_cmd(repo_path, &["remote", "get-url", "origin"]).ok() } else { None };
+        let active_branch = if is_git {
+            self.get_current_branch(repo_path).ok()
+        } else {
+            None
+        };
+        let remote_url = if is_git {
+            self.run_git_cmd(repo_path, &["remote", "get-url", "origin"])
+                .ok()
+        } else {
+            None
+        };
 
         let mut languages = Vec::new();
         let mut package_managers = Vec::new();
@@ -301,7 +423,8 @@ impl GitService {
             build_scripts.push("cargo build".to_string());
         }
 
-        if repo_path.join("pyproject.toml").exists() || repo_path.join("requirements.txt").exists() {
+        if repo_path.join("pyproject.toml").exists() || repo_path.join("requirements.txt").exists()
+        {
             languages.push("Python".to_string());
             test_scripts.push("pytest".to_string());
         }
@@ -311,8 +434,11 @@ impl GitService {
             test_scripts.push("go test ./...".to_string());
         }
 
-        let has_ci = repo_path.join(".github").join("workflows").exists() || repo_path.join(".gitlab-ci.yml").exists();
-        let has_instruction_file = repo_path.join("SKILL.md").exists() || repo_path.join("AGENTS.md").exists() || repo_path.join("CLAUDE.md").exists();
+        let has_ci = repo_path.join(".github").join("workflows").exists()
+            || repo_path.join(".gitlab-ci.yml").exists();
+        let has_instruction_file = repo_path.join("SKILL.md").exists()
+            || repo_path.join("AGENTS.md").exists()
+            || repo_path.join("CLAUDE.md").exists();
 
         RepoInspectionResult {
             is_git_repo: is_git,

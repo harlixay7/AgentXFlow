@@ -17,7 +17,11 @@ fn setup_temp_git_repo() -> std::path::PathBuf {
             .output()
             .expect("Failed to run git command");
         if !out.status.success() {
-            eprintln!("Git cmd {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            eprintln!(
+                "Git cmd {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     };
 
@@ -92,7 +96,7 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     }
 
     let decomposed = engine
-        .decompose_masterplan(proj_id, steps_input)
+        .decompose_masterplan(proj_id, steps_input, None, None)
         .expect("Failed to decompose masterplan");
 
     assert_eq!(decomposed.len(), 12);
@@ -101,8 +105,12 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     assert_eq!(updated_plan.status, "RESORTED");
 
     println!("[TEST] 3. Registering agents...");
-    let agent1 = engine.register_agent("Antigravity-Lead", "Antigravity").unwrap();
-    let agent2 = engine.register_agent("Claude-Code-Backend", "Claude").unwrap();
+    let agent1 = engine
+        .register_agent("Antigravity-Lead", "Antigravity")
+        .unwrap();
+    let agent2 = engine
+        .register_agent("Claude-Code-Backend", "Claude")
+        .unwrap();
     let agent3 = engine.register_agent("Cursor-Frontend", "Cursor").unwrap();
 
     println!("[TEST] 4. Agent 1 claiming chunk 1...");
@@ -124,8 +132,13 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
             suggested_scope: None,
             acceptance_criteria: None,
         }],
+        None,
+        None,
     );
-    assert!(hostile_decompose.is_err(), "Re-decomposition must be blocked when steps are claimed");
+    assert!(
+        hostile_decompose.is_err(),
+        "Re-decomposition must be blocked when steps are claimed"
+    );
 
     println!("[TEST] 5. Agent 2 claiming chunk 2...");
     let task2 = engine
@@ -160,13 +173,25 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     assert!(no_more.is_err());
 
     println!("[TEST] 9. Re-registering agent...");
-    let re_agent1 = engine.register_agent("Antigravity-Lead", "Antigravity").unwrap();
+    let re_agent1 = engine
+        .register_agent("Antigravity-Lead", "Antigravity")
+        .unwrap();
     assert_eq!(re_agent1.id, agent1.id);
-    assert_eq!(re_agent1.session_token, agent1.session_token);
+    // D11: re-registration must rotate to a fresh random token, never reuse the
+    // forgeable deterministic axf_sess_<id> value.
+    assert_ne!(
+        re_agent1.session_token, agent1.session_token,
+        "Re-registration must rotate the session token"
+    );
+    assert!(re_agent1.session_token.is_some());
 
     println!("[TEST] 10. Resetting masterplan...");
-    let reset_res = engine.reset_masterplan(proj_id);
-    assert!(reset_res.is_ok(), "Resetting masterplan must succeed without deadlock: {:?}", reset_res.err());
+    let reset_res = engine.reset_masterplan(proj_id, None);
+    assert!(
+        reset_res.is_ok(),
+        "Resetting masterplan must succeed without deadlock: {:?}",
+        reset_res.err()
+    );
 
     let plan_after_reset = engine.get_masterplan(proj_id).unwrap();
     assert!(plan_after_reset.is_none());
@@ -174,4 +199,197 @@ fn test_masterplan_lifecycle_and_chunked_claims() {
     let steps_after_reset = engine.list_masterplan_steps(proj_id).unwrap();
     assert_eq!(steps_after_reset.len(), 0);
     println!("[TEST] SUCCESS!");
+}
+
+#[test]
+fn test_decompose_idempotency_key_returns_stored_result() {
+    let temp_repo = setup_temp_git_repo();
+    let temp_db = temp_repo.join("test_db.sqlite");
+    let pool = DbPool::new(&temp_db).expect("Failed to initialize test DB");
+    let engine = CoordinatorEngine::new(pool.clone());
+
+    let proj = engine
+        .create_project(
+            "Idempotency Test",
+            &temp_repo.to_string_lossy(),
+            "Spec",
+            "main",
+        )
+        .expect("Failed to create test project");
+
+    engine
+        .create_or_update_masterplan(&proj.id, "Plan text", 4, 2)
+        .unwrap();
+
+    let steps_input: Vec<DecomposedStepInput> = (1..=4)
+        .map(|i| DecomposedStepInput {
+            step_index: i,
+            title: format!("Step {}", i),
+            description: format!("Desc {}", i),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        })
+        .collect();
+
+    let first = engine
+        .decompose_masterplan(
+            &proj.id,
+            steps_input.clone(),
+            None,
+            Some("key-abc".to_string()),
+        )
+        .expect("First decompose failed");
+    assert_eq!(first.len(), 4);
+
+    let second = engine
+        .decompose_masterplan(
+            &proj.id,
+            steps_input.clone(),
+            None,
+            Some("key-abc".to_string()),
+        )
+        .expect("Second decompose with same key failed");
+    assert_eq!(second.len(), 4);
+    assert_eq!(first[0].title, second[0].title);
+
+    let steps = engine.list_masterplan_steps(&proj.id).unwrap();
+    assert_eq!(steps.len(), 4, "Masterplan_steps must not have duplicates");
+}
+
+#[test]
+fn test_decompose_duplicate_without_key_still_heuristic_guarded() {
+    let temp_repo = setup_temp_git_repo();
+    let temp_db = temp_repo.join("test_db.sqlite");
+    let pool = DbPool::new(&temp_db).expect("Failed to initialize test DB");
+    let engine = CoordinatorEngine::new(pool.clone());
+
+    let proj = engine
+        .create_project("Guard Test", &temp_repo.to_string_lossy(), "Spec", "main")
+        .expect("Failed to create test project");
+
+    engine
+        .create_or_update_masterplan(&proj.id, "Plan text", 2, 1)
+        .unwrap();
+
+    let steps1: Vec<DecomposedStepInput> = vec![
+        DecomposedStepInput {
+            step_index: 1,
+            title: "S1".into(),
+            description: "D1".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+        DecomposedStepInput {
+            step_index: 2,
+            title: "S2".into(),
+            description: "D2".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+    ];
+
+    engine
+        .decompose_masterplan(&proj.id, steps1, None, None)
+        .unwrap();
+
+    let steps2: Vec<DecomposedStepInput> = vec![
+        DecomposedStepInput {
+            step_index: 1,
+            title: "S1".into(),
+            description: "D1".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+        DecomposedStepInput {
+            step_index: 2,
+            title: "S2".into(),
+            description: "D2".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+    ];
+
+    let res = engine.decompose_masterplan(&proj.id, steps2, None, None);
+    assert!(
+        res.is_ok(),
+        "Content-equality guard should allow identical retry without claims"
+    );
+}
+
+#[test]
+fn test_idempotency_key_scoped_to_masterplan() {
+    let temp_repo = setup_temp_git_repo();
+    let temp_db = temp_repo.join("test_db.sqlite");
+    let pool = DbPool::new(&temp_db).expect("Failed to initialize test DB");
+    let engine = CoordinatorEngine::new(pool.clone());
+
+    let dir_a = temp_repo.join("proj_a");
+    let dir_b = temp_repo.join("proj_b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let proj_a = engine
+        .create_project("Scope Test A", &dir_a.to_string_lossy(), "Spec", "main")
+        .expect("Failed to create test project");
+    let proj_b = engine
+        .create_project("Scope Test B", &dir_b.to_string_lossy(), "Spec", "main")
+        .expect("Failed to create test project");
+
+    engine
+        .create_or_update_masterplan(&proj_a.id, "Plan text", 2, 1)
+        .unwrap();
+    engine
+        .create_or_update_masterplan(&proj_b.id, "Plan text B", 3, 1)
+        .unwrap();
+
+    let steps1: Vec<DecomposedStepInput> = vec![
+        DecomposedStepInput {
+            step_index: 1,
+            title: "S1".into(),
+            description: "D1".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+        DecomposedStepInput {
+            step_index: 2,
+            title: "S2".into(),
+            description: "D2".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+    ];
+
+    engine
+        .decompose_masterplan(&proj_a.id, steps1, None, Some("shared-key".to_string()))
+        .unwrap();
+
+    let steps2: Vec<DecomposedStepInput> = vec![
+        DecomposedStepInput {
+            step_index: 1,
+            title: "A".into(),
+            description: "B".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+        DecomposedStepInput {
+            step_index: 2,
+            title: "C".into(),
+            description: "D".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+        DecomposedStepInput {
+            step_index: 3,
+            title: "E".into(),
+            description: "F".into(),
+            suggested_scope: None,
+            acceptance_criteria: None,
+        },
+    ];
+
+    let res = engine.decompose_masterplan(&proj_b.id, steps2, None, Some("shared-key".to_string()));
+    assert!(
+        res.is_err(),
+        "Reusing an idempotency key with a different masterplan_id must fail"
+    );
 }

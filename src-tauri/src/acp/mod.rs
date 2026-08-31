@@ -50,18 +50,33 @@ impl AcpRuntime {
             #[cfg(not(target_os = "windows"))]
             let check_cmd = format!("which {}", bin);
 
-            let is_installed = std::process::Command::new(if cfg!(target_os = "windows") { "cmd" } else { "sh" })
-                .args([if cfg!(target_os = "windows") { "/c" } else { "-c" }, &check_cmd])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let is_installed = std::process::Command::new(if cfg!(target_os = "windows") {
+                "cmd"
+            } else {
+                "sh"
+            })
+            .args([
+                if cfg!(target_os = "windows") {
+                    "/c"
+                } else {
+                    "-c"
+                },
+                &check_cmd,
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
 
             discovered.push(AcpAgentDescriptor {
                 name: name.to_string(),
                 binary_name: bin.to_string(),
                 agent_type: agent_type.to_string(),
                 is_installed,
-                version: if is_installed { Some("1.0.0".to_string()) } else { None },
+                version: if is_installed {
+                    Some("1.0.0".to_string())
+                } else {
+                    None
+                },
                 capabilities: AgentCapabilitySet::default(),
             });
         }
@@ -81,7 +96,10 @@ impl AcpRuntime {
         let run_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        info!("Starting ACP agent run '{}' for agent '{}' on task '{}' (Role: {})", run_id, agent_id, task_id, role);
+        info!(
+            "Starting ACP agent run '{}' for agent '{}' on task '{}' (Role: {})",
+            run_id, agent_id, task_id, role
+        );
 
         let run = AgentRun {
             id: run_id.clone(),
@@ -148,7 +166,11 @@ impl AcpRuntime {
         Ok(req)
     }
 
-    pub fn respond_permission_request(&self, request_id: &str, is_approved: bool) -> Result<(), String> {
+    pub fn respond_permission_request(
+        &self,
+        request_id: &str,
+        is_approved: bool,
+    ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let status = if is_approved { "APPROVED" } else { "DENIED" };
 
@@ -156,7 +178,8 @@ impl AcpRuntime {
         conn.execute(
             "UPDATE agent_permission_requests SET status = ?1, responded_at = ?2 WHERE id = ?3",
             rusqlite::params![status, now, request_id],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok(())
     }

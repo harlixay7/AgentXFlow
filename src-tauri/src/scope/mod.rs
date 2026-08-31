@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::db::DbPool;
@@ -45,7 +45,9 @@ impl ScopeManager {
         let expires_at = (now + Duration::hours(4)).to_rfc3339();
 
         // Use transaction for atomic check & lease reservation
-        let tx = conn.transaction().map_err(|e| format!("Failed to start scope transaction: {}", e))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start scope transaction: {}", e))?;
 
         // 1. Clean up expired leases
         tx.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now_str])
@@ -111,8 +113,13 @@ impl ScopeManager {
             });
         }
 
-        tx.commit().map_err(|e| format!("Failed to commit scope reservation: {}", e))?;
-        info!("Successfully acquired {} scope leases for task '{}'", granted.len(), task_id);
+        tx.commit()
+            .map_err(|e| format!("Failed to commit scope reservation: {}", e))?;
+        info!(
+            "Successfully acquired {} scope leases for task '{}'",
+            granted.len(),
+            task_id
+        );
         Ok(granted)
     }
 
@@ -136,7 +143,10 @@ impl ScopeManager {
         }
         if result.is_empty() && !raw.trim().is_empty() {
             let clean = raw.trim().replace('\\', "/");
-            let norm = clean.trim_start_matches("./").trim_start_matches('/').to_string();
+            let norm = clean
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
             if Glob::new(&norm).is_err() {
                 return Err(format!("Invalid glob pattern: '{}'", norm));
             }
@@ -147,50 +157,17 @@ impl ScopeManager {
 
     pub fn normalize_pattern(raw: &str) -> Result<String, String> {
         let list = Self::normalize_patterns(raw)?;
-        list.into_iter().next().ok_or_else(|| "Empty pattern".to_string())
+        list.into_iter()
+            .next()
+            .ok_or_else(|| "Empty pattern".to_string())
     }
 
-    /// Layer 2: Real-time collision analysis against concurrent active tasks
-    pub fn check_scope_overlap(
-        &self,
-        target_task_id: &str,
-        patterns: &[String],
-    ) -> Result<Vec<ScopeLease>, String> {
-        let conn = self.db.lock();
-        let now = Utc::now().to_rfc3339();
-
-        let mut stmt = conn
-            .prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id != ?1 AND expires_at > ?2 AND access_type = 'EXCLUSIVE_WRITE'")
-            .map_err(|e| e.to_string())?;
-
-        let leases_iter = stmt
-            .query_map(rusqlite::params![target_task_id, now], |row| {
-                Ok(ScopeLease {
-                    id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    agent_id: row.get(2)?,
-                    pattern: row.get(3)?,
-                    access_type: row.get(4)?,
-                    expires_at: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-
-        let mut overlapping = Vec::new();
-        for lease_res in leases_iter.flatten() {
-            for requested in patterns {
-                let norm = Self::normalize_pattern(requested).unwrap_or_else(|_| requested.clone());
-                if self.globs_might_overlap(&norm, &lease_res.pattern) {
-                    overlapping.push(lease_res.clone());
-                    break;
-                }
-            }
-        }
-
-        Ok(overlapping)
-    }
-
+    /// Layer 2 (real-time collision analysis) was removed: `check_scope_overlap`
+    /// had no callers, and its only logic was a DB query delegating to
+    /// `globs_might_overlap` — the exact algorithm `acquire_scope`'s pre-check
+    /// already uses. Both paths share one implementation, so the dead duplicate
+    /// was deleted (hardening D25).
+    ///
     /// Layer 3: Actual mutation audit comparing real Git diff changed files against granted scope leases
     pub fn audit_actual_mutations(
         &self,
@@ -217,7 +194,9 @@ impl ScopeManager {
             .map_err(|e| e.to_string())?;
 
         let patterns_iter = stmt
-            .query_map(rusqlite::params![task_id, now_str], |row| row.get::<_, String>(0))
+            .query_map(rusqlite::params![task_id, now_str], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|e| e.to_string())?;
 
         let mut builder = GlobSetBuilder::new();
@@ -239,7 +218,10 @@ impl ScopeManager {
 
         for file in changed_files {
             let normalized = file.replace('\\', "/");
-            let clean = normalized.trim_start_matches("./").trim_start_matches('/').to_string();
+            let clean = normalized
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
 
             if !globset.is_match(&clean) {
                 let v_id = Uuid::new_v4().to_string();
@@ -247,7 +229,13 @@ impl ScopeManager {
                     "INSERT INTO scope_violations (id, task_id, agent_id, file_path, violation_type, detected_at, resolved, attempt_id)
                      VALUES (?1, ?2, ?3, ?4, 'UNRESERVED_WRITE', ?5, 0, ?6)",
                     rusqlite::params![v_id, task_id, agent_id, clean, now_str, attempt_id],
-                ).ok();
+                )
+                .map_err(|e| {
+                    format!(
+                        "Failed to record scope violation for '{}': {}",
+                        clean, e
+                    )
+                })?;
 
                 violations.push(ScopeViolation {
                     id: v_id,
@@ -261,20 +249,53 @@ impl ScopeManager {
             }
         }
 
-        // Auto-resolve any previous violations for files that are either no longer in changed_files or are now covered by scope
-        if let Ok(mut unres_stmt) = conn.prepare("SELECT id, file_path FROM scope_violations WHERE task_id = ?1 AND resolved = 0") {
-            if let Ok(unres_iter) = unres_stmt.query_map([task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
-                let unres_list: Vec<(String, String)> = unres_iter.flatten().collect();
-                for (v_id, path) in unres_list {
-                    let normalized = path.replace('\\', "/");
-                    let clean = normalized.trim_start_matches("./").trim_start_matches('/').to_string();
-                    let is_still_changed = changed_files.iter().any(|f| {
-                        let f_clean = f.replace('\\', "/").trim_start_matches("./").trim_start_matches('/').to_string();
-                        f_clean == clean
-                    });
-                    if !is_still_changed || globset.is_match(&clean) {
-                        conn.execute("UPDATE scope_violations SET resolved = 1 WHERE id = ?1", [&v_id]).ok();
-                    }
+        // Auto-resolve any previous violations for files that are either no longer in changed_files or are now covered by scope.
+        // Auto-resolve is non-fatal: failures are logged instead of silently leaving stale unresolved records.
+        let mut unres_stmt = match conn.prepare(
+            "SELECT id, file_path FROM scope_violations WHERE task_id = ?1 AND resolved = 0",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                error!(
+                    "Failed to load unresolved scope violations for auto-resolve: {}",
+                    e
+                );
+                return Ok(violations);
+            }
+        };
+        let unres_iter = match unres_stmt.query_map([task_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(iter) => iter,
+            Err(e) => {
+                error!(
+                    "Failed to query unresolved scope violations for auto-resolve: {}",
+                    e
+                );
+                return Ok(violations);
+            }
+        };
+        let unres_list: Vec<(String, String)> = unres_iter.flatten().collect();
+        for (v_id, path) in unres_list {
+            let normalized = path.replace('\\', "/");
+            let clean = normalized
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
+            let is_still_changed = changed_files.iter().any(|f| {
+                let f_clean = f
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .trim_start_matches('/')
+                    .to_string();
+                f_clean == clean
+            });
+            if !is_still_changed || globset.is_match(&clean) {
+                if let Err(e) = conn.execute(
+                    "UPDATE scope_violations SET resolved = 1 WHERE id = ?1",
+                    [&v_id],
+                ) {
+                    error!("Failed to auto-resolve scope violation '{}': {}", v_id, e);
                 }
             }
         }
@@ -283,14 +304,30 @@ impl ScopeManager {
     }
 
     /// Semantic Collision Risk Scoring
-    pub fn calculate_collision_risk(&self, task_a_id: &str, task_b_id: &str) -> Result<CollisionRisk, String> {
+    pub fn calculate_collision_risk(
+        &self,
+        task_a_id: &str,
+        task_b_id: &str,
+    ) -> Result<CollisionRisk, String> {
         let conn = self.db.lock();
 
-        let mut stmt_a = conn.prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let patterns_a: Vec<String> = stmt_a.query_map([task_a_id], |r| r.get(0)).map_err(|e| e.to_string())?.flatten().collect();
+        let mut stmt_a = conn
+            .prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let patterns_a: Vec<String> = stmt_a
+            .query_map([task_a_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
-        let mut stmt_b = conn.prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let patterns_b: Vec<String> = stmt_b.query_map([task_b_id], |r| r.get(0)).map_err(|e| e.to_string())?.flatten().collect();
+        let mut stmt_b = conn
+            .prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let patterns_b: Vec<String> = stmt_b
+            .query_map([task_b_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let mut overlapping = Vec::new();
         let mut semantic_factors = Vec::new();
@@ -335,20 +372,27 @@ impl ScopeManager {
 
     pub fn release_scope_by_agent(&self, task_id: &str, agent_id: &str) -> Result<(), String> {
         let conn = self.db.lock();
-        let affected = conn.execute(
-            "DELETE FROM scope_leases WHERE task_id = ?1 AND agent_id = ?2",
-            rusqlite::params![task_id, agent_id],
-        ).map_err(|e| e.to_string())?;
+        let affected = conn
+            .execute(
+                "DELETE FROM scope_leases WHERE task_id = ?1 AND agent_id = ?2",
+                rusqlite::params![task_id, agent_id],
+            )
+            .map_err(|e| e.to_string())?;
 
         if affected == 0 {
             // Check if leases existed under another agent
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM scope_leases WHERE task_id = ?1",
-                [task_id],
-                |r| r.get(0),
-            ).unwrap_or(0);
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM scope_leases WHERE task_id = ?1",
+                    [task_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             if count > 0 {
-                return Err(format!("Scope lease release rejected: Leases for task '{}' belong to another agent.", task_id));
+                return Err(format!(
+                    "Scope lease release rejected: Leases for task '{}' belong to another agent.",
+                    task_id
+                ));
             }
         }
         Ok(())
@@ -358,14 +402,21 @@ impl ScopeManager {
         let conn = self.db.lock();
         let now = Utc::now();
         let expires_at = (now + Duration::hours(4)).to_rfc3339();
-        conn.execute("UPDATE scope_leases SET expires_at = ?1 WHERE task_id = ?2", rusqlite::params![expires_at, task_id])
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE scope_leases SET expires_at = ?1 WHERE task_id = ?2",
+            rusqlite::params![expires_at, task_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     /// Conservative glob overlap detection:
     /// Any partial, direct, prefix, wildcard, or uncertain relationship blocks collision.
     pub fn globs_might_overlap(&self, pattern_a: &str, pattern_b: &str) -> bool {
+        // Windows filesystems are case-insensitive, so compare in lowercase there.
+        #[cfg(target_os = "windows")]
+        let (pattern_a, pattern_b) = (pattern_a.to_lowercase(), pattern_b.to_lowercase());
+
         if pattern_a == pattern_b {
             return true;
         }
@@ -373,13 +424,46 @@ impl ScopeManager {
             return true;
         }
 
-        let clean_a = pattern_a.trim_end_matches('*').trim_end_matches('/');
-        let clean_b = pattern_b.trim_end_matches('*').trim_end_matches('/');
+        // Segment-aware comparison: split both patterns on '/'. Inputs are already
+        // normalized (backslashes converted to '/', "./" stripped) by normalize_patterns.
+        let segments_a: Vec<&str> = pattern_a.split('/').collect();
+        let segments_b: Vec<&str> = pattern_b.split('/').collect();
 
-        if clean_a.is_empty() || clean_b.is_empty() {
-            return true;
+        let (shorter, longer) = if segments_a.len() <= segments_b.len() {
+            (&segments_a, &segments_b)
+        } else {
+            (&segments_b, &segments_a)
+        };
+
+        for (seg_a, seg_b) in shorter.iter().zip(longer.iter()) {
+            if !Self::segments_compatible(seg_a, seg_b) {
+                return false;
+            }
         }
 
-        clean_a.starts_with(clean_b) || clean_b.starts_with(clean_a)
+        if longer.len() > shorter.len() {
+            // A deeper pattern overlaps when the shorter one ends in a wildcard
+            // (matches arbitrary depth), or the boundary is prefix-compatible: the
+            // longer pattern's segment at the shorter's last index starts with the
+            // shorter's last segment (e.g. "src" vs "src/auth", "src/foo" vs
+            // "src/foo*/x" — conservative).
+            let last_short = shorter.last().expect("patterns are non-empty");
+            let boundary = longer[shorter.len() - 1];
+            boundary.starts_with(last_short) || last_short.contains('*') || boundary.contains('*')
+        } else {
+            true
+        }
+    }
+
+    /// Segments at the same path position are compatible when equal, or when either
+    /// side contains a wildcard (`*`/`**`): conservatively, any wildcard could match
+    /// the other segment (a literal that is a prefix of a wildcard segment's fixed
+    /// part is subsumed by this rule, e.g. "foo" vs "foo*"). A literal-vs-literal
+    /// mismatch in a shared position means the paths are disjoint.
+    fn segments_compatible(a: &str, b: &str) -> bool {
+        a == b || a.contains('*') || b.contains('*')
     }
 }
+
+#[cfg(test)]
+mod tests;

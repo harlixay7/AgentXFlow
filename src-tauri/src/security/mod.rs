@@ -1,9 +1,9 @@
 use crate::error::CoordinatorError;
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
@@ -48,7 +48,15 @@ impl SecurityManager {
     }
 
     fn generate_and_save_token(path: &Path) -> Result<String, CoordinatorError> {
-        let raw = format!("{}-{}-{}", Uuid::new_v4(), Uuid::new_v4(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let raw = format!(
+            "{}-{}-{}",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
         let mut hasher = Sha256::new();
         hasher.update(raw.as_bytes());
         let token = format!("axf_live_{}", hex::encode(hasher.finalize()));
@@ -64,14 +72,23 @@ impl SecurityManager {
     }
 
     pub fn rotate_token(&self) -> Result<String, CoordinatorError> {
-        let raw = format!("{}-{}-{}", Uuid::new_v4(), Uuid::new_v4(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        let raw = format!(
+            "{}-{}-{}",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
         let mut hasher = Sha256::new();
         hasher.update(raw.as_bytes());
         let new_token = format!("axf_live_{}", hex::encode(hasher.finalize()));
 
         if let Some(ref path) = self.token_file {
-            fs::write(path, &new_token)
-                .map_err(|e| CoordinatorError::Io(format!("Failed to persist rotated auth.token: {}", e)))?;
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(path, &new_token).map_err(|e| {
+                CoordinatorError::Io(format!("Failed to persist rotated auth.token: {}", e))
+            })?;
         }
 
         *self.token.write() = new_token.clone();
@@ -81,6 +98,26 @@ impl SecurityManager {
 
     pub fn validate_token(&self, incoming: &str) -> bool {
         let current = self.token.read();
-        incoming == *current
+        constant_time_eq(incoming, &current)
     }
 }
+
+/// Constant-time string equality: length check first (returns false on length
+/// mismatch), then OR-accumulate byte-wise XOR differences and compare to zero.
+/// Never short-circuits on the first differing byte, so comparison time does
+/// not leak prefix information about the secret.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+#[cfg(test)]
+mod tests;

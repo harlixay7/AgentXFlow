@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.4] - 2026-08-16
+
+### Added
+- **Final Release Delivery Protocol (Step N/N)**:
+  - Coordinator core detects final chunk completion (`Step N/N`) and returns `next_action: "FINAL_RELEASE_DELIVERY"`.
+  - Mandates building the production executable, generating automated launch scripts (`run.bat` for Windows / `start.sh` for Unix), verifying launch, and writing a comprehensive `USER_GUIDE.md` / `HOW_TO_USE.md`.
+- **4-Phase Deep Architectural Decomposition & Phased Chunking**:
+  - Added `append: true` support to `masterplan_decompose` for phased 25-step chunking across 4 distinct phases (Foundation, Domain Logic, UI & Motion, Polish & Release).
+  - Rich prompt guidance in `masterplan_get` instructing architects to expand specifications with creative UX ideas, defensive error boundaries, state flows, and non-overlapping scopes.
+- **Clean Repository Reset on Masterplan Reset**:
+  - `reset_masterplan` cleanly resets the local Git repository (`git reset --hard HEAD`, `git clean -fd`, `git worktree prune`), cancels active tasks, wipes `.agentxflow/worktrees`, and clears all step records.
+  - Exposed `masterplan_reset` as a native MCP tool (`masterplan_reset(project_id="...", masterplan_id="...")`) with full JSON schema.
+- **Real-Time Primary Workspace Synchronization**:
+  - Automatically synchronizes the primary repository working directory on disk (`git reset --hard HEAD` and `git clean -fd`) immediately upon merge queue integration, guaranteeing that all merged files appear in the user's workspace in real time.
+- **Full-Stack Baseline & Root Mounting Rules**:
+  - Architect decomposition now enforces Step 1 runnable baseline scaffolding (`package.json`, `index.html`, `vite.config.ts`, `main.tsx`, `App.tsx`, router) and mandatory mounting of all UI components into `App.tsx`/routes across all phases to eliminate isolated/orphaned code.
+- **Masterplan UI Vertical Scrolling**:
+  - Wrapped Masterplan Hub catalog and step inspection views in responsive `.view-content` flex scroll viewports for smooth vertical scrolling across any list size.
+
+---
+
+## [0.4.3] - 2026-08-16
+
+### Added
+- **Dynamic Agent State Engine**:
+  - Automatically derives live agent status (`WORKING`, `IDLE`, `DISCONNECTED`) based on active in-flight task assignments (`RUNNING` / `VERIFYING`) and a 120-second liveness threshold.
+  - Adds `active_task_id`, `active_task_title`, and `last_seen_seconds` to the `Agent` model.
+- **Transparent MCP Activity Heartbeats**:
+  - Automatically touches agent session timestamps and heartbeats on every inbound MCP tool call without requiring agents to run background heartbeat timers.
+- **Interactive Step Unclaiming & Worktree Cleanup UI**:
+  - **Agent Management View**: Added live color indicators (🟢 IDLE, 🔵 WORKING, ⚪ DISCONNECTED), last seen timers ("Active 5s ago", "Seen 3m ago"), and 1-click **"Unclaim Steps"** & **"Force Idle"** controls.
+  - **Masterplan Hub View**: Added agent indicators on claimed chunk cards, inline 1-click **"Unclaim"** buttons for individual steps, and a batch **"Unclaim All (N)"** button to instantly release stale in-flight work back to `PENDING`.
+- **Coordinator Engine & IPC Extensions**:
+  - Added `unclaim_agent_tasks` and `force_agent_idle` core methods and exposed them via Tauri IPC and MCP tools (`unclaim_agent_tasks`, `force_agent_idle`).
+
+---
+
 ## [0.4.2] - 2026-08-15
 
 ### Added

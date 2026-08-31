@@ -187,6 +187,17 @@ body {
   overflow: hidden;
 }
 
+/* Generic View Content Scroll Container */
+.view-content {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
 /* Bottom Debugger Panels */
 .bottom-debugger-panel {
   height: 190px;

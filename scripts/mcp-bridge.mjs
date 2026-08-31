@@ -361,6 +361,28 @@ const TOOLS = [
       required: ['project_id'],
     },
   },
+  {
+    name: 'unclaim_agent_tasks',
+    description: 'Safely unclaim all active tasks for an agent, reverting masterplan steps to PENDING and releasing locks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent_id: { type: 'string', description: 'Agent identifier' },
+      },
+      required: ['agent_id'],
+    },
+  },
+  {
+    name: 'force_agent_idle',
+    description: 'Forces an agent status to IDLE, unclaiming active tasks and resetting session heartbeat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent_id: { type: 'string', description: 'Agent identifier' },
+      },
+      required: ['agent_id'],
+    },
+  },
 ];
 
 function getAgentSessionToken(agentId) {

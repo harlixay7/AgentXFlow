@@ -1,5 +1,6 @@
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -10,7 +11,21 @@ use crate::db::DbPool;
 use crate::models::{EvaluatorResult, ProofBundle, VerificationResult, VerificationRun};
 
 const MAX_OUTPUT_BYTES: usize = 65_536; // 64 KB per stream
-const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn kill_process_tree(child: &std::process::Child) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &format!("-{}", child.id())])
+            .output();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VerificationEngine {
@@ -24,6 +39,7 @@ impl VerificationEngine {
 
     /// Executes a configured verification check command directly in the task worktree
     /// with strict timeout, process termination, output capping, and duration tracking.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_check(
         &self,
         task_id: &str,
@@ -32,7 +48,12 @@ impl VerificationEngine {
         worktree_path: &Path,
         commit_sha: &str,
         command_str: &str,
+        timeout: Duration,
     ) -> Result<VerificationRun, String> {
+        if timeout.as_secs() < 1 {
+            return Err("timeout must be >= 1 second".to_string());
+        }
+
         info!(
             "Executing coordinator verification check '{}' [{}] in {:?}",
             check_name, command_str, worktree_path
@@ -45,32 +66,56 @@ impl VerificationEngine {
 
         let start = Instant::now();
 
-        #[cfg(target_os = "windows")]
-        let mut child = Command::new("cmd")
-            .args(["/c", command_str])
-            .current_dir(worktree_path)
+        let mut cmd = Command::new(if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        });
+        if cfg!(target_os = "windows") {
+            cmd.args(["/c", command_str]);
+        } else {
+            cmd.args(["-c", command_str]);
+        }
+        cmd.current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn command '{}': {}", command_str, e))?;
 
-        #[cfg(not(target_os = "windows"))]
-        let mut child = Command::new("sh")
-            .args(["-c", command_str])
-            .current_dir(worktree_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn command '{}': {}", command_str, e))?;
+        let mut out_reader = child.stdout.take().map(|mut handle| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = handle.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let mut err_reader = child.stderr.take().map(|mut handle| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = handle.read_to_end(&mut buf);
+                buf
+            })
+        });
 
         // Poll with timeout
         let mut timed_out = false;
+        let mut exit_status: Option<std::process::ExitStatus> = None;
         loop {
             match child.try_wait() {
-                Ok(Some(_status)) => break,
+                Ok(Some(status)) => {
+                    exit_status = Some(status);
+                    break;
+                }
                 Ok(None) => {
-                    if start.elapsed() > CHECK_TIMEOUT {
+                    if start.elapsed() > timeout {
                         timed_out = true;
+                        kill_process_tree(&child);
                         let _ = child.kill();
                         break;
                     }
@@ -78,45 +123,52 @@ impl VerificationEngine {
                 }
                 Err(e) => {
                     warn!("Error waiting on child process: {}", e);
+                    kill_process_tree(&child);
                     let _ = child.kill();
                     break;
                 }
             }
         }
+        let _ = child.wait(); // reap the direct child
+
+        let stdout = out_reader
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = err_reader
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let mut out = String::from_utf8_lossy(&stdout).into_owned();
+        let mut err = String::from_utf8_lossy(&stderr).into_owned();
+
+        if out.len() > MAX_OUTPUT_BYTES {
+            out.truncate(MAX_OUTPUT_BYTES);
+            out.push_str("\n\n[...STDOUT TRUNCATED BY COORDINATOR (EXCEEDED 64KB)...]");
+        }
+        if err.len() > MAX_OUTPUT_BYTES {
+            err.truncate(MAX_OUTPUT_BYTES);
+            err.push_str("\n\n[...STDERR TRUNCATED BY COORDINATOR (EXCEEDED 64KB)...]");
+        }
+
+        if timed_out {
+            let timeout_msg = format!(
+                "Command timed out after {} seconds and was terminated.",
+                timeout.as_secs()
+            );
+            if !err.is_empty() {
+                err.push_str("\n\n");
+            }
+            err.push_str(&timeout_msg);
+        }
+
+        let (exit_code, is_passed) = match (timed_out, exit_status) {
+            (true, _) => (-1, false),
+            (false, Some(s)) => (s.code().unwrap_or(-1), s.code() == Some(0)),
+            (false, None) => (-1, false),
+        };
 
         let duration_ms = start.elapsed().as_millis() as i64;
-
-        let (exit_code, stdout, stderr, is_passed) = if timed_out {
-            (
-                -1,
-                String::new(),
-                format!(
-                    "Command timed out after {} seconds and was terminated.",
-                    CHECK_TIMEOUT.as_secs()
-                ),
-                false,
-            )
-        } else {
-            let output = child
-                .wait_with_output()
-                .map_err(|e| format!("Failed to read command output: {}", e))?;
-
-            let code = output.status.code().unwrap_or(-1);
-            let mut out = String::from_utf8_lossy(&output.stdout).to_string();
-            let mut err = String::from_utf8_lossy(&output.stderr).to_string();
-
-            if out.len() > MAX_OUTPUT_BYTES {
-                out.truncate(MAX_OUTPUT_BYTES);
-                out.push_str("\n\n[...STDOUT TRUNCATED BY COORDINATOR (EXCEEDED 64KB)...]");
-            }
-            if err.len() > MAX_OUTPUT_BYTES {
-                err.truncate(MAX_OUTPUT_BYTES);
-                err.push_str("\n\n[...STDERR TRUNCATED BY COORDINATOR (EXCEEDED 64KB)...]");
-            }
-
-            let passed = output.status.success();
-            (code, out, err, passed)
-        };
 
         let run_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -130,23 +182,24 @@ impl VerificationEngine {
             commit_sha: commit_sha.to_string(),
             command: command_str.to_string(),
             exit_code,
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
+            stdout: out.clone(),
+            stderr: err.clone(),
             duration_ms,
             is_passed,
             is_stale: false,
             executed_at: now.clone(),
+            timed_out,
         };
 
         // Record in SQLite
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO verification_runs (id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO verification_runs (id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at, timed_out)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 run.id, run.task_id, run.run_id, run.check_id, run.check_name,
                 run.commit_sha, run.command, run.exit_code, run.stdout, run.stderr,
-                run.duration_ms, run.is_passed, run.is_stale, run.executed_at
+                run.duration_ms, run.is_passed, run.is_stale, run.executed_at, timed_out
             ],
         ).map_err(|e| e.to_string())?;
 
@@ -157,6 +210,7 @@ impl VerificationEngine {
             "exit_code": exit_code,
             "duration_ms": duration_ms,
             "passed": is_passed,
+            "timed_out": timed_out,
             "commit_sha": commit_sha,
         });
 
@@ -170,12 +224,17 @@ impl VerificationEngine {
     }
 
     /// Automatically marks previous verification runs as stale if task HEAD moved
-    pub fn invalidate_stale_verifications(&self, task_id: &str, current_head_sha: &str) -> Result<(), String> {
+    pub fn invalidate_stale_verifications(
+        &self,
+        task_id: &str,
+        current_head_sha: &str,
+    ) -> Result<(), String> {
         let conn = self.db.lock();
         conn.execute(
             "UPDATE verification_runs SET is_stale = 1 WHERE task_id = ?1 AND commit_sha != ?2",
             rusqlite::params![task_id, current_head_sha],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -264,7 +323,8 @@ impl VerificationEngine {
         let mut results = Vec::new();
         let now_str = Utc::now().to_rfc3339();
 
-        for (chk_id, chk_type, cmd, _args_json, _timeout, _required) in configured_checks {
+        for (chk_id, chk_type, cmd, _args_json, timeout_secs, _required) in configured_checks {
+            let timeout = Duration::from_secs(timeout_secs.max(1) as u64);
             let run_res = self.execute_check(
                 task_id,
                 &chk_id,
@@ -272,6 +332,7 @@ impl VerificationEngine {
                 worktree_path,
                 commit_sha,
                 &cmd,
+                timeout,
             )?;
 
             // Compute SHA256 of stdout + stderr
@@ -322,14 +383,19 @@ impl VerificationEngine {
             conn.execute(
                 "UPDATE acceptance_criteria SET is_satisfied = 1 WHERE task_id = ?1",
                 [task_id],
-            ).map_err(|e| format!("Failed to update acceptance criteria: {}", e))?;
+            )
+            .map_err(|e| format!("Failed to update acceptance criteria: {}", e))?;
         }
 
         Ok(results)
     }
 
     /// Verifies task submission against mandatory checklist, evidence, machine evaluators, and coordinator checks
-    pub fn verify_task_submission(&self, task_id: &str, current_head_sha: &str) -> Result<VerificationResult, String> {
+    pub fn verify_task_submission(
+        &self,
+        task_id: &str,
+        current_head_sha: &str,
+    ) -> Result<VerificationResult, String> {
         let conn = self.db.lock();
 
         // 1. Mandatory Steps Checklist Gate
@@ -339,7 +405,12 @@ impl VerificationEngine {
 
         let steps_iter = stmt
             .query_map([task_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, String>(3)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
 
@@ -372,7 +443,11 @@ impl VerificationEngine {
 
         let runs_iter = stmt_runs
             .query_map(rusqlite::params![task_id, current_head_sha], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
 
@@ -393,7 +468,11 @@ impl VerificationEngine {
 
         let evals_iter = stmt_evals
             .query_map(rusqlite::params![task_id, current_head_sha], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, i32>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, i32>(2)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
 
@@ -401,7 +480,10 @@ impl VerificationEngine {
         for ev in evals_iter.flatten() {
             let (name, passed, exit_code) = ev;
             if !passed {
-                failed_evaluators.push(format!("Machine evaluator '{}' failed (exit code: {})", name, exit_code));
+                failed_evaluators.push(format!(
+                    "Machine evaluator '{}' failed (exit code: {})",
+                    name, exit_code
+                ));
             }
         }
 
@@ -416,7 +498,10 @@ impl VerificationEngine {
             rejection_reasons.push(format!("Unresolved out-of-scope modification: {}", file));
         }
         for check in &failed_checks {
-            rejection_reasons.push(format!("Coordinator verification check '{}' failed or is stale", check));
+            rejection_reasons.push(format!(
+                "Coordinator verification check '{}' failed or is stale",
+                check
+            ));
         }
         for eval_err in &failed_evaluators {
             rejection_reasons.push(eval_err.clone());
@@ -450,7 +535,7 @@ impl VerificationEngine {
         let conn = self.db.lock();
 
         let mut stmt = conn
-            .prepare("SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at FROM verification_runs WHERE task_id = ?1 AND commit_sha = ?2")
+            .prepare("SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at, timed_out FROM verification_runs WHERE task_id = ?1 AND commit_sha = ?2 ORDER BY id ASC")
             .map_err(|e| e.to_string())?;
 
         let runs_iter = stmt
@@ -470,6 +555,7 @@ impl VerificationEngine {
                     is_passed: row.get(11)?,
                     is_stale: row.get(12)?,
                     executed_at: row.get(13)?,
+                    timed_out: row.get(14)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -479,17 +565,23 @@ impl VerificationEngine {
             verification_runs.push(r);
         }
 
-        // Retrieve active attempt ID and attempt number
+        // Retrieve active attempt ID and attempt number. When no attempt row exists the
+        // digest must stay deterministic, so the fallback is a fixed empty identity (the
+        // same value persisted in proof_bundles.attempt_id) rather than a fresh UUID.
         let (attempt_id, attempt_num): (String, i32) = conn
             .query_row(
                 "SELECT id, attempt_number FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
                 [task_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap_or_else(|_| (Uuid::new_v4().to_string(), 1));
+            .unwrap_or_else(|_| (String::new(), 1));
 
         // Fetch task criteria and steps snapshots for audit log
-        let mut criteria_stmt = conn.prepare("SELECT id, criterion, is_satisfied FROM acceptance_criteria WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let mut criteria_stmt = conn
+            .prepare(
+                "SELECT id, criterion, is_satisfied FROM acceptance_criteria WHERE task_id = ?1 ORDER BY id ASC",
+            )
+            .map_err(|e| e.to_string())?;
         let criteria_json: String = criteria_stmt
             .query_map([task_id], |r| {
                 Ok(serde_json::json!({
@@ -498,11 +590,14 @@ impl VerificationEngine {
                     "is_satisfied": r.get::<_, bool>(2)?,
                 }))
             })
-            .map(|iter| serde_json::to_string(&iter.flatten().collect::<Vec<_>>()).unwrap_or("[]".to_string()))
+            .map(|iter| {
+                serde_json::to_string(&iter.flatten().collect::<Vec<_>>())
+                    .unwrap_or("[]".to_string())
+            })
             .unwrap_or("[]".to_string());
         drop(criteria_stmt);
 
-        let mut steps_stmt = conn.prepare("SELECT id, title, description, is_mandatory, status FROM task_steps WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let mut steps_stmt = conn.prepare("SELECT id, title, description, is_mandatory, status FROM task_steps WHERE task_id = ?1 ORDER BY id ASC").map_err(|e| e.to_string())?;
         let steps_json: String = steps_stmt
             .query_map([task_id], |r| {
                 Ok(serde_json::json!({
@@ -513,24 +608,120 @@ impl VerificationEngine {
                     "status": r.get::<_, String>(4)?,
                 }))
             })
-            .map(|iter| serde_json::to_string(&iter.flatten().collect::<Vec<_>>()).unwrap_or("[]".to_string()))
+            .map(|iter| {
+                serde_json::to_string(&iter.flatten().collect::<Vec<_>>())
+                    .unwrap_or("[]".to_string())
+            })
             .unwrap_or("[]".to_string());
         drop(steps_stmt);
 
-        // Canonical deterministic SHA256 digest across all verified package attributes
+        // Fetch machine evaluator results (identity, version and full result payload) for
+        // the same commit HEAD the bundle seals, in a deterministic order.
+        let mut evals_stmt = conn
+            .prepare(
+                "SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 AND commit_sha = ?2 ORDER BY id ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let evaluator_results: Vec<EvaluatorResult> = evals_stmt
+            .query_map(rusqlite::params![task_id, head_sha], |r| {
+                Ok(EvaluatorResult {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    attempt_id: r.get(2)?,
+                    criterion_id: r.get(3)?,
+                    evaluator_name: r.get(4)?,
+                    evaluator_type: r.get(5)?,
+                    evaluator_version: r.get(6)?,
+                    commit_sha: r.get(7)?,
+                    exit_code: r.get(8)?,
+                    stdout_output: r.get(9)?,
+                    stderr_output: r.get(10)?,
+                    output_sha256: r.get(11)?,
+                    duration_ms: r.get(12)?,
+                    passed: r.get(13)?,
+                    evaluated_at: r.get(14)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        drop(evals_stmt);
+
+        // Scope violations bound to this attempt, in a deterministic order.
+        let mut violations_stmt = conn
+            .prepare(
+                "SELECT id, task_id, agent_id, file_path, violation_type, detected_at, resolved FROM scope_violations WHERE task_id = ?1 AND attempt_id = ?2 ORDER BY id ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let scope_violations: Vec<crate::models::ScopeViolation> = violations_stmt
+            .query_map(rusqlite::params![task_id, attempt_id], |r| {
+                Ok(crate::models::ScopeViolation {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    file_path: r.get(3)?,
+                    violation_type: r.get(4)?,
+                    detected_at: r.get(5)?,
+                    resolved: r.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        drop(violations_stmt);
+
+        // Canonical ordering: sort files so the digest is independent of input order and
+        // the persisted files_changed_json matches exactly what was hashed.
+        let mut files_changed = files_changed.to_vec();
+        files_changed.sort();
+
+        // Canonical deterministic SHA256 digest across all verified package attributes.
+        // Every scalar is hashed as a u64 big-endian length prefix followed by its UTF-8
+        // bytes (integers and booleans as their decimal string form); every list carries a
+        // u64 big-endian element count. Fixed field order + length prefixes make the
+        // concatenation unambiguous, and every value is the exact one persisted in the
+        // proof_bundles row or re-derivable from the evidence tables with the same
+        // deterministic ORDER BY.
+        fn push_field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        fn push_list_count(hasher: &mut Sha256, len: usize) {
+            hasher.update((len as u64).to_be_bytes());
+        }
+
         let mut hasher = Sha256::new();
-        hasher.update(task_id.as_bytes());
-        hasher.update(project_id.as_bytes());
-        hasher.update(base_sha.as_bytes());
-        hasher.update(head_sha.as_bytes());
-        for f in files_changed {
-            hasher.update(f.as_bytes());
+        push_field(&mut hasher, task_id.as_bytes());
+        push_field(&mut hasher, project_id.as_bytes());
+        push_field(&mut hasher, attempt_id.as_bytes());
+        push_field(&mut hasher, base_sha.as_bytes());
+        push_field(&mut hasher, head_sha.as_bytes());
+        push_list_count(&mut hasher, files_changed.len());
+        for f in &files_changed {
+            push_field(&mut hasher, f.as_bytes());
         }
-        hasher.update(diff_summary.as_bytes());
+        push_field(&mut hasher, diff_summary.as_bytes());
+        push_field(&mut hasher, criteria_json.as_bytes());
+        push_field(&mut hasher, steps_json.as_bytes());
+        push_list_count(&mut hasher, verification_runs.len());
         for run in &verification_runs {
-            hasher.update(run.check_name.as_bytes());
-            hasher.update(run.exit_code.to_string().as_bytes());
+            push_field(&mut hasher, run.check_name.as_bytes());
+            push_field(&mut hasher, run.exit_code.to_string().as_bytes());
+            push_field(&mut hasher, run.duration_ms.to_string().as_bytes());
+            push_field(&mut hasher, run.timed_out.to_string().as_bytes());
+            push_field(&mut hasher, run.stdout.as_bytes());
+            push_field(&mut hasher, run.stderr.as_bytes());
         }
+        push_list_count(&mut hasher, evaluator_results.len());
+        for ev in &evaluator_results {
+            push_field(&mut hasher, ev.evaluator_name.as_bytes());
+            push_field(&mut hasher, ev.evaluator_version.as_bytes());
+            let result_json = serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string());
+            push_field(&mut hasher, result_json.as_bytes());
+        }
+        let violations_json =
+            serde_json::to_string(&scope_violations).unwrap_or_else(|_| "[]".to_string());
+        push_field(&mut hasher, violations_json.as_bytes());
         let proof_hash = hex::encode(hasher.finalize());
 
         let bundle = ProofBundle {
@@ -540,20 +731,21 @@ impl VerificationEngine {
             prompt: prompt.to_string(),
             base_sha: base_sha.to_string(),
             head_sha: head_sha.to_string(),
-            files_changed: files_changed.to_vec(),
+            files_changed: files_changed.clone(),
             diff_summary: diff_summary.to_string(),
             verification_runs,
-            scope_violations: Vec::new(),
+            scope_violations,
             proof_hash: proof_hash.clone(),
             generated_at: Utc::now().to_rfc3339(),
         };
 
         let files_json = serde_json::to_string(&bundle.files_changed).unwrap_or("[]".to_string());
-        let verification_runs_json = serde_json::to_string(&bundle.verification_runs).unwrap_or("[]".to_string());
+        let verification_runs_json =
+            serde_json::to_string(&bundle.verification_runs).unwrap_or("[]".to_string());
         let id = Uuid::new_v4().to_string();
 
         conn.execute(
-            "INSERT OR REPLACE INTO proof_bundles (id, task_id, project_id, agent_id, attempt_id, attempt_number, prompt, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash, generated_at)
+            "INSERT INTO proof_bundles (id, task_id, project_id, agent_id, attempt_id, attempt_number, prompt, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash, generated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 id, bundle.task_id, bundle.project_id, bundle.agent_id, attempt_id, attempt_num,
@@ -596,3 +788,6 @@ impl VerificationEngine {
         Ok(rows.flatten().collect())
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -78,6 +78,18 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         json!({
+            "name": "masterplan_reset",
+            "description": "Reset a masterplan to an empty slate: deletes plan steps, cancels all in-flight tasks for the project, and removes AgentXFlow-managed worktrees. The user's working directory is never modified.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Target project ID" },
+                    "masterplan_id": { "type": "string", "description": "Optional specific masterplan ID to reset" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        json!({
             "name": "masterplan_decompose",
             "description": "Decompose raw masterplan into structured execution steps. Returns compact summary by default.",
             "inputSchema": {
@@ -86,6 +98,7 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
                     "project_id": { "type": "string", "description": "Project ID" },
                     "idempotency_key": { "type": "string", "description": "Optional client idempotency key (e.g. 'decompose:<plan_id>:<hash>') for retry protection" },
                     "compact": { "type": "boolean", "description": "When true (default), returns token-efficient summary instead of echoing all step records" },
+                    "append": { "type": "boolean", "description": "When true, appends/merges steps for phased multi-chunk decomposition (e.g. 25 steps per phase) without wiping existing steps" },
                     "steps": {
                         "type": "array",
                         "items": {
@@ -337,6 +350,28 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
                     "task_id": { "type": "string", "description": "Task identifier" }
                 },
                 "required": ["task_id"]
+            }
+        }),
+        json!({
+            "name": "unclaim_agent_tasks",
+            "description": "Safely unclaim all active tasks for an agent, reverting masterplan steps to PENDING and releasing locks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent identifier" }
+                },
+                "required": ["agent_id"]
+            }
+        }),
+        json!({
+            "name": "force_agent_idle",
+            "description": "Forces an agent status to IDLE, unclaiming active tasks and resetting session heartbeat.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent identifier" }
+                },
+                "required": ["agent_id"]
             }
         }),
     ]

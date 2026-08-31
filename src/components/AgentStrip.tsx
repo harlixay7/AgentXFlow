@@ -17,16 +17,31 @@ export const AgentStrip: React.FC<AgentStripProps> = ({ agents, tasks }) => {
 
       {agents.map((agent) => {
         const currentTask = tasks.find((t) => t.assigned_agent_id === agent.id && t.state !== 'DONE');
+        const isWorking = agent.status === 'WORKING';
+        const isDisconnected = agent.status === 'DISCONNECTED';
+        const taskTitle = agent.active_task_title || (currentTask ? currentTask.title : null);
+
         return (
           <div key={agent.id} className="agent-badge">
             <div
               className={`status-dot ${
-                agent.status === 'WORKING' ? 'active' : agent.status === 'BLOCKED' ? 'blocked' : 'idle'
+                isWorking ? 'active' : isDisconnected ? 'idle' : agent.status === 'BLOCKED' ? 'blocked' : 'idle'
               }`}
+              style={{
+                backgroundColor: isWorking
+                  ? 'var(--accent-blue)'
+                  : isDisconnected
+                  ? 'var(--text-muted)'
+                  : 'var(--accent-green)',
+              }}
             />
             <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{agent.name}</span>
             <span style={{ color: 'var(--text-muted)' }}>
-              {currentTask ? `${currentTask.title.substring(0, 24)}... · ${currentTask.state}` : 'Idle'}
+              {taskTitle
+                ? `${taskTitle.substring(0, 20)}...`
+                : isDisconnected
+                ? 'Disconnected'
+                : 'Idle'}
             </span>
           </div>
         );

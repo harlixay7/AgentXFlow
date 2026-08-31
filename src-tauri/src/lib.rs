@@ -22,8 +22,8 @@ use crate::db::DbPool;
 use crate::git::RepoInspectionResult;
 use crate::mcp::McpServer;
 use crate::models::{
-    Agent, CollisionRisk, ContextPack, EventItem, IntegrationAttempt, Masterplan,
-    MasterplanStep, MergeQueueItem, Project, ProjectContextPack, ScopeLease, Task, TaskDependency, TaskDetails,
+    Agent, CollisionRisk, ContextPack, EventItem, IntegrationAttempt, Masterplan, MasterplanStep,
+    MergeQueueItem, Project, ProjectContextPack, ScopeLease, Task, TaskDependency, TaskDetails,
     TaskStep, VerificationResult,
 };
 use crate::security::SecurityManager;
@@ -72,7 +72,9 @@ fn create_project(
     master_spec: String,
     target_branch: String,
 ) -> Result<Project, String> {
-    state.coordinator.create_project(&name, &path, &master_spec, &target_branch)
+    state
+        .coordinator
+        .create_project(&name, &path, &master_spec, &target_branch)
 }
 
 #[tauri::command]
@@ -98,7 +100,14 @@ fn create_task(
     steps: Vec<(String, String, bool)>,
     criteria: Vec<String>,
 ) -> Result<Task, String> {
-    state.coordinator.create_task(&project_id, &title, &description, &priority, steps, criteria)
+    state.coordinator.create_task(
+        &project_id,
+        &title,
+        &description,
+        &priority,
+        steps,
+        criteria,
+    )
 }
 
 #[tauri::command]
@@ -107,7 +116,10 @@ fn get_task(state: State<'_, Arc<AppState>>, task_id: String) -> Result<Task, St
 }
 
 #[tauri::command]
-fn get_task_details(state: State<'_, Arc<AppState>>, task_id: String) -> Result<TaskDetails, String> {
+fn get_task_details(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+) -> Result<TaskDetails, String> {
     state.coordinator.get_task_details(&task_id)
 }
 
@@ -132,7 +144,9 @@ fn complete_step(
     agent_id: Option<String>,
     evidence_json: Option<String>,
 ) -> Result<TaskStep, String> {
-    state.coordinator.complete_step(&step_id, agent_id.as_deref(), evidence_json.as_deref())
+    state
+        .coordinator
+        .complete_step(&step_id, agent_id.as_deref(), evidence_json.as_deref())
 }
 
 #[tauri::command]
@@ -151,7 +165,9 @@ fn cancel_task(
     agent_id: Option<String>,
     reason: Option<String>,
 ) -> Result<Task, String> {
-    state.coordinator.cancel_task(&task_id, agent_id.as_deref(), reason.as_deref())
+    state
+        .coordinator
+        .cancel_task(&task_id, agent_id.as_deref(), reason.as_deref())
 }
 
 #[tauri::command]
@@ -160,7 +176,9 @@ fn requeue_task(
     task_id: String,
     agent_id: Option<String>,
 ) -> Result<(), String> {
-    state.coordinator.requeue_task(&task_id, agent_id.as_deref())
+    state
+        .coordinator
+        .requeue_task(&task_id, agent_id.as_deref())
 }
 
 #[tauri::command]
@@ -170,7 +188,10 @@ fn request_scope(
     agent_id: String,
     patterns: Vec<String>,
 ) -> Result<Vec<ScopeLease>, String> {
-    state.coordinator.scope.acquire_scope(&task_id, &agent_id, patterns, "EXCLUSIVE_WRITE")
+    state
+        .coordinator
+        .scope
+        .acquire_scope(&task_id, &agent_id, patterns, "EXCLUSIVE_WRITE")
 }
 
 #[tauri::command]
@@ -179,7 +200,10 @@ fn calculate_collision_risk(
     task_a_id: String,
     task_b_id: String,
 ) -> Result<CollisionRisk, String> {
-    state.coordinator.scope.calculate_collision_risk(&task_a_id, &task_b_id)
+    state
+        .coordinator
+        .scope
+        .calculate_collision_risk(&task_a_id, &task_b_id)
 }
 
 #[tauri::command]
@@ -189,7 +213,10 @@ fn add_task_dependency(
     depends_on_task_id: String,
     dependency_type: String,
 ) -> Result<TaskDependency, String> {
-    state.coordinator.dag.add_dependency(&task_id, &depends_on_task_id, &dependency_type)
+    state
+        .coordinator
+        .dag
+        .add_dependency(&task_id, &depends_on_task_id, &dependency_type)
 }
 
 #[tauri::command]
@@ -224,7 +251,9 @@ fn satisfy_acceptance_criterion(
     criterion_id: String,
     evidence: Option<String>,
 ) -> Result<(), String> {
-    state.coordinator.satisfy_acceptance_criterion(&task_id, &criterion_id, evidence.as_deref())
+    state
+        .coordinator
+        .satisfy_acceptance_criterion(&task_id, &criterion_id, evidence.as_deref())
 }
 
 #[tauri::command]
@@ -233,8 +262,16 @@ fn process_merge_by_id(
     project_id: String,
     queue_item_id: String,
 ) -> Result<IntegrationAttempt, String> {
-    let proj = state.coordinator.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
-    state.coordinator.merge.process_merge_by_id(&queue_item_id, Path::new(&proj.path))
+    let proj = state
+        .coordinator
+        .list_projects()?
+        .into_iter()
+        .find(|p| p.id == project_id)
+        .ok_or("Project not found")?;
+    state
+        .coordinator
+        .merge
+        .process_merge_by_id(&queue_item_id, Path::new(&proj.path))
 }
 
 #[tauri::command]
@@ -288,16 +325,26 @@ fn register_agent(
 }
 
 #[tauri::command]
-fn unregister_agent(
-    state: State<'_, Arc<AppState>>,
-    agent_id: String,
-) -> Result<(), String> {
+fn unregister_agent(state: State<'_, Arc<AppState>>, agent_id: String) -> Result<(), String> {
     state.coordinator.unregister_agent(&agent_id)
 }
 
 #[tauri::command]
 fn list_agents(state: State<'_, Arc<AppState>>) -> Result<Vec<Agent>, String> {
     state.coordinator.list_agents()
+}
+
+#[tauri::command]
+fn unclaim_agent_tasks(
+    state: State<'_, Arc<AppState>>,
+    agent_id: String,
+) -> Result<Vec<String>, String> {
+    state.coordinator.unclaim_agent_tasks(&agent_id)
+}
+
+#[tauri::command]
+fn force_agent_idle(state: State<'_, Arc<AppState>>, agent_id: String) -> Result<(), String> {
+    state.coordinator.force_agent_idle(&agent_id)
 }
 
 #[tauri::command]
@@ -308,7 +355,12 @@ fn create_or_update_masterplan(
     target_step_count: i32,
     max_steps_per_agent: i32,
 ) -> Result<Masterplan, String> {
-    state.coordinator.create_or_update_masterplan(&project_id, &raw_text, target_step_count, max_steps_per_agent)
+    state.coordinator.create_or_update_masterplan(
+        &project_id,
+        &raw_text,
+        target_step_count,
+        max_steps_per_agent,
+    )
 }
 
 #[tauri::command]
@@ -332,8 +384,12 @@ fn decompose_masterplan(
     state: State<'_, Arc<AppState>>,
     project_id: String,
     steps: Vec<crate::models::DecomposedStepInput>,
+    append: Option<bool>,
+    idempotency_key: Option<String>,
 ) -> Result<Vec<MasterplanStep>, String> {
-    state.coordinator.decompose_masterplan(&project_id, steps)
+    state
+        .coordinator
+        .decompose_masterplan(&project_id, steps, append, idempotency_key)
 }
 
 #[tauri::command]
@@ -379,14 +435,13 @@ fn set_masterplan_active_toggle(
     is_active: bool,
     force: bool,
 ) -> Result<crate::models::Masterplan, String> {
-    state.coordinator.set_masterplan_active_toggle(&masterplan_id, is_active, force)
+    state
+        .coordinator
+        .set_masterplan_active_toggle(&masterplan_id, is_active, force)
 }
 
 #[tauri::command]
-fn delete_masterplan(
-    state: State<'_, Arc<AppState>>,
-    masterplan_id: String,
-) -> Result<(), String> {
+fn delete_masterplan(state: State<'_, Arc<AppState>>, masterplan_id: String) -> Result<(), String> {
     state.coordinator.delete_masterplan(&masterplan_id)
 }
 
@@ -395,7 +450,9 @@ fn list_masterplan_steps_by_plan_id(
     state: State<'_, Arc<AppState>>,
     masterplan_id: String,
 ) -> Result<Vec<crate::models::MasterplanStep>, String> {
-    state.coordinator.list_masterplan_steps_by_plan_id(&masterplan_id)
+    state
+        .coordinator
+        .list_masterplan_steps_by_plan_id(&masterplan_id)
 }
 
 #[tauri::command]
@@ -405,15 +462,20 @@ fn claim_masterplan_chunk(
     agent_id: String,
     count: Option<i32>,
 ) -> Result<Task, String> {
-    state.coordinator.claim_masterplan_chunk(&project_id, &agent_id, count)
+    state
+        .coordinator
+        .claim_masterplan_chunk(&project_id, &agent_id, count)
 }
 
 #[tauri::command]
 fn reset_masterplan(
     state: State<'_, Arc<AppState>>,
     project_id: String,
+    masterplan_id: Option<String>,
 ) -> Result<(), String> {
-    state.coordinator.reset_masterplan(&project_id)
+    state
+        .coordinator
+        .reset_masterplan(&project_id, masterplan_id.as_deref())
 }
 
 #[tauri::command]
@@ -422,7 +484,9 @@ fn set_masterplan_milestone_approval(
     project_id: String,
     require_approval: bool,
 ) -> Result<bool, String> {
-    state.coordinator.set_masterplan_milestone_approval(&project_id, require_approval)
+    state
+        .coordinator
+        .set_masterplan_milestone_approval(&project_id, require_approval)
 }
 
 #[tauri::command]
@@ -433,7 +497,12 @@ fn prepare_masterplan(
     target_step_count: i32,
     max_steps_per_agent: i32,
 ) -> Result<crate::models::PreparedMasterplanSnapshot, String> {
-    state.coordinator.prepare_masterplan(&project_id, &raw_text, target_step_count, max_steps_per_agent)
+    state.coordinator.prepare_masterplan(
+        &project_id,
+        &raw_text,
+        target_step_count,
+        max_steps_per_agent,
+    )
 }
 
 #[tauri::command]
@@ -449,7 +518,9 @@ fn get_current_context(
     agent_id: Option<String>,
     project_id: Option<String>,
 ) -> Result<crate::models::CurrentContext, String> {
-    state.coordinator.get_current_context(agent_id.as_deref(), project_id.as_deref())
+    state
+        .coordinator
+        .get_current_context(agent_id.as_deref(), project_id.as_deref())
 }
 
 pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
@@ -467,13 +538,22 @@ pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_port = 7890;
 
     let mcp_server = McpServer::new(coordinator.clone(), mcp_port, security);
-    let addr = mcp_server.start().await.map_err(|e| format!("Failed to start MCP server: {}", e))?;
+    let addr = mcp_server
+        .start()
+        .await
+        .map_err(|e| format!("Failed to start MCP server: {}", e))?;
     println!("AgentXFlow Coordinator Daemon running on http://{}", addr);
 
     let bg_coordinator = coordinator.clone();
     tokio::spawn(async move {
+        let mut last_sweep =
+            std::time::Instant::now() - std::time::Duration::from_secs(crate::core::SWEEP_INTERVAL);
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            if last_sweep.elapsed() >= std::time::Duration::from_secs(crate::core::SWEEP_INTERVAL) {
+                last_sweep = std::time::Instant::now();
+                let _ = bg_coordinator.stale_recovery_sweep();
+            }
             if let Ok(projects) = bg_coordinator.list_projects() {
                 for p in projects {
                     let _ = bg_coordinator.process_next_merge(&p.id);
@@ -488,7 +568,7 @@ pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = dirs_next::data_dir()
         .map(|p| p.join("AgentXFlow"))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -496,10 +576,11 @@ pub fn run() {
     std::fs::create_dir_all(&data_dir).ok();
     let db_path = data_dir.join("agentxflow_v2.db");
 
-    let db_pool = DbPool::new(&db_path).expect("Failed to initialize SQLite connection pool");
+    let db_pool = DbPool::new(&db_path)?;
     let coordinator = CoordinatorEngine::new(db_pool);
 
-    let security = SecurityManager::init_or_load(&data_dir).expect("Failed to initialize security manager");
+    let security =
+        SecurityManager::init_or_load(&data_dir).expect("Failed to initialize security manager");
     let mcp_port = 7890;
 
     let mcp_server = McpServer::new(coordinator.clone(), mcp_port, security.clone());
@@ -513,8 +594,14 @@ pub fn run() {
     // Autonomous coordinator background merge queue worker
     let bg_coordinator = coordinator.clone();
     tauri::async_runtime::spawn(async move {
+        let mut last_sweep =
+            std::time::Instant::now() - std::time::Duration::from_secs(crate::core::SWEEP_INTERVAL);
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            if last_sweep.elapsed() >= std::time::Duration::from_secs(crate::core::SWEEP_INTERVAL) {
+                last_sweep = std::time::Instant::now();
+                let _ = bg_coordinator.stale_recovery_sweep();
+            }
             if let Ok(projects) = bg_coordinator.list_projects() {
                 for p in projects {
                     let _ = bg_coordinator.process_next_merge(&p.id);
@@ -565,6 +652,8 @@ pub fn run() {
             register_agent,
             unregister_agent,
             list_agents,
+            unclaim_agent_tasks,
+            force_agent_idle,
             create_or_update_masterplan,
             create_masterplan,
             list_masterplans_for_project,
@@ -584,4 +673,5 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+    Ok(())
 }

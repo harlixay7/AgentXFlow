@@ -1,11 +1,16 @@
 pub mod migrations;
 
+#[cfg(test)]
+mod tests;
+
 use fs2::FileExt;
 use rusqlite::{Connection, Result as SqlResult};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::info;
+
+use crate::error::CoordinatorError;
 
 #[derive(Debug, Clone)]
 pub struct DbPool {
@@ -14,25 +19,32 @@ pub struct DbPool {
 }
 
 impl DbPool {
-    pub fn new(db_path: &Path) -> SqlResult<Self> {
+    pub fn new(db_path: &Path) -> Result<Self, CoordinatorError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
 
         let lock_file = {
             let lock_path = db_path.with_extension("lock");
-            match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path) {
-                Ok(file) => {
-                    if let Err(e) = file.try_lock_exclusive() {
-                        warn!("Warning: Could not acquire exclusive coordinator instance lock on {:?}: {}", lock_path, e);
-                    }
-                    Some(Arc::new(file))
-                }
-                Err(e) => {
-                    warn!("Could not open lockfile {:?}: {}", lock_path, e);
-                    None
-                }
-            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|e| {
+                    CoordinatorError::Io(format!(
+                        "Could not open coordinator lockfile {:?}: {}",
+                        lock_path, e
+                    ))
+                })?;
+            file.try_lock_exclusive().map_err(|e| {
+                CoordinatorError::Database(format!(
+                    "Another AgentXFlow coordinator instance is already running (lock {:?} is held): {}",
+                    lock_path, e
+                ))
+            })?;
+            Some(Arc::new(file))
         };
 
         info!("Opening SQLite database at {:?}", db_path);
@@ -61,6 +73,6 @@ impl DbPool {
     }
 
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap()
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 }

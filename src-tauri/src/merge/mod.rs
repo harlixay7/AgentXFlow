@@ -1,11 +1,21 @@
 use chrono::Utc;
+use serde_json::json;
 use std::path::Path;
+use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::core::transition_task_state_on_conn;
 use crate::db::DbPool;
 use crate::git::GitService;
-use crate::models::{IntegrationAttempt, MergeQueueItem};
+use crate::models::{IntegrationAttempt, MergeQueueItem, TaskState};
+use crate::verification::VerificationEngine;
+
+/// Maximum time allowed for post-merge verification (cargo test / npm test) to run in the
+/// integration worktree. Without this bound, a hung merge test would stall the background
+/// merge worker (and the 3s merge loop) forever. The verification executor tree-kills the
+/// offending process when the timeout fires.
+pub(crate) const POST_MERGE_VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct MergeEngine {
@@ -16,6 +26,31 @@ pub struct MergeEngine {
 impl MergeEngine {
     pub fn new(db: DbPool, git: GitService) -> Self {
         Self { db, git }
+    }
+
+    /// Sequence-numbered event emitter. Mirrors `CoordinatorEngine::emit_event` column-for-column
+    /// (`events.event_id, project_id, task_id, agent_id, event_type, payload_json, timestamp`;
+    /// `sequence` is AUTOINCREMENT) so merge lifecycle events are indistinguishable from core events.
+    /// Best-effort telemetry: a failed INSERT never fails the merge (same policy as core).
+    fn emit_event(
+        &self,
+        project_id: Option<&str>,
+        task_id: Option<&str>,
+        agent_id: Option<&str>,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) {
+        let conn = self.db.lock();
+        let event_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let payload_str = payload.to_string();
+
+        conn.execute(
+            "INSERT INTO events (event_id, project_id, task_id, agent_id, event_type, payload_json, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![event_id, project_id, task_id, agent_id, event_type, payload_str, now],
+        )
+        .ok();
     }
 
     /// Adds a verified task to the serialized merge queue
@@ -191,7 +226,11 @@ impl MergeEngine {
             }
 
             // Atomically mark RUNNING_CHECKS
-            conn.execute("UPDATE merge_queue SET status = 'RUNNING_CHECKS' WHERE id = ?1", [&item.id]).ok();
+            conn.execute(
+                "UPDATE merge_queue SET status = 'RUNNING_CHECKS' WHERE id = ?1",
+                [&item.id],
+            )
+            .ok();
         }
 
         self.process_merge(&item.project_id, repo_path, &item)
@@ -204,95 +243,322 @@ impl MergeEngine {
         repo_path: &Path,
         item: &MergeQueueItem,
     ) -> Result<IntegrationAttempt, String> {
-        info!("Processing merge queue item '{}' for task '{}' (Branch: {})", item.id, item.task_id, item.branch_name);
+        info!(
+            "Processing merge queue item '{}' for task '{}' (Branch: {})",
+            item.id, item.task_id, item.branch_name
+        );
 
         let target_sha_before = self.git.get_ref_sha(repo_path, &item.target_branch)?;
 
         // 1. Stale base detection: If target branch has moved past recorded base, STOP and mark STALE
         if target_sha_before != item.base_sha {
             let conn = self.db.lock();
-            conn.execute("UPDATE merge_queue SET status = 'STALE' WHERE id = ?1", [&item.id]).ok();
-            conn.execute("UPDATE tasks SET state = 'BLOCKED', substate = 'NONE' WHERE id = ?1", [&item.task_id]).ok();
-            info!("Merge candidate '{}' has stale base SHA (recorded: {}, current: {}). Stopped.", item.id, item.base_sha, target_sha_before);
+            conn.execute(
+                "UPDATE merge_queue SET status = 'STALE' WHERE id = ?1",
+                [&item.id],
+            )
+            .ok();
+            let blocked = transition_task_state_on_conn(
+                &conn,
+                &item.task_id,
+                &[TaskState::MergeReady],
+                TaskState::Blocked,
+            );
+            match &blocked {
+                Ok(()) => {
+                    conn.execute(
+                        "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
+                        [&item.task_id],
+                    )
+                    .ok();
+                }
+                Err(e) => error!(
+                    "Failed to mark task '{}' BLOCKED (stale base): {}",
+                    item.task_id, e
+                ),
+            }
+            drop(conn);
+            if blocked.is_ok() {
+                self.emit_event(
+                    Some(&item.project_id),
+                    Some(&item.task_id),
+                    None,
+                    "MERGE_BLOCKED_STALE",
+                    json!({
+                        "queue_item_id": item.id.clone(),
+                        "base_sha": item.base_sha.clone(),
+                        "current_sha": target_sha_before,
+                    }),
+                );
+            }
+            info!(
+                "Merge candidate '{}' has stale base SHA (recorded: {}, current: {}). Stopped.",
+                item.id, item.base_sha, target_sha_before
+            );
             return Err(format!("Target branch '{}' has moved (current SHA: {}). Candidate base is STALE. Rebase required.", item.target_branch, target_sha_before));
         }
 
         // 2. Ensure dedicated disposable integration worktree exists
-        let integration_dir = self.git.ensure_integration_worktree(repo_path, project_id, &item.target_branch)?;
-
-        // Reset integration workspace to exact target branch state
-        self.git.run_git_cmd(&integration_dir, &["reset", "--hard", &item.target_branch]).ok();
-        self.git.run_git_cmd(&integration_dir, &["clean", "-fd"]).ok();
-
-        // 3. Execute 3-way merge simulation in integration worktree
-        let merge_res = self.git.run_git_cmd(&integration_dir, &["merge", "--no-commit", "--no-ff", &item.branch_name]);
+        let integration_dir =
+            self.git
+                .ensure_integration_worktree(repo_path, project_id, &item.target_branch)?;
 
         let now = Utc::now().to_rfc3339();
         let attempt_id = Uuid::new_v4().to_string();
 
+        // Reset integration workspace to exact target branch state
+        if let Err(reset_err) = self
+            .git
+            .run_git_cmd(&integration_dir, &["reset", "--hard", &item.target_branch])
+            .and_then(|_| self.git.run_git_cmd(&integration_dir, &["clean", "-fd"]))
+        {
+            let conn = self.db.lock();
+            conn.execute(
+                "UPDATE merge_queue SET status = 'BLOCKED' WHERE id = ?1",
+                [&item.id],
+            )
+            .ok();
+            let blocked = transition_task_state_on_conn(
+                &conn,
+                &item.task_id,
+                &[TaskState::MergeReady],
+                TaskState::Blocked,
+            );
+            match &blocked {
+                Ok(()) => {
+                    conn.execute(
+                        "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
+                        [&item.task_id],
+                    )
+                    .ok();
+                }
+                Err(e) => error!(
+                    "Failed to mark task '{}' BLOCKED (integration worktree reset): {}",
+                    item.task_id, e
+                ),
+            }
+            let attempt = IntegrationAttempt {
+                id: attempt_id,
+                merge_queue_id: item.id.clone(),
+                simulation_passed: false,
+                conflicts_json: Some(format!(
+                    "Integration worktree reset to '{}' failed: {}",
+                    item.target_branch, reset_err
+                )),
+                post_merge_verification_passed: false,
+                merge_strategy: "MERGE_COMMIT".to_string(),
+                target_sha_before,
+                target_sha_after: None,
+                attempted_at: now,
+            };
+            conn.execute(
+                "INSERT INTO integration_attempts (id, merge_queue_id, simulation_passed, conflicts_json, post_merge_verification_passed, merge_strategy, target_sha_before, target_sha_after, attempted_at)
+                 VALUES (?1, ?2, 0, ?3, 0, 'MERGE_COMMIT', ?4, NULL, ?5)",
+                rusqlite::params![attempt.id, attempt.merge_queue_id, attempt.conflicts_json, attempt.target_sha_before, attempt.attempted_at],
+            )
+            .ok();
+            drop(conn);
+            if blocked.is_ok() {
+                self.emit_event(
+                    Some(&item.project_id),
+                    Some(&item.task_id),
+                    None,
+                    "MERGE_BLOCKED_RESET",
+                    json!({ "queue_item_id": item.id.clone() }),
+                );
+            }
+            error!(
+                "Integration worktree reset failed for task '{}': {}",
+                item.task_id, reset_err
+            );
+            self.git
+                .remove_worktree(
+                    repo_path,
+                    &[repo_path.join(".agentxflow")],
+                    &integration_dir,
+                )
+                .ok();
+            return Err(format!(
+                "Failed to reset integration worktree to target branch '{}': {}",
+                item.target_branch, reset_err
+            ));
+        }
+
+        // 3. Execute 3-way merge simulation in integration worktree
+        let merge_res = self.git.run_git_cmd(
+            &integration_dir,
+            &["merge", "--no-commit", "--no-ff", &item.branch_name],
+        );
+
         match merge_res {
             Ok(_) => {
-                // 4. Run real post-merge verification tests if configured
+                // 4. Run real post-merge verification tests if configured. The command is
+                // executed through the shared verification executor, which bounds it by
+                // POST_MERGE_VERIFY_TIMEOUT and tree-kills the process on timeout, so a hung
+                // test suite can never stall the background merge worker forever.
+                let verify = VerificationEngine::new(self.db.clone());
                 let mut post_merge_passed = true;
-                if integration_dir.join("Cargo.toml").exists() {
-                    let out = std::process::Command::new("cargo")
-                        .args(["test"])
-                        .current_dir(&integration_dir)
-                        .output();
-                    if let Ok(res) = out {
-                        if !res.status.success() {
-                            post_merge_passed = false;
-                        }
-                    }
+                let mut post_merge_timed_out = false;
+                let post_merge_command = if integration_dir.join("Cargo.toml").exists() {
+                    Some("cargo test".to_string())
                 } else if integration_dir.join("package.json").exists() {
-                    let out = std::process::Command::new("npm")
-                        .args(["test"])
-                        .current_dir(&integration_dir)
-                        .output();
-                    if let Ok(res) = out {
-                        if !res.status.success() {
+                    Some("npm test".to_string())
+                } else {
+                    None
+                };
+
+                if let Some(command_str) = post_merge_command {
+                    match verify.execute_check(
+                        &item.task_id,
+                        "post-merge",
+                        "POST_MERGE_TESTS",
+                        &integration_dir,
+                        &target_sha_before,
+                        &command_str,
+                        POST_MERGE_VERIFY_TIMEOUT,
+                    ) {
+                        Ok(run) => {
+                            post_merge_passed = run.is_passed;
+                            post_merge_timed_out = run.timed_out;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Post-merge verification could not be executed for task '{}': {}",
+                                item.task_id, e
+                            );
                             post_merge_passed = false;
                         }
                     }
                 }
 
                 if !post_merge_passed {
-                    self.git.run_git_cmd(&integration_dir, &["merge", "--abort"]).ok();
+                    self.git
+                        .run_git_cmd(&integration_dir, &["merge", "--abort"])
+                        .ok();
                     let conn = self.db.lock();
-                    conn.execute("UPDATE merge_queue SET status = 'FAILED_TESTS' WHERE id = ?1", [&item.id]).ok();
-                    conn.execute("UPDATE tasks SET state = 'BLOCKED', substate = 'NONE' WHERE id = ?1", [&item.task_id]).ok();
-                    self.git.remove_worktree(repo_path, &integration_dir).ok();
+                    conn.execute(
+                        "UPDATE merge_queue SET status = 'FAILED_TESTS' WHERE id = ?1",
+                        [&item.id],
+                    )
+                    .ok();
+                    let blocked = transition_task_state_on_conn(
+                        &conn,
+                        &item.task_id,
+                        &[TaskState::MergeReady],
+                        TaskState::Blocked,
+                    );
+                    match &blocked {
+                        Ok(()) => {
+                            conn.execute(
+                                "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
+                                [&item.task_id],
+                            )
+                            .ok();
+                        }
+                        Err(e) => error!(
+                            "Failed to mark task '{}' BLOCKED (post-merge tests): {}",
+                            item.task_id, e
+                        ),
+                    }
+                    drop(conn);
+                    if blocked.is_ok() {
+                        self.emit_event(
+                            Some(&item.project_id),
+                            Some(&item.task_id),
+                            None,
+                            "MERGE_BLOCKED_TESTS",
+                            json!({
+                                "queue_item_id": item.id.clone(),
+                                "timed_out": post_merge_timed_out,
+                            }),
+                        );
+                    }
+                    self.git
+                        .remove_worktree(
+                            repo_path,
+                            &[repo_path.join(".agentxflow")],
+                            &integration_dir,
+                        )
+                        .ok();
+                    if post_merge_timed_out {
+                        warn!(
+                            "Post-merge verification TIMED OUT after {} seconds for task '{}' in integration worktree {:?}; process tree terminated. Integration aborted.",
+                            POST_MERGE_VERIFY_TIMEOUT.as_secs(),
+                            item.task_id,
+                            integration_dir
+                        );
+                        return Err(format!(
+                            "Post-merge verification test suite timed out after {} seconds and was terminated in the integration worktree. Integration aborted.",
+                            POST_MERGE_VERIFY_TIMEOUT.as_secs()
+                        ));
+                    }
                     return Err("Post-merge verification test suite failed in integration worktree. Integration aborted.".to_string());
                 }
 
                 // 5. Commit merge in integration worktree
                 let commit_res = self.git.run_git_cmd(
                     &integration_dir,
-                    &["commit", "-m", &format!("Merge task {}: {}", item.task_id, item.branch_name)],
+                    &[
+                        "commit",
+                        "-m",
+                        &format!("Merge task {}: {}", item.task_id, item.branch_name),
+                    ],
                 );
 
                 if let Err(commit_err) = commit_res {
-                    self.git.run_git_cmd(&integration_dir, &["merge", "--abort"]).ok();
+                    self.git
+                        .run_git_cmd(&integration_dir, &["merge", "--abort"])
+                        .ok();
                     let conn = self.db.lock();
-                    conn.execute("UPDATE merge_queue SET status = 'FAILED' WHERE id = ?1", [&item.id]).ok();
-                    self.git.remove_worktree(repo_path, &integration_dir).ok();
-                    return Err(format!("Failed to commit merge in integration worktree: {}", commit_err));
+                    conn.execute(
+                        "UPDATE merge_queue SET status = 'FAILED' WHERE id = ?1",
+                        [&item.id],
+                    )
+                    .ok();
+                    self.git
+                        .remove_worktree(
+                            repo_path,
+                            &[repo_path.join(".agentxflow")],
+                            &integration_dir,
+                        )
+                        .ok();
+                    return Err(format!(
+                        "Failed to commit merge in integration worktree: {}",
+                        commit_err
+                    ));
                 }
 
                 // 6. Advance the target branch ref atomically using Compare-and-Swap (CAS)
                 let integration_head = self.git.get_head_sha(&integration_dir)?;
                 self.git.run_git_cmd(
                     repo_path,
-                    &["update-ref", &format!("refs/heads/{}", item.target_branch), &integration_head, &target_sha_before],
+                    &[
+                        "update-ref",
+                        &format!("refs/heads/{}", item.target_branch),
+                        &integration_head,
+                        &target_sha_before,
+                    ],
                 )?;
 
-                // 7. Safely synchronize root working tree if target branch is currently checked out
+                // 7. Synchronize primary repository working directory on disk if target branch is currently checked out.
+                // SAFETY (master plan Invariant A): never destroy user work. Only fast-forward a CLEAN primary checkout.
                 if let Ok(current_branch) = self.git.get_current_branch(repo_path) {
                     if current_branch == item.target_branch {
-                        if self.git.check_worktree_cleanliness(repo_path).is_ok() {
-                            self.git.run_git_cmd(repo_path, &["merge", "--ff-only", &integration_head]).ok();
-                        } else {
-                            warn!("User root repo has uncommitted edits on {}. Ref was advanced, working copy left untouched.", item.target_branch);
+                        match self.git.check_worktree_cleanliness(repo_path) {
+                            Ok(()) => {
+                                info!("Synchronizing primary repository working directory on disk to newly merged HEAD: {}", integration_head);
+                                // The CAS update-ref at step 6 already advanced the branch; on a clean tree
+                                // merge --ff-only verifies the tree matches HEAD before touching anything.
+                                if let Err(e) = self.git.run_git_cmd(
+                                    repo_path,
+                                    &["merge", "--ff-only", &integration_head],
+                                ) {
+                                    warn!("Primary checkout fast-forward sync failed (ref already advanced; working copy left untouched): {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Primary checkout has uncommitted/staged/untracked changes on {}; working copy left untouched. Ref was advanced to {}. {}", item.target_branch, integration_head, e.join(", "));
+                            }
                         }
                     }
                 }
@@ -300,18 +566,42 @@ impl MergeEngine {
                 let target_sha_after = self.git.get_ref_sha(repo_path, &item.target_branch).ok();
 
                 let conn = self.db.lock();
-                conn.execute("UPDATE merge_queue SET status = 'MERGED', processed_at = ?1 WHERE id = ?2", [&now, &item.id]).ok();
-                conn.execute("UPDATE tasks SET state = 'DONE', substate = 'NONE', updated_at = ?1 WHERE id = ?2", [&now, &item.task_id]).ok();
+                conn.execute(
+                    "UPDATE merge_queue SET status = 'MERGED', processed_at = ?1 WHERE id = ?2",
+                    [&now, &item.id],
+                )
+                .ok();
+                let done = transition_task_state_on_conn(
+                    &conn,
+                    &item.task_id,
+                    &[TaskState::MergeReady],
+                    TaskState::Done,
+                );
+                match &done {
+                    Ok(()) => {
+                        conn.execute(
+                            "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
+                            [&item.task_id],
+                        )
+                        .ok();
+                    }
+                    Err(e) => error!(
+                        "Failed to mark task '{}' DONE after merge: {}",
+                        item.task_id, e
+                    ),
+                }
                 // Complete associated masterplan steps
                 conn.execute("UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2", [&now, &item.task_id]).ok();
 
-                let pending_remaining: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM masterplan_steps ms
+                let pending_remaining: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM masterplan_steps ms
                      JOIN masterplans mp ON ms.masterplan_id = mp.id
                      WHERE mp.project_id = ?1 AND ms.status != 'COMPLETED'",
-                    [&item.project_id],
-                    |r| r.get(0),
-                ).unwrap_or(1);
+                        [&item.project_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(1);
 
                 if pending_remaining == 0 {
                     conn.execute("UPDATE masterplans SET status = 'COMPLETED', updated_at = ?1 WHERE project_id = ?2", [&now, &item.project_id]).ok();
@@ -335,20 +625,67 @@ impl MergeEngine {
                     rusqlite::params![attempt.id, attempt.merge_queue_id, attempt.target_sha_before, attempt.target_sha_after, attempt.attempted_at],
                 ).ok();
 
+                drop(conn);
+                if done.is_ok() {
+                    self.emit_event(
+                        Some(&item.project_id),
+                        Some(&item.task_id),
+                        None,
+                        "MERGE_DONE",
+                        json!({
+                            "queue_item_id": item.id.clone(),
+                            "target_sha_after": attempt.target_sha_after.clone(),
+                        }),
+                    );
+                }
+
                 // Clean up disposable integration worktree
-                self.git.remove_worktree(repo_path, &integration_dir).ok();
+                self.git
+                    .remove_worktree(
+                        repo_path,
+                        &[repo_path.join(".agentxflow")],
+                        &integration_dir,
+                    )
+                    .ok();
 
                 Ok(attempt)
             }
             Err(err) => {
                 // Abort merge cleanly in integration worktree
-                self.git.run_git_cmd(&integration_dir, &["merge", "--abort"]).ok();
+                self.git
+                    .run_git_cmd(&integration_dir, &["merge", "--abort"])
+                    .ok();
 
                 let conn = self.db.lock();
-                conn.execute("UPDATE merge_queue SET status = 'BLOCKED_CONFLICT' WHERE id = ?1", [&item.id]).ok();
-                conn.execute("UPDATE tasks SET state = 'BLOCKED', substate = 'NONE', updated_at = ?1 WHERE id = ?2", [&now, &item.task_id]).ok();
+                conn.execute(
+                    "UPDATE merge_queue SET status = 'BLOCKED_CONFLICT' WHERE id = ?1",
+                    [&item.id],
+                )
+                .ok();
+                let blocked = transition_task_state_on_conn(
+                    &conn,
+                    &item.task_id,
+                    &[TaskState::MergeReady],
+                    TaskState::Blocked,
+                );
+                match &blocked {
+                    Ok(()) => {
+                        conn.execute(
+                            "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
+                            [&item.task_id],
+                        )
+                        .ok();
+                    }
+                    Err(e) => error!(
+                        "Failed to mark task '{}' BLOCKED (merge conflict): {}",
+                        item.task_id, e
+                    ),
+                }
 
-                error!("Merge conflict detected for task '{}': {}", item.task_id, err);
+                error!(
+                    "Merge conflict detected for task '{}': {}",
+                    item.task_id, err
+                );
 
                 let attempt = IntegrationAttempt {
                     id: attempt_id,
@@ -368,8 +705,25 @@ impl MergeEngine {
                     rusqlite::params![attempt.id, attempt.merge_queue_id, attempt.conflicts_json, attempt.target_sha_before, attempt.attempted_at],
                 ).ok();
 
+                drop(conn);
+                if blocked.is_ok() {
+                    self.emit_event(
+                        Some(&item.project_id),
+                        Some(&item.task_id),
+                        None,
+                        "MERGE_BLOCKED_CONFLICT",
+                        json!({ "queue_item_id": item.id.clone() }),
+                    );
+                }
+
                 // Clean up disposable integration worktree
-                self.git.remove_worktree(repo_path, &integration_dir).ok();
+                self.git
+                    .remove_worktree(
+                        repo_path,
+                        &[repo_path.join(".agentxflow")],
+                        &integration_dir,
+                    )
+                    .ok();
 
                 Ok(attempt)
             }

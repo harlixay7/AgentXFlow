@@ -36,7 +36,9 @@ impl TaskState {
         match s.to_uppercase().as_str() {
             "BACKLOG" => TaskState::Backlog,
             "READY" => TaskState::Ready,
-            "RUNNING" | "WORKING" | "CLAIMED" | "ANALYZING" | "SCOPE_APPROVED" => TaskState::Running,
+            "RUNNING" | "WORKING" | "CLAIMED" | "ANALYZING" | "SCOPE_APPROVED" => {
+                TaskState::Running
+            }
             "VERIFYING" => TaskState::Verifying,
             "VERIFIED" => TaskState::Verified,
             "BLOCKED" => TaskState::Blocked,
@@ -52,9 +54,11 @@ impl TaskState {
     pub fn can_transition_to(&self, next: &TaskState) -> bool {
         match (self, next) {
             (TaskState::Backlog, TaskState::Ready) => true,
+            (TaskState::Backlog, TaskState::Running) => true, // claim_task accepts BACKLOG tasks directly
             (TaskState::Ready, TaskState::Running) => true,
             (TaskState::Running, TaskState::Verifying) => true,
             (TaskState::Verifying, TaskState::Verified) => true,
+            (TaskState::Verifying, TaskState::MergeReady) => true, // submit_task auto-enqueues directly from VERIFYING
             (TaskState::Verified, TaskState::MergeReady) => true,
             (TaskState::Running, TaskState::Review) => true,
             (TaskState::Running, TaskState::MergeReady) => true,
@@ -68,6 +72,7 @@ impl TaskState {
             (TaskState::Failed, TaskState::Ready) => true,
             (TaskState::Blocked, TaskState::Ready) => true,
             (TaskState::Blocked, TaskState::Running) => true,
+            (TaskState::Blocked, TaskState::MergeReady) => true, // reconcile_task re-bases a BLOCKED task back to MERGE_READY
             (_, TaskState::Blocked) => true,
             (_, TaskState::Failed) => true,
             (_, TaskState::Cancelled) => true,
@@ -264,6 +269,12 @@ pub struct Agent {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +397,8 @@ pub struct VerificationRun {
     pub is_passed: bool,
     pub is_stale: bool,
     pub executed_at: String,
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,6 +688,3 @@ pub struct CurrentContext {
     pub pending_tasks_count: usize,
     pub instructions: String,
 }
-
-
-

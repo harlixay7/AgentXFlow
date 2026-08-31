@@ -27,7 +27,8 @@ impl PolicyEngine {
             "INSERT INTO policies (id, project_id, hook, condition_pattern, action, reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![id, project_id, hook, condition_pattern, action, reason],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok(PolicyRule {
             id,
@@ -46,12 +47,21 @@ impl PolicyEngine {
         target: &str,
     ) -> Result<(&'static str, Option<String>), String> {
         // Hard-coded non-negotiable safety guardrails
-        if target.contains("git reset --hard") || target.contains("rm -rf /") || target.contains("format C:") {
-            return Ok(("DENY", Some("Destructive operation is strictly prohibited by security policy".to_string())));
+        if target.contains("git reset --hard")
+            || target.contains("rm -rf /")
+            || target.contains("format C:")
+        {
+            return Ok((
+                "DENY",
+                Some("Destructive operation is strictly prohibited by security policy".to_string()),
+            ));
         }
 
         if target.contains("git push") {
-            return Ok(("REQUIRE_APPROVAL", Some("Direct Git push requires human approval".to_string())));
+            return Ok((
+                "REQUIRE_APPROVAL",
+                Some("Direct Git push requires human approval".to_string()),
+            ));
         }
 
         let conn = self.db.lock();
@@ -61,7 +71,11 @@ impl PolicyEngine {
 
         let rules = stmt
             .query_map(rusqlite::params![project_id, hook], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
 

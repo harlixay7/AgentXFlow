@@ -76,8 +76,9 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 | `masterplan_list` | _(none)_ | List all masterplans across all projects with status, step counts, and active handoffs. |
 | `masterplan_get` | `project_id` | Inspect masterplan state, raw specification text, project identity, and architect decomposition instructions. |
 | `masterplan_status` | `project_id` | Query plan progress stats, total steps, and step statuses. |
+| `masterplan_reset` | `project_id`, `masterplan_id?` | Reset a masterplan, canceling active tasks, clearing steps, wiping worktrees, and cleanly restoring Git repository to HEAD. |
 | `prepare_masterplan` | `project_id`, `raw_text`, `target_step_count?`, `max_steps_per_agent?` | Atomically save, parse, structure, and prepare a masterplan for agents. |
-| `masterplan_decompose` | `project_id`, `steps`, `idempotency_key?`, `compact?` | Normalize raw masterplan text into structured, non-overlapping execution steps. Returns compact summary by default. |
+| `masterplan_decompose` | `project_id`, `steps`, `append?`, `idempotency_key?`, `compact?` | Normalize raw masterplan text into structured, non-overlapping execution steps. Supports 4-phase decomposition with append mode and compact summary output. |
 | `masterplan_claim_chunk`| `project_id`, `agent_id`, `count?` | Claim next batch of steps (strictly capped by limit) and allocate an isolated Git worktree. |
 | `agent_register` | `name`, `agent_type` | Idempotently register agent session with a canonical IDE identity and get an authoritative session token. |
 | `agent_heartbeat` | `agent_id` | Refresh your session heartbeat and active lease timers. |
@@ -92,6 +93,8 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
 | `task_submit` | `task_id`, `agent_id` | Submit task; coordinator automatically executes verification profiles, machine evaluators, and git diff mutation audit. Returns milestone handoff instructions on completion. |
 | `task_cancel` | `task_id`, `agent_id?`, `reason?` | Cancel an active task, releasing all write scope leases, cleaning up worktrees, and reverting any masterplan steps back to PENDING. |
 | `task_requeue` | `task_id`, `agent_id?` | Requeue a claimed chunk task back to masterplan pending steps, releasing held scope leases. |
+| `unclaim_agent_tasks` | `agent_id` | Safely unclaim all active tasks for an agent, reverting masterplan steps to PENDING and releasing locks. |
+| `force_agent_idle` | `agent_id` | Forces an agent status to IDLE, unclaiming active tasks and resetting session heartbeat. |
 | `task_reconcile` | `task_id` | Reconcile task state, task attempt, proof bundle, and merge queue status. |
 | `merge_queue_status` | `project_id` | Check queue position and status for serialized branch merges. |
 | `merge_enqueue` | `project_id`, `task_id` | Enqueue a verified or MERGE_READY task into the serialized merge queue. |
@@ -115,3 +118,19 @@ When `masterplan_get` reports `status: "UNSORTED"`, you are the **Master Archite
    - If `next_action == 'masterplan_claim_chunk'`: Autonomous swarm mode is enabled; proceed to claim your next chunk immediately without waiting.
 11. **Automated Machine Verification**: Criteria satisfaction is derived strictly from passing automated machine evaluators and verification profiles.
 12. **Fix Submission Rejections**: If `task_submit` returns validation errors, inspect `rejection_reasons`, address them inside your worktree, and call `task_submit` again.
+13. **Transparent Activity Heartbeats**: Every inbound MCP tool call automatically refreshes your agent heartbeat and active session lease. You do NOT need to run background heartbeat timers.
+14. **Parallel Swarm Collaboration**: Multiple agents can claim distinct chunks and work simultaneously in parallel Git worktrees without lock contention.
+15. **Final Step Release Delivery Protocol**: The agent assigned to the final masterplan chunk (containing Step N/N) must deliver the full release:
+    - Build the production bundle / executable (`npm run build` / `cargo build --release`).
+    - Create a robust, automated launcher script (`run.bat` for Windows / `start.sh` for Unix) that automatically checks and installs dependencies (e.g. `if not exist node_modules call npm install`), starts the server, and auto-opens the browser (`start http://localhost:<port>`).
+    - Test and verify that the application launches successfully.
+    - Create/update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the full app architecture, configuration, features, navigation map, and step-by-step instructions on how to use the entire application.
+    - Present the complete application walkthrough to the user in chat.
+16. **4-Phase Deep Architectural Decomposition & Full-Stack Integration**: Masterplans of any target step count N (e.g. 10, 20, 50, 75, 100 steps) are dynamically proportioned into 4 full-stack phases (25% each):
+    - Phase 1 (Steps 1 to ~25% N): Runnable Baseline Scaffolding & Core Architecture (Step 1 MUST scaffold the runnable project root: `package.json`, `index.html`, `vite.config.ts`, `main.tsx`/`index.js`, `App.tsx`, and router/navigation skeleton; subsequent Phase 1 steps implement database schemas, shared types, global state stores, and project utilities).
+    - Phase 2 (Steps ~26% to ~50% N): Domain Business Logic, State Stores, APIs, Backend Handlers, and Workflows (bound to global app state).
+    - Phase 3 (Steps ~51% to ~75% N): High-Fidelity UI Views & Components (MANDATORY: Every component step must specify exact import & mounting instructions in `App.tsx` / `AppRoutes.tsx` / Navigation bar so all features are interactive and visible in the live application—zero isolated/orphaned code).
+    - Phase 4 (Steps ~76% to N): Integration, Edge Cases, Verification Suites, Production Launcher Build (`run.bat` / `start.sh`), Launch Validation, and Complete `USER_GUIDE.md` / `HOW_TO_USE.md`.
+    - For large plans, you can submit in phased batches using `masterplan_decompose(project_id="...", steps=[...], append=true)` to ensure high-depth specifications.
+17. **Clean Masterplan & Repository Reset**: When `reset_masterplan` is invoked, the coordinator cleans all steps, cancels active tasks, deletes temporary worktrees, and runs `git reset --hard HEAD` and `git clean -fd` to cleanly restore the repository.
+18. **Real-Time Primary Working Directory Synchronization**: Every task merge processed by the serialized FIFO merge queue automatically synchronizes the primary repository working directory on disk (`git reset --hard HEAD` and `git clean -fd`), ensuring all merged files immediately appear in the user's workspace in real time.

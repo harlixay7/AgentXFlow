@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { McpInfo, Agent } from '../types';
 import { coordinatorApi } from '../api/coordinator';
-import { Terminal, Copy, Check, ShieldCheck, Activity, Cpu, Server, FileText, Plus, Bot, Layers, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Terminal, Copy, Check, ShieldCheck, Activity, Cpu, Server, FileText, Plus, Bot, Layers, CheckCircle2, AlertCircle, RefreshCw } from 'lucide-react';
 
 interface IntegrationsViewProps {
   agents?: Agent[];
@@ -13,6 +13,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'antigravity' | 'claude' | 'cursor' | 'opencode' | 'generic'>('antigravity');
   const [pingStatus, setPingStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [isRotating, setIsRotating] = useState(false);
   const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   const [agentName, setAgentName] = useState('');
@@ -46,6 +47,31 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
       }
     } catch {
       setPingStatus('error');
+    }
+  };
+
+  const handleRotateToken = async () => {
+    const confirmed = window.confirm(
+      'Rotate the master MCP token?\n\nThis immediately invalidates the current token. Any IDE/agent configs that embed the old token (Antigravity, Cursor, Claude Code/Codex, OpenCode, generic MCP clients) will stop working until you paste the new one.'
+    );
+    if (!confirmed) return;
+    setIsRotating(true);
+    setFeedback(null);
+    try {
+      await coordinatorApi.rotateMcpToken();
+      const fresh = await coordinatorApi.getMcpInfo();
+      setMcpInfo(fresh);
+      setFeedback({
+        message: 'Master token rotated. The old token is invalidated — re-copy the new token into any configs that embed it.',
+        type: 'success',
+      });
+    } catch (err: any) {
+      setFeedback({
+        message: `Token rotation failed: ${err.message || err}`,
+        type: 'error',
+      });
+    } finally {
+      setIsRotating(false);
     }
   };
 
@@ -154,15 +180,27 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
               />
               Gateway Status: {pingStatus === 'success' ? 'ONLINE (127.0.0.1:7890)' : pingStatus === 'error' ? 'OFFLINE / UNREACHABLE' : 'CHECKING...'}
             </div>
-            <button
-              className="btn btn-secondary"
-              style={{ fontSize: 11, padding: '4px 10px' }}
-              onClick={handlePingTest}
-              title="Send an HTTP ping to http://127.0.0.1:7890/health to verify endpoint connectivity"
-            >
-              <Activity size={12} />
-              {pingStatus === 'testing' ? 'Pinging...' : pingStatus === 'success' ? '200 OK (Healthy)' : pingStatus === 'error' ? 'Connection Error' : 'Test Health Ping'}
-            </button>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: 11, padding: '4px 10px' }}
+                onClick={handlePingTest}
+                title="Send an HTTP ping to http://127.0.0.1:7890/health to verify endpoint connectivity"
+              >
+                <Activity size={12} />
+                {pingStatus === 'testing' ? 'Pinging...' : pingStatus === 'success' ? '200 OK (Healthy)' : pingStatus === 'error' ? 'Connection Error' : 'Test Health Ping'}
+              </button>
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: 11, padding: '4px 10px' }}
+                onClick={handleRotateToken}
+                disabled={isRotating}
+                title="Generate a new master bootstrap token; immediately invalidates the current token in all IDE/agent configs"
+              >
+                <RefreshCw size={12} />
+                {isRotating ? 'Rotating...' : 'Rotate Token'}
+              </button>
+            </div>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10, fontFamily: 'var(--font-mono)', fontSize: 11 }}>
@@ -297,7 +335,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', gap: 6, userSelect: 'text' }}>
                   <span>{ag.agent_type}</span>
                   <span>•</span>
-                  <span style={{ color: ag.status === 'WORKING' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{ag.status}</span>
+                  <span style={{ color: ag.status === 'WORKING' ? 'var(--accent-blue)' : ag.status === 'IDLE' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{ag.status}</span>
                 </div>
               </div>
             </div>

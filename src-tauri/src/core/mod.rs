@@ -3,7 +3,7 @@ use rusqlite::params;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::acp::AcpRuntime;
@@ -12,16 +12,32 @@ use crate::db::DbPool;
 use crate::git::GitService;
 use crate::merge::MergeEngine;
 use crate::models::{
-    AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, CurrentContext, DecomposedStepInput,
-    EvaluatorResult, EventItem, EvidenceRecord, IntegrationAttempt, Masterplan, MasterplanStep, MasterplanSummary,
-    MergeQueueItem, PreparedMasterplanSnapshot, Project, ProjectContextPack, ProofBundle, ScopeLease, ScopeViolation,
-    Task, TaskAttempt, TaskDependency, TaskDetails, TaskState, TaskStep, TaskSubstate,
-    VerificationResult, VerificationRun,
+    AcceptanceCriteria, Agent, AgentCapabilitySet, ContextPack, CurrentContext,
+    DecomposedStepInput, EvaluatorResult, EventItem, EvidenceRecord, IntegrationAttempt,
+    Masterplan, MasterplanStep, MasterplanSummary, MergeQueueItem, PreparedMasterplanSnapshot,
+    Project, ProjectContextPack, ProofBundle, ScopeLease, ScopeViolation, Task, TaskAttempt,
+    TaskDependency, TaskDetails, TaskState, TaskStep, TaskSubstate, VerificationResult,
+    VerificationRun,
 };
 use crate::policies::PolicyEngine;
 use crate::scheduler::{SchedulerConfig, SchedulerEngine};
 use crate::scope::ScopeManager;
 use crate::verification::VerificationEngine;
+
+/// Sliding session expiry window: every heartbeat pushes agent_sessions.expires_at
+/// to now + SESSION_TTL_DAYS, so active agents never expire while dead agents
+/// lose their session SESSION_TTL_DAYS after their last heartbeat. First sessions
+/// (registration) keep the historical 365-day window for backward compatibility.
+const SESSION_TTL_DAYS: i64 = 30;
+
+/// Stale-recovery sweep cadence (seconds): the background loops in lib.rs invoke
+/// `stale_recovery_sweep` no more often than every SWEEP_INTERVAL.
+pub const SWEEP_INTERVAL: u64 = 60;
+
+/// An agent whose `last_heartbeat` is older than this many seconds is treated as
+/// disconnected, so its in-flight RUNNING/VERIFYING/CLAIMING tasks are reclaimed
+/// by the sweep. Agents heartbeat on every tool call (see mcp/mod.rs).
+pub const STALE_AGENT_GRACE: i64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorEngine {
@@ -35,6 +51,55 @@ pub struct CoordinatorEngine {
     pub policy: PolicyEngine,
     pub scheduler: SchedulerEngine,
     pub worktrees_root: std::path::PathBuf,
+}
+
+/// Startup reconciliation failure accounting: every failed reconcile write is
+/// logged with context and aggregated so a partial reconcile is never silent.
+#[derive(Default)]
+struct ReconcileFailureLog {
+    failures: Vec<(String, String)>,
+}
+
+impl ReconcileFailureLog {
+    fn record(&mut self, category: &str, detail: String) {
+        warn!(
+            "Startup reconciliation write failure [{}]: {}",
+            category, detail
+        );
+        self.failures.push((category.to_string(), detail));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        let mut by_category: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (category, _) in &self.failures {
+            *by_category.entry(category.clone()).or_insert(0) += 1;
+        }
+        json!({
+            "total_failures": self.failures.len(),
+            "by_category": by_category,
+            "failures": self.failures.iter().map(|(_, detail)| detail).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Snapshot of the stored proof_bundles row the merge-enqueue gate verifies (D28): every
+/// field the canonical proof digest covers (and the persisted proof_hash it must match).
+struct StoredProofRow {
+    task_id: String,
+    project_id: String,
+    attempt_id: String,
+    base_sha: String,
+    head_sha: String,
+    files_changed_json: String,
+    diff_summary: String,
+    criteria_json: String,
+    steps_json: String,
+    proof_hash: String,
 }
 
 impl CoordinatorEngine {
@@ -54,7 +119,12 @@ impl CoordinatorEngine {
         let dag = DagEngine::new(db.clone());
         let acp = AcpRuntime::new(db.clone());
         let policy = PolicyEngine::new(db.clone());
-        let scheduler = SchedulerEngine::new(db.clone(), dag.clone(), scope.clone(), SchedulerConfig::default());
+        let scheduler = SchedulerEngine::new(
+            db.clone(),
+            dag.clone(),
+            scope.clone(),
+            SchedulerConfig::default(),
+        );
 
         let engine = Self {
             db,
@@ -82,6 +152,20 @@ impl CoordinatorEngine {
         event_type: &str,
         payload: serde_json::Value,
     ) {
+        let _ = self.emit_event_checked(project_id, task_id, agent_id, event_type, payload);
+    }
+
+    /// Result-returning event emitter for callers that must observe telemetry
+    /// write failures (e.g. startup reconciliation). Best-effort by policy:
+    /// `emit_event` discards the result.
+    fn emit_event_checked(
+        &self,
+        project_id: Option<&str>,
+        task_id: Option<&str>,
+        agent_id: Option<&str>,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
         let conn = self.db.lock();
         let event_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -91,7 +175,9 @@ impl CoordinatorEngine {
             "INSERT INTO events (event_id, project_id, task_id, agent_id, event_type, payload_json, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![event_id, project_id, task_id, agent_id, event_type, payload_str, now],
-        ).ok();
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     pub fn get_events_after(&self, last_sequence: i64) -> Result<Vec<EventItem>, String> {
@@ -122,51 +208,216 @@ impl CoordinatorEngine {
         Ok(res)
     }
 
-    /// Self-healing startup reconciliation to repair interrupted claims and unclosed integrations
+    /// Centralized validated task state transition: applies the transition atomically
+    /// (transaction), then emits the event. The state change is authoritative: event
+    /// emission is best-effort telemetry and never rolls back the committed transition.
+    pub fn transition_task_state(
+        &self,
+        task_id: &str,
+        from: &[TaskState],
+        to: TaskState,
+        agent_id: Option<&str>,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start transaction: {}", e))?;
+
+        transition_task_state_on_conn(&tx, task_id, from, to)?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
+
+        let project_id: Option<String> = conn
+            .query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .ok();
+        drop(conn);
+
+        self.emit_event(
+            project_id.as_deref(),
+            Some(task_id),
+            agent_id,
+            event_type,
+            payload,
+        );
+        Ok(())
+    }
+
+    /// Self-healing startup reconciliation to repair interrupted claims and unclosed integrations.
+    /// Every write failure is logged with context and aggregated; if any write failed a
+    /// `RECONCILE_PARTIAL` event is emitted after the loop. Startup still proceeds
+    /// (availability) but never silently.
     pub fn reconcile_on_startup(&self) {
         info!("Running AgentXFlow startup reconciliation...");
-        let conn = self.db.lock();
+        let mut failures = ReconcileFailureLog::default();
 
         // 1. Reset tasks left in CLAIMING state back to READY
-        let mut stmt_interrupted = match conn.prepare("SELECT id, project_id, worktree_path FROM tasks WHERE state = 'CLAIMING'") {
-            Ok(s) => s,
-            Err(_) => return,
+        let interrupted_tasks: Vec<(String, String, Option<String>)> = {
+            let conn = self.db.lock();
+            let scanned = match conn
+                .prepare("SELECT id, project_id, worktree_path FROM tasks WHERE state = 'CLAIMING'")
+            {
+                Ok(mut stmt) => stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map(|iter| iter.flatten().collect())
+                    .unwrap_or_default(),
+                Err(e) => {
+                    failures.record(
+                        "claiming_task_scan",
+                        format!("could not list interrupted CLAIMING tasks: {}", e),
+                    );
+                    Vec::new()
+                }
+            };
+            scanned
         };
 
-        let interrupted_tasks: Vec<(String, String, Option<String>)> = stmt_interrupted
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map(|iter| iter.flatten().collect())
-            .unwrap_or_default();
-        drop(stmt_interrupted);
-
-        for (t_id, _p_id, wt_path) in interrupted_tasks {
+        for (t_id, p_id, wt_path) in interrupted_tasks {
             if let Some(path_str) = wt_path {
-                let path = std::path::PathBuf::from(path_str);
+                let path = std::path::PathBuf::from(path_str.clone());
                 if path.exists() {
-                    let _ = std::fs::remove_dir_all(&path);
+                    let repo_path: Option<std::path::PathBuf> = {
+                        let conn = self.db.lock();
+                        conn.query_row("SELECT path FROM projects WHERE id = ?1", [&p_id], |r| {
+                            r.get::<_, String>(0)
+                        })
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                    };
+                    if let Some(repo_path) = repo_path {
+                        let managed_roots =
+                            vec![self.worktrees_root.clone(), repo_path.join(".agentxflow")];
+                        if self
+                            .git
+                            .is_managed_worktree(&repo_path, &managed_roots, &path)
+                        {
+                            if let Err(e) = std::fs::remove_dir_all(&path) {
+                                failures.record(
+                                    "worktree_cleanup",
+                                    format!(
+                                        "task '{}' (project '{}'): failed to remove managed worktree {:?}: {}",
+                                        t_id, p_id, path, e
+                                    ),
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "Refusing to delete unmanaged worktree path {:?} during startup reconciliation",
+                                path
+                            );
+                            if let Err(e) = self.emit_event_checked(
+                                None,
+                                Some(&t_id),
+                                None,
+                                "WORKTREE_SAFETY_REFUSAL",
+                                json!({ "path": path_str }),
+                            ) {
+                                failures.record(
+                                    "worktree_safety_refusal_event",
+                                    format!(
+                                        "task '{}' (project '{}'): could not emit WORKTREE_SAFETY_REFUSAL: {}",
+                                        t_id, p_id, e
+                                    ),
+                                );
+                            }
+                        }
+                    }
                 }
             }
-            conn.execute(
-                "UPDATE tasks SET state = 'READY', substate = 'NONE', assigned_agent_id = NULL, worktree_path = NULL, branch_name = NULL WHERE id = ?1",
-                [&t_id],
-            ).ok();
-            conn.execute("DELETE FROM scope_leases WHERE task_id = ?1", [&t_id]).ok();
-            info!("Reconciled interrupted claiming task '{}' -> reset to READY", t_id);
+            let conn = self.db.lock();
+            match transition_task_state_on_conn(
+                &conn,
+                &t_id,
+                &[TaskState::Backlog], // DB stores 'CLAIMING' which parses to Backlog (Task 4.1 parse quirk)
+                TaskState::Ready,
+            ) {
+                Ok(()) => {
+                    if let Err(e) = conn.execute(
+                        "UPDATE tasks SET substate = 'NONE', assigned_agent_id = NULL, worktree_path = NULL, branch_name = NULL WHERE id = ?1",
+                        [&t_id],
+                    ) {
+                        failures.record(
+                            "claiming_task_cleanup",
+                            format!(
+                                "task '{}' (project '{}'): failed to clear claim fields: {}",
+                                t_id, p_id, e
+                            ),
+                        );
+                    }
+                    if let Err(e) =
+                        conn.execute("DELETE FROM scope_leases WHERE task_id = ?1", [&t_id])
+                    {
+                        failures.record(
+                            "claiming_lease_cleanup",
+                            format!(
+                                "task '{}' (project '{}'): failed to release scope lease: {}",
+                                t_id, p_id, e
+                            ),
+                        );
+                    }
+                    info!(
+                        "Reconciled interrupted claiming task '{}' -> reset to READY",
+                        t_id
+                    );
+                }
+                Err(e) => {
+                    failures.record(
+                        "claiming_task_transition",
+                        format!("task '{}' (project '{}'): {}", t_id, p_id, e),
+                    );
+                    warn!(
+                        "Failed to reconcile interrupted claiming task '{}' to READY: {}",
+                        t_id, e
+                    );
+                }
+            }
+            drop(conn);
         }
 
         // 2. Reset merge queue items interrupted during checks
-        conn.execute("UPDATE merge_queue SET status = 'READY' WHERE status = 'RUNNING_CHECKS'", []).ok();
+        let conn = self.db.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE merge_queue SET status = 'READY' WHERE status = 'RUNNING_CHECKS'",
+            [],
+        ) {
+            failures.record("merge_queue_reset", e.to_string());
+        }
 
         // 3. Mark expired scope leases
         let now = Utc::now().to_rfc3339();
-        conn.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now]).ok();
+        if let Err(e) = conn.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now]) {
+            failures.record("scope_lease_cleanup", e.to_string());
+        }
 
         // 4. Reconcile orphaned claimed masterplan steps whose tasks are missing or cancelled
-        conn.execute(
+        if let Err(e) = conn.execute(
             "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL
              WHERE status = 'CLAIMED' AND (claimed_task_id IS NULL OR claimed_task_id IN (SELECT id FROM tasks WHERE state = 'CANCELLED' OR is_stale = 1))",
             [],
-        ).ok();
+        ) {
+            failures.record("masterplan_step_reset", e.to_string());
+        }
+        drop(conn);
+
+        // 5. Surface any write failures: startup proceeds, but never silently
+        if !failures.is_empty() {
+            error!(
+                "Startup reconciliation completed with {} write failure(s): {:?}",
+                failures.failures.len(),
+                failures.failures
+            );
+            let summary = failures.summary();
+            if let Err(e) = self.emit_event_checked(None, None, None, "RECONCILE_PARTIAL", summary)
+            {
+                error!("Failed to record RECONCILE_PARTIAL event: {}", e);
+            }
+        }
     }
 
     // --- Projects ---
@@ -183,7 +434,10 @@ impl CoordinatorEngine {
         }
 
         if !self.git.is_git_repo(repo_path) {
-            info!("Directory '{}' is not a Git repository. Auto-initializing...", path);
+            info!(
+                "Directory '{}' is not a Git repository. Auto-initializing...",
+                path
+            );
             self.git.init_repo(repo_path)?;
         }
 
@@ -228,7 +482,13 @@ impl CoordinatorEngine {
         };
 
         drop(conn);
-        self.emit_event(Some(&id), None, None, "PROJECT_CREATED", json!({ "name": name, "path": path }));
+        self.emit_event(
+            Some(&id),
+            None,
+            None,
+            "PROJECT_CREATED",
+            json!({ "name": name, "path": path }),
+        );
         Ok(proj)
     }
 
@@ -251,10 +511,21 @@ impl CoordinatorEngine {
             "Build JWT-based authentication service in src/auth/",
             "HIGH",
             vec![
-                ("Implement Token Generation".to_string(), "Generate signed JWT tokens".to_string(), true),
-                ("Add Auth Unit Tests".to_string(), "Run cargo test --test auth_test".to_string(), true),
+                (
+                    "Implement Token Generation".to_string(),
+                    "Generate signed JWT tokens".to_string(),
+                    true,
+                ),
+                (
+                    "Add Auth Unit Tests".to_string(),
+                    "Run cargo test --test auth_test".to_string(),
+                    true,
+                ),
             ],
-            vec!["Token signature matches secret".to_string(), "All tests pass".to_string()],
+            vec![
+                "Token signature matches secret".to_string(),
+                "All tests pass".to_string(),
+            ],
         )?;
 
         self.create_task(
@@ -263,8 +534,16 @@ impl CoordinatorEngine {
             "Build robust migration runner for 24 tables",
             "MEDIUM",
             vec![
-                ("Write Migration SQL".to_string(), "Create initial schema".to_string(), true),
-                ("Verify Foreign Keys".to_string(), "Test cascading deletes".to_string(), true),
+                (
+                    "Write Migration SQL".to_string(),
+                    "Create initial schema".to_string(),
+                    true,
+                ),
+                (
+                    "Verify Foreign Keys".to_string(),
+                    "Test cascading deletes".to_string(),
+                    true,
+                ),
             ],
             vec!["Schema migrations are idempotent".to_string()],
         )?;
@@ -297,6 +576,25 @@ impl CoordinatorEngine {
             res.push(r);
         }
         Ok(res)
+    }
+
+    pub fn get_project(&self, project_id: &str) -> Result<Project, String> {
+        let conn = self.db.lock();
+        conn.query_row(
+            "SELECT id, name, path, master_spec, target_branch, created_at, updated_at FROM projects WHERE id = ?1",
+            [project_id],
+            |row| {
+                Ok(Project {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    master_spec: row.get(3)?,
+                    target_branch: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        ).map_err(|e| format!("Project '{}' not found: {}", project_id, e))
     }
 
     // --- Tasks ---
@@ -337,7 +635,8 @@ impl CoordinatorEngine {
                 "INSERT INTO acceptance_criteria (id, task_id, criterion, is_satisfied, is_locked)
                  VALUES (?1, ?2, ?3, 0, 0)",
                 params![crit_id, id, crit],
-            ).ok();
+            )
+            .ok();
         }
 
         let task = Task {
@@ -365,7 +664,13 @@ impl CoordinatorEngine {
         };
 
         drop(conn);
-        self.emit_event(Some(project_id), Some(&id), None, "TASK_CREATED", json!({ "title": title, "priority": priority }));
+        self.emit_event(
+            Some(project_id),
+            Some(&id),
+            None,
+            "TASK_CREATED",
+            json!({ "title": title, "priority": priority }),
+        );
         Ok(task)
     }
 
@@ -378,7 +683,16 @@ impl CoordinatorEngine {
         steps: Vec<(String, String, bool)>,
         criteria: Vec<String>,
     ) -> Result<Task, String> {
-        self.create_task_internal(project_id, None, None, title, description, priority, steps, criteria)
+        self.create_task_internal(
+            project_id,
+            None,
+            None,
+            title,
+            description,
+            priority,
+            steps,
+            criteria,
+        )
     }
 
     pub fn list_tasks(&self, project_id: &str) -> Result<Vec<Task>, String> {
@@ -416,7 +730,9 @@ impl CoordinatorEngine {
             })
         };
 
-        let rows = stmt.query_map([project_id], map_row).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([project_id], map_row)
+            .map_err(|e| e.to_string())?;
         let mut res = Vec::new();
         for r in rows.flatten() {
             res.push(r);
@@ -459,7 +775,12 @@ impl CoordinatorEngine {
     }
 
     /// Explicitly cancel a task, releasing all write scope leases and returning masterplan steps to PENDING
-    pub fn cancel_task(&self, task_id: &str, caller_agent_id: Option<&str>, reason: Option<&str>) -> Result<Task, String> {
+    pub fn cancel_task(
+        &self,
+        task_id: &str,
+        caller_agent_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<Task, String> {
         let task = self.get_task(task_id)?;
 
         if let Some(caller) = caller_agent_id {
@@ -471,33 +792,25 @@ impl CoordinatorEngine {
         }
 
         if task.state == TaskState::Done {
-            return Err(format!("Cannot cancel task '{}': Task is already DONE (merged)", task_id));
+            return Err(format!(
+                "Cannot cancel task '{}': Task is already DONE (merged)",
+                task_id
+            ));
         }
 
-        let now = Utc::now().to_rfc3339();
-
-        // 1. Release all scope leases held by this task
-        let _ = self.scope.release_scope(task_id);
-
         let mut conn = self.db.lock();
-        let tx = conn.transaction().map_err(|e| format!("Failed to start cancel transaction: {}", e))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start cancel transaction: {}", e))?;
 
-        // 2. Return any claimed masterplan steps back to PENDING
-        tx.execute(
-            "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1 WHERE claimed_task_id = ?2",
-            params![now, task_id],
-        ).map_err(|e| e.to_string())?;
+        // Transaction-body cancellation writes (scope release, masterplan revert,
+        // merge-queue removal, CANCELLED + stale). Event emission and worktree
+        // cleanup happen after commit below: both lock the DB.
+        cancel_task_inner(&tx, task_id, reason)
+            .map_err(|e| format!("Failed to cancel task: {}", e))?;
 
-        // 3. Remove from merge queue if present
-        tx.execute("DELETE FROM merge_queue WHERE task_id = ?1", [task_id]).map_err(|e| e.to_string())?;
-
-        // 4. Update task state to CANCELLED and mark is_stale = 1
-        tx.execute(
-            "UPDATE tasks SET state = 'CANCELLED', substate = 'NONE', is_stale = 1, updated_at = ?1 WHERE id = ?2",
-            params![now, task_id],
-        ).map_err(|e| e.to_string())?;
-
-        tx.commit().map_err(|e| format!("Failed to commit task cancellation: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit task cancellation: {}", e))?;
         drop(conn);
 
         // 5. Cleanup worktree if present
@@ -505,11 +818,28 @@ impl CoordinatorEngine {
             let p = Path::new(wt_path);
             if p.exists() {
                 if let Ok(projs) = self.list_projects() {
-                    if let Some(proj) = projs.into_iter().find(|p| p.id == task.project_id) {
-                        let _ = self.git.remove_worktree(Path::new(&proj.path), p);
+                    if let Some(proj) = projs.into_iter().find(|pr| pr.id == task.project_id) {
+                        let repo_path = Path::new(&proj.path);
+                        let managed_roots =
+                            vec![self.worktrees_root.clone(), repo_path.join(".agentxflow")];
+                        if self.git.is_managed_worktree(repo_path, &managed_roots, p) {
+                            let _ = self.git.remove_worktree(repo_path, &managed_roots, p);
+                            let _ = crate::git::GitService::safe_remove_dir_all(p);
+                        } else {
+                            warn!(
+                                "Refusing to delete unmanaged worktree path {:?} during task cancellation",
+                                p
+                            );
+                            self.emit_event(
+                                Some(&task.project_id),
+                                Some(task_id),
+                                caller_agent_id,
+                                "WORKTREE_SAFETY_REFUSAL",
+                                json!({ "path": wt_path }),
+                            );
+                        }
                     }
                 }
-                let _ = crate::git::GitService::safe_remove_dir_all(p);
             }
         }
 
@@ -526,7 +856,11 @@ impl CoordinatorEngine {
 
     /// Requeues a task chunk back to the masterplan: releases scope leases and sets step status = PENDING
     pub fn requeue_task(&self, task_id: &str, caller_agent_id: Option<&str>) -> Result<(), String> {
-        self.cancel_task(task_id, caller_agent_id, Some("Task requeued to masterplan pending backlog"))?;
+        self.cancel_task(
+            task_id,
+            caller_agent_id,
+            Some("Task requeued to masterplan pending backlog"),
+        )?;
         Ok(())
     }
 
@@ -535,39 +869,128 @@ impl CoordinatorEngine {
         let conn = self.db.lock();
 
         let mut stmt_steps = conn.prepare("SELECT id, task_id, order_index, title, description, is_mandatory, status, completed_at FROM task_steps WHERE task_id = ?1 ORDER BY order_index ASC").map_err(|e| e.to_string())?;
-        let steps: Vec<TaskStep> = stmt_steps.query_map([task_id], |r| {
-            Ok(TaskStep { id: r.get(0)?, task_id: r.get(1)?, order_index: r.get(2)?, title: r.get(3)?, description: r.get(4)?, is_mandatory: r.get(5)?, status: r.get(6)?, completed_at: r.get(7)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let steps: Vec<TaskStep> = stmt_steps
+            .query_map([task_id], |r| {
+                Ok(TaskStep {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    order_index: r.get(2)?,
+                    title: r.get(3)?,
+                    description: r.get(4)?,
+                    is_mandatory: r.get(5)?,
+                    status: r.get(6)?,
+                    completed_at: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let mut stmt_crit = conn.prepare("SELECT id, task_id, criterion, is_satisfied, is_locked FROM acceptance_criteria WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let criteria: Vec<AcceptanceCriteria> = stmt_crit.query_map([task_id], |r| {
-            Ok(AcceptanceCriteria { id: r.get(0)?, task_id: r.get(1)?, criterion: r.get(2)?, is_satisfied: r.get(3)?, is_locked: r.get(4)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let criteria: Vec<AcceptanceCriteria> = stmt_crit
+            .query_map([task_id], |r| {
+                Ok(AcceptanceCriteria {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    criterion: r.get(2)?,
+                    is_satisfied: r.get(3)?,
+                    is_locked: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let mut stmt_leases = conn.prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let leases: Vec<ScopeLease> = stmt_leases.query_map([task_id], |r| {
-            Ok(ScopeLease { id: r.get(0)?, task_id: r.get(1)?, agent_id: r.get(2)?, pattern: r.get(3)?, access_type: r.get(4)?, expires_at: r.get(5)?, created_at: r.get(6)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let leases: Vec<ScopeLease> = stmt_leases
+            .query_map([task_id], |r| {
+                Ok(ScopeLease {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    pattern: r.get(3)?,
+                    access_type: r.get(4)?,
+                    expires_at: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let mut stmt_deps = conn.prepare("SELECT id, task_id, depends_on_task_id, dependency_type, created_at FROM task_dependencies WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let dependencies: Vec<TaskDependency> = stmt_deps.query_map([task_id], |r| {
-            Ok(TaskDependency { id: r.get(0)?, task_id: r.get(1)?, depends_on_task_id: r.get(2)?, dependency_type: r.get(3)?, created_at: r.get(4)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let dependencies: Vec<TaskDependency> = stmt_deps
+            .query_map([task_id], |r| {
+                Ok(TaskDependency {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    depends_on_task_id: r.get(2)?,
+                    dependency_type: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
-        let mut stmt_runs = conn.prepare("SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at FROM verification_runs WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let verification_runs: Vec<VerificationRun> = stmt_runs.query_map([task_id], |r| {
-            Ok(VerificationRun { id: r.get(0)?, task_id: r.get(1)?, run_id: r.get(2)?, check_id: r.get(3)?, check_name: r.get(4)?, commit_sha: r.get(5)?, command: r.get(6)?, exit_code: r.get(7)?, stdout: r.get(8)?, stderr: r.get(9)?, duration_ms: r.get(10)?, is_passed: r.get(11)?, is_stale: r.get(12)?, executed_at: r.get(13)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let mut stmt_runs = conn.prepare("SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at, timed_out FROM verification_runs WHERE task_id = ?1").map_err(|e| e.to_string())?;
+        let verification_runs: Vec<VerificationRun> = stmt_runs
+            .query_map([task_id], |r| {
+                Ok(VerificationRun {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    run_id: r.get(2)?,
+                    check_id: r.get(3)?,
+                    check_name: r.get(4)?,
+                    commit_sha: r.get(5)?,
+                    command: r.get(6)?,
+                    exit_code: r.get(7)?,
+                    stdout: r.get(8)?,
+                    stderr: r.get(9)?,
+                    duration_ms: r.get(10)?,
+                    is_passed: r.get(11)?,
+                    is_stale: r.get(12)?,
+                    executed_at: r.get(13)?,
+                    timed_out: r.get(14)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let mut stmt_violations = conn.prepare("SELECT id, task_id, agent_id, file_path, violation_type, detected_at, resolved FROM scope_violations WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let violations: Vec<ScopeViolation> = stmt_violations.query_map([task_id], |r| {
-            Ok(ScopeViolation { id: r.get(0)?, task_id: r.get(1)?, agent_id: r.get(2)?, file_path: r.get(3)?, violation_type: r.get(4)?, detected_at: r.get(5)?, resolved: r.get(6)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let violations: Vec<ScopeViolation> = stmt_violations
+            .query_map([task_id], |r| {
+                Ok(ScopeViolation {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    file_path: r.get(3)?,
+                    violation_type: r.get(4)?,
+                    detected_at: r.get(5)?,
+                    resolved: r.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let mut stmt_evidence = conn.prepare("SELECT id, task_id, step_id, evidence_type, source, payload_json, recorded_at FROM evidence_records WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let evidence_records: Vec<EvidenceRecord> = stmt_evidence.query_map([task_id], |r| {
-            Ok(EvidenceRecord { id: r.get(0)?, task_id: r.get(1)?, step_id: r.get(2)?, evidence_type: r.get(3)?, source: r.get(4)?, payload_json: r.get(5)?, recorded_at: r.get(6)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let evidence_records: Vec<EvidenceRecord> = stmt_evidence
+            .query_map([task_id], |r| {
+                Ok(EvidenceRecord {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    step_id: r.get(2)?,
+                    evidence_type: r.get(3)?,
+                    source: r.get(4)?,
+                    payload_json: r.get(5)?,
+                    recorded_at: r.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let proof_bundle = conn.query_row(
             "SELECT task_id, project_id, agent_id, prompt, base_sha, head_sha, files_changed_json, diff_summary, proof_hash, generated_at, verification_runs_json FROM proof_bundles WHERE task_id = ?1 ORDER BY generated_at DESC LIMIT 1",
@@ -609,6 +1032,9 @@ impl CoordinatorEngine {
                         last_heartbeat: r.get(5)?,
                         created_at: r.get(6)?,
                         session_token: None,
+                        active_task_id: Some(task_id.to_string()),
+                        active_task_title: Some(task.title.clone()),
+                        last_seen_seconds: None,
                     })
                 },
             ).ok()
@@ -636,25 +1062,29 @@ impl CoordinatorEngine {
         ).ok();
 
         let mut stmt_eval = conn.prepare("SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 ORDER BY evaluated_at DESC").map_err(|e| e.to_string())?;
-        let evaluator_results: Vec<EvaluatorResult> = stmt_eval.query_map([task_id], |r| {
-            Ok(EvaluatorResult {
-                id: r.get(0)?,
-                task_id: r.get(1)?,
-                attempt_id: r.get(2)?,
-                criterion_id: r.get(3)?,
-                evaluator_name: r.get(4)?,
-                evaluator_type: r.get(5)?,
-                evaluator_version: r.get(6)?,
-                commit_sha: r.get(7)?,
-                exit_code: r.get(8)?,
-                stdout_output: r.get(9)?,
-                stderr_output: r.get(10)?,
-                output_sha256: r.get(11)?,
-                duration_ms: r.get(12)?,
-                passed: r.get(13)?,
-                evaluated_at: r.get(14)?,
+        let evaluator_results: Vec<EvaluatorResult> = stmt_eval
+            .query_map([task_id], |r| {
+                Ok(EvaluatorResult {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    attempt_id: r.get(2)?,
+                    criterion_id: r.get(3)?,
+                    evaluator_name: r.get(4)?,
+                    evaluator_type: r.get(5)?,
+                    evaluator_version: r.get(6)?,
+                    commit_sha: r.get(7)?,
+                    exit_code: r.get(8)?,
+                    stdout_output: r.get(9)?,
+                    stderr_output: r.get(10)?,
+                    output_sha256: r.get(11)?,
+                    duration_ms: r.get(12)?,
+                    passed: r.get(13)?,
+                    evaluated_at: r.get(14)?,
+                })
             })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         Ok(TaskDetails {
             task,
@@ -675,19 +1105,27 @@ impl CoordinatorEngine {
     /// Crash-safe Task Claiming with Compare-and-Swap & Transactional Lock
     pub fn claim_task(&self, task_id: &str, agent_id: &str) -> Result<Task, String> {
         if !self.is_agent_registered(agent_id) {
-            return Err(format!("Agent registration required: Agent ID '{}' is not registered.", agent_id));
+            return Err(format!(
+                "Agent registration required: Agent ID '{}' is not registered.",
+                agent_id
+            ));
         }
 
         // Dependency gate check
         if !self.dag.are_dependencies_satisfied(task_id)? {
-            return Err(format!("Cannot claim task '{}': Prerequisite dependencies are not yet DONE", task_id));
+            return Err(format!(
+                "Cannot claim task '{}': Prerequisite dependencies are not yet DONE",
+                task_id
+            ));
         }
 
         let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
         // 1. Transactional check & reserve state as CLAIMING
-        let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {}", e))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start transaction: {}", e))?;
 
         let (project_id, current_state, current_assigned): (String, String, Option<String>) = tx
             .query_row(
@@ -698,12 +1136,18 @@ impl CoordinatorEngine {
             .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?;
 
         if current_state != "BACKLOG" && current_state != "READY" {
-            return Err(format!("Cannot claim task '{}': Task is already in state '{}'", task_id, current_state));
+            return Err(format!(
+                "Cannot claim task '{}': Task is already in state '{}'",
+                task_id, current_state
+            ));
         }
 
         if let Some(existing_agent) = current_assigned {
             if !existing_agent.is_empty() && existing_agent != agent_id {
-                return Err(format!("Cannot claim task '{}': Already assigned to agent '{}'", task_id, existing_agent));
+                return Err(format!(
+                    "Cannot claim task '{}': Already assigned to agent '{}'",
+                    task_id, existing_agent
+                ));
             }
         }
 
@@ -717,10 +1161,21 @@ impl CoordinatorEngine {
 
         let repo_path = Path::new(&proj_path);
         let branch_name = format!("agentxflow/task-{}", task_id);
-        let worktree_dir = self.worktrees_root.join(&project_id).join(format!("task-{}", task_id));
+        let worktree_dir = self
+            .worktrees_root
+            .join(&project_id)
+            .join(format!("task-{}", task_id));
         let worktree_path_str = worktree_dir.to_string_lossy().to_string();
 
-        let base_sha = self.git.get_ref_sha(repo_path, &target_branch).ok();
+        let base_sha = self
+            .git
+            .get_ref_sha(repo_path, &target_branch)
+            .map_err(|e| {
+                format!(
+                    "Failed to resolve base commit '{}' for claim of task '{}': {}",
+                    target_branch, task_id, e
+                )
+            })?;
 
         // Set state = 'CLAIMING'
         tx.execute(
@@ -728,39 +1183,100 @@ impl CoordinatorEngine {
             params![agent_id, worktree_path_str, branch_name, base_sha, now, task_id],
         ).map_err(|e| format!("Failed to record task claim: {}", e))?;
 
-        tx.commit().map_err(|e| format!("Failed to commit claim reservation: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit claim reservation: {}", e))?;
         drop(conn);
 
         // 2. Cut isolated Git worktree on disk
         if worktree_dir.exists() {
-            let _ = self.git.remove_worktree(repo_path, &worktree_dir);
-            let _ = std::fs::remove_dir_all(&worktree_dir);
+            let managed_roots = vec![self.worktrees_root.clone(), repo_path.join(".agentxflow")];
+            if self
+                .git
+                .is_managed_worktree(repo_path, &managed_roots, &worktree_dir)
+            {
+                let _ = self
+                    .git
+                    .remove_worktree(repo_path, &managed_roots, &worktree_dir);
+                let _ = std::fs::remove_dir_all(&worktree_dir);
+            } else {
+                warn!(
+                    "Refusing to remove unmanaged path {:?} during claim re-cut",
+                    worktree_dir
+                );
+                self.emit_event(
+                    Some(&project_id),
+                    Some(task_id),
+                    Some(agent_id),
+                    "WORKTREE_SAFETY_REFUSAL",
+                    json!({ "path": worktree_path_str }),
+                );
+            }
         }
 
-        if let Err(e) = self.git.create_worktree(repo_path, &worktree_dir, &branch_name, &target_branch) {
-            // Full compensation on failure
+        if let Err(e) =
+            self.git
+                .create_worktree(repo_path, &worktree_dir, &branch_name, &target_branch)
+        {
+            // Full compensation on failure: validated CLAIMING -> READY reset.
+            // (DB stores 'CLAIMING' which parses to TaskState::Backlog - Task 4.1 parse quirk)
             let conn = self.db.lock();
-            conn.execute(
-                "UPDATE tasks SET state = 'READY', substate = 'NONE', assigned_agent_id = NULL, worktree_path = NULL, branch_name = NULL WHERE id = ?1",
-                [task_id],
-            ).ok();
+            if let Err(te) = transition_task_state_on_conn(
+                &conn,
+                task_id,
+                &[TaskState::Backlog],
+                TaskState::Ready,
+            ) {
+                error!(
+                    "Failed to compensate claim reservation for task '{}' after worktree creation failure: {}",
+                    task_id, te
+                );
+            } else {
+                conn.execute(
+                    "UPDATE tasks SET substate = 'NONE', assigned_agent_id = NULL, worktree_path = NULL, branch_name = NULL WHERE id = ?1",
+                    [task_id],
+                ).ok();
+            }
             return Err(format!("Failed to create isolated Git worktree: {}", e));
         }
 
-        // 3. Mark state = 'RUNNING' and lock criteria
-        let conn = self.db.lock();
-        conn.execute(
-            "UPDATE tasks SET state = 'RUNNING', substate = 'ANALYZING', updated_at = ?1 WHERE id = ?2",
-            params![now, task_id],
-        ).ok();
-        conn.execute("UPDATE acceptance_criteria SET is_locked = 1 WHERE task_id = ?1", [task_id]).ok();
+        // 3. Mark state = 'RUNNING' and lock criteria atomically (validated transition;
+        //    the current state at this point is 'CLAIMING', which parses to Backlog)
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start finalize transaction: {}", e))?;
+        transition_task_state_on_conn(&tx, task_id, &[TaskState::Backlog], TaskState::Running)
+            .map_err(|e| format!("Failed to mark task as RUNNING: {}", e))?;
+        tx.execute(
+            "UPDATE tasks SET substate = 'ANALYZING' WHERE id = ?1",
+            [task_id],
+        )
+        .map_err(|e| format!("Failed to record task substate: {}", e))?;
+        tx.execute(
+            "UPDATE acceptance_criteria SET is_locked = 1 WHERE task_id = ?1",
+            [task_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit claim finalization: {}", e))?;
         drop(conn);
 
-        self.emit_event(Some(&project_id), Some(task_id), Some(agent_id), "TASK_CLAIMED", json!({ "agent": agent_id }));
+        self.emit_event(
+            Some(&project_id),
+            Some(task_id),
+            Some(agent_id),
+            "TASK_CLAIMED",
+            json!({ "agent": agent_id }),
+        );
         self.get_task(task_id)
     }
 
-    pub fn complete_step(&self, step_id: &str, agent_id: Option<&str>, evidence_json: Option<&str>) -> Result<TaskStep, String> {
+    pub fn complete_step(
+        &self,
+        step_id: &str,
+        agent_id: Option<&str>,
+        evidence_json: Option<&str>,
+    ) -> Result<TaskStep, String> {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
@@ -787,7 +1303,8 @@ impl CoordinatorEngine {
         conn.execute(
             "UPDATE task_steps SET status = 'COMPLETED', completed_at = ?1 WHERE id = ?2",
             params![now, step_id],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
 
         let step = conn.query_row(
             "SELECT id, task_id, order_index, title, description, is_mandatory, status, completed_at FROM task_steps WHERE id = ?1",
@@ -816,7 +1333,13 @@ impl CoordinatorEngine {
         }
 
         drop(conn);
-        self.emit_event(None, Some(&step.task_id), agent_id, "STEP_COMPLETED", json!({ "step_id": step_id, "title": step.title }));
+        self.emit_event(
+            None,
+            Some(&step.task_id),
+            agent_id,
+            "STEP_COMPLETED",
+            json!({ "step_id": step_id, "title": step.title }),
+        );
         Ok(step)
     }
 
@@ -827,18 +1350,28 @@ impl CoordinatorEngine {
         // 1. Ownership enforcement
         if let Some(ref assigned) = task.assigned_agent_id {
             if assigned != agent_id {
-                return Err(format!("Task ownership violation: Task '{}' is owned by agent '{}', not '{}'", task_id, assigned, agent_id));
+                return Err(format!(
+                    "Task ownership violation: Task '{}' is owned by agent '{}', not '{}'",
+                    task_id, assigned, agent_id
+                ));
             }
         }
 
-        let _proj = self.list_projects()?.into_iter().find(|p| p.id == task.project_id).ok_or("Project not found")?;
+        let _proj = self
+            .list_projects()?
+            .into_iter()
+            .find(|p| p.id == task.project_id)
+            .ok_or("Project not found")?;
         let worktree_dir = match task.worktree_path.as_deref() {
             Some(path) => Path::new(path),
             None => return Err("Task has no worktree path allocated".to_string()),
         };
 
         if !worktree_dir.exists() {
-            return Err(format!("Task worktree does not exist at {:?}", worktree_dir));
+            return Err(format!(
+                "Task worktree does not exist at {:?}",
+                worktree_dir
+            ));
         }
 
         // 2. Cleanliness check (reject dirty worktree with uncommitted changes)
@@ -853,11 +1386,22 @@ impl CoordinatorEngine {
             });
         }
 
-        // Transition state to VERIFYING
+        // Transition state to VERIFYING (validated)
         let now = Utc::now().to_rfc3339();
+        self.transition_task_state(
+            task_id,
+            &[TaskState::Running],
+            TaskState::Verifying,
+            Some(agent_id),
+            "TASK_VERIFYING",
+            json!({ "substate": "VERIFYING" }),
+        )?;
         let conn = self.db.lock();
-        conn.execute("UPDATE tasks SET state = 'VERIFYING', substate = 'VERIFYING', updated_at = ?1 WHERE id = ?2", [&now, task_id])
-            .map_err(|e| format!("Failed to set task to VERIFYING: {}", e))?;
+        conn.execute(
+            "UPDATE tasks SET substate = 'VERIFYING' WHERE id = ?1",
+            [task_id],
+        )
+        .map_err(|e| format!("Failed to set task substate: {}", e))?;
 
         // Retrieve or create active task attempt with strict error propagation and run_number compatibility
         let attempt_opt: Option<(String, i32)> = conn
@@ -899,7 +1443,8 @@ impl CoordinatorEngine {
         let head_sha = self.git.get_worktree_head_sha(worktree_dir)?;
 
         // 4. Invalidate stale verifications from previous commit SHAs
-        self.verify.invalidate_stale_verifications(task_id, &head_sha)?;
+        self.verify
+            .invalidate_stale_verifications(task_id, &head_sha)?;
 
         // 5. Automatically execute comprehensive verification profile and machine evaluators
         self.verify.execute_profile_for_attempt(
@@ -910,13 +1455,26 @@ impl CoordinatorEngine {
             &head_sha,
         )?;
 
-        // 6. Perform actual Git mutation audit against held scope leases for this attempt
-        let changed_files = if let Some(ref base) = task.base_sha {
-            self.git.get_worktree_mutations(worktree_dir, base).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        self.scope.audit_attempt_mutations(task_id, Some(&attempt_id), agent_id, &changed_files)?;
+        // 6. Perform actual Git mutation audit against held scope leases for this attempt.
+        //    Fail CLOSED: without a resolvable base commit or a computable git diff the
+        //    submission must error instead of auditing an empty change set.
+        let base_sha = task.base_sha.as_deref().ok_or_else(|| {
+            format!(
+                "Failed to audit task '{}': no base commit recorded for this task",
+                task_id
+            )
+        })?;
+        let changed_files = self
+            .git
+            .get_worktree_mutations(worktree_dir, base_sha)
+            .map_err(|e| {
+                format!(
+                    "Failed to compute git mutations for task '{}' audit: {}",
+                    task_id, e
+                )
+            })?;
+        self.scope
+            .audit_attempt_mutations(task_id, Some(&attempt_id), agent_id, &changed_files)?;
 
         // 7. Verification checks gate evaluation
         let verify_res = self.verify.verify_task_submission(task_id, &head_sha)?;
@@ -925,27 +1483,46 @@ impl CoordinatorEngine {
 
         if verify_res.is_valid {
             // 8. Generate deterministic Proof-of-Completion bundle (strictly required before MERGE_READY)
-            self.verify.generate_proof_bundle(
-                task_id,
-                &task.project_id,
-                Some(agent_id),
-                &task.description,
-                task.base_sha.as_deref().unwrap_or(""),
-                &head_sha,
-                &changed_files,
-                "Authoritative Coordinator Automated Verification Passed",
-            ).map_err(|e| format!("Failed to generate proof bundle: {}", e))?;
+            self.verify
+                .generate_proof_bundle(
+                    task_id,
+                    &task.project_id,
+                    Some(agent_id),
+                    &task.description,
+                    task.base_sha.as_deref().unwrap_or(""),
+                    &head_sha,
+                    &changed_files,
+                    "Authoritative Coordinator Automated Verification Passed",
+                )
+                .map_err(|e| format!("Failed to generate proof bundle: {}", e))?;
 
             // 9. Auto-enqueue for serialized merge queue (strictly required before MERGE_READY)
             self.enqueue_task_by_id(&task.project_id, task_id)
                 .map_err(|e| format!("Failed to enqueue task in merge queue: {}", e))?;
 
-            // 10. Atomically transition state to MERGE_READY & attempt to VERIFIED & complete masterplan steps
+            // 10. Atomically transition state to MERGE_READY & attempt to VERIFIED & complete masterplan steps.
+            //     The step-9 enqueue already transitioned VERIFYING -> MERGE_READY, so the write here
+            //     is a no-op self-leg: guard it instead of letting the primitive reject it.
             let conn = self.db.lock();
+            let current_state: String = conn
+                .query_row("SELECT state FROM tasks WHERE id = ?1", [task_id], |r| {
+                    r.get(0)
+                })
+                .map_err(|e| e.to_string())?;
+            if current_state != "MERGE_READY" {
+                transition_task_state_on_conn(
+                    &conn,
+                    task_id,
+                    &[TaskState::Verifying],
+                    TaskState::MergeReady,
+                )
+                .map_err(|e| format!("Failed to transition task to MERGE_READY: {}", e))?;
+            }
             conn.execute(
-                "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', head_sha = ?1, updated_at = ?2 WHERE id = ?3",
-                params![head_sha, now_finished, task_id],
-            ).map_err(|e| format!("Failed to transition task to MERGE_READY: {}", e))?;
+                "UPDATE tasks SET substate = 'NONE', head_sha = ?1 WHERE id = ?2",
+                params![head_sha, task_id],
+            )
+            .map_err(|e| e.to_string())?;
 
             conn.execute(
                 "UPDATE task_attempts SET status = 'VERIFIED', head_sha = ?1, finished_at = ?2 WHERE id = ?3",
@@ -958,14 +1535,29 @@ impl CoordinatorEngine {
             ).ok();
             drop(conn);
 
-            self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_VERIFIED", json!({ "head_sha": head_sha }));
+            self.emit_event(
+                Some(&task.project_id),
+                Some(task_id),
+                Some(agent_id),
+                "TASK_VERIFIED",
+                json!({ "head_sha": head_sha }),
+            );
         } else {
-            let reasons_json = serde_json::to_string(&verify_res.rejection_reasons).unwrap_or_else(|_| "[]".to_string());
+            let reasons_json = serde_json::to_string(&verify_res.rejection_reasons)
+                .unwrap_or_else(|_| "[]".to_string());
             let conn = self.db.lock();
+            transition_task_state_on_conn(
+                &conn,
+                task_id,
+                &[TaskState::Verifying],
+                TaskState::Failed,
+            )
+            .map_err(|e| format!("Failed to set task to FAILED: {}", e))?;
             conn.execute(
-                "UPDATE tasks SET state = 'FAILED', substate = 'NONE', updated_at = ?1 WHERE id = ?2",
-                params![now_finished, task_id],
-            ).map_err(|e| format!("Failed to set task to FAILED: {}", e))?;
+                "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
+                [task_id],
+            )
+            .map_err(|e| e.to_string())?;
 
             conn.execute(
                 "UPDATE task_attempts SET status = 'FAILED', rejection_reasons = ?1, finished_at = ?2 WHERE id = ?3",
@@ -973,27 +1565,49 @@ impl CoordinatorEngine {
             ).map_err(|e| format!("Failed to update task attempt status: {}", e))?;
             drop(conn);
 
-            self.emit_event(Some(&task.project_id), Some(task_id), Some(agent_id), "TASK_VERIFICATION_FAILED", json!({ "reasons": verify_res.rejection_reasons }));
+            self.emit_event(
+                Some(&task.project_id),
+                Some(task_id),
+                Some(agent_id),
+                "TASK_VERIFICATION_FAILED",
+                json!({ "reasons": verify_res.rejection_reasons }),
+            );
         }
 
         Ok(verify_res)
     }
 
     /// Backend-Authoritative Enqueue by Task ID
-    pub fn enqueue_task_by_id(&self, project_id: &str, task_id: &str) -> Result<MergeQueueItem, String> {
+    pub fn enqueue_task_by_id(
+        &self,
+        project_id: &str,
+        task_id: &str,
+    ) -> Result<MergeQueueItem, String> {
         let task = self.get_task(task_id)?;
         if task.project_id != project_id {
-            return Err(format!("Task '{}' does not belong to project '{}'", task_id, project_id));
+            return Err(format!(
+                "Task '{}' does not belong to project '{}'",
+                task_id, project_id
+            ));
         }
 
-        if task.state != TaskState::Review && task.state != TaskState::MergeReady && task.state != TaskState::Verifying {
+        if task.state != TaskState::Review
+            && task.state != TaskState::MergeReady
+            && task.state != TaskState::Verifying
+        {
             return Err(format!("Task '{}' is in state '{:?}'. Only tasks in VERIFYING, REVIEW, or MERGE_READY state can be enqueued for merge.", task_id, task.state));
         }
 
-        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
+        let proj = self
+            .list_projects()?
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .ok_or("Project not found")?;
         let repo_path = Path::new(&proj.path);
 
-        let branch_name = task.branch_name.ok_or("Task has no branch name allocated")?;
+        let branch_name = task
+            .branch_name
+            .ok_or("Task has no branch name allocated")?;
         let worktree_dir = match task.worktree_path.as_deref() {
             Some(p) => Path::new(p),
             None => return Err("Task has no worktree allocated".to_string()),
@@ -1001,18 +1615,63 @@ impl CoordinatorEngine {
 
         let head_sha = self.git.get_worktree_head_sha(worktree_dir)?;
 
-        // Ensure proof bundle exists for this HEAD
+        // Ensure a proof bundle exists for this HEAD and that its canonical digest is
+        // intact (D28): load the LATEST proof row for (task, head), recompute the hash
+        // from the row's stored inputs + evidence tables, and refuse to enqueue when the
+        // stored proof_hash no longer matches - a tampered row cannot pass the gate.
         let conn = self.db.lock();
-        let has_proof: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM proof_bundles WHERE task_id = ?1 AND head_sha = ?2",
-            rusqlite::params![task_id, head_sha],
-            |r| r.get(0),
-        ).unwrap_or(0);
-        drop(conn);
+        let proof_row: Option<StoredProofRow> = conn
+            .query_row(
+                "SELECT task_id, project_id, attempt_id, base_sha, head_sha, files_changed_json, diff_summary, criteria_json, steps_json, proof_hash
+                 FROM proof_bundles
+                 WHERE task_id = ?1 AND head_sha = ?2
+                 ORDER BY generated_at DESC, id DESC LIMIT 1",
+                rusqlite::params![task_id, head_sha],
+                |r| {
+                    Ok(StoredProofRow {
+                        task_id: r.get(0)?,
+                        project_id: r.get(1)?,
+                        attempt_id: r.get(2)?,
+                        base_sha: r.get(3)?,
+                        head_sha: r.get(4)?,
+                        files_changed_json: r.get(5)?,
+                        diff_summary: r.get(6)?,
+                        criteria_json: r.get(7)?,
+                        steps_json: r.get(8)?,
+                        proof_hash: r.get(9)?,
+                    })
+                },
+            )
+            .ok();
 
-        if has_proof == 0 {
-            return Err(format!("No valid proof bundle found for task '{}' at commit HEAD {}. Verification is required.", task_id, head_sha));
+        let stored = match proof_row {
+            Some(row) => row,
+            None => {
+                return Err(format!("No valid proof bundle found for task '{}' at commit HEAD {}. Verification is required.", task_id, head_sha));
+            }
+        };
+
+        let recomputed_proof_hash = Self::recompute_proof_hash_on_conn(&conn, &stored)?;
+
+        if recomputed_proof_hash != stored.proof_hash {
+            drop(conn);
+            self.emit_event(
+                Some(project_id),
+                Some(task_id),
+                task.assigned_agent_id.as_deref(),
+                "PROOF_INTEGRITY_FAILURE",
+                json!({
+                    "head_sha": head_sha,
+                    "stored_proof_hash": stored.proof_hash,
+                    "recomputed_proof_hash": recomputed_proof_hash,
+                }),
+            );
+            return Err(format!(
+                "Proof integrity check failed: stored proof for task '{}' at HEAD {} does not match its recorded evidence (tamper detected).",
+                task_id, head_sha
+            ));
         }
+        drop(conn);
 
         // Check if already enqueued in READY state (idempotent)
         {
@@ -1042,9 +1701,14 @@ impl CoordinatorEngine {
             }
         }
 
-        let base_sha = task.base_sha
+        let base_sha = task
+            .base_sha
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| self.git.get_ref_sha(repo_path, &proj.target_branch).unwrap_or_default());
+            .unwrap_or_else(|| {
+                self.git
+                    .get_ref_sha(repo_path, &proj.target_branch)
+                    .unwrap_or_default()
+            });
 
         let item = self.merge.enqueue_task(
             project_id,
@@ -1055,56 +1719,277 @@ impl CoordinatorEngine {
             &head_sha,
         )?;
 
-        // Mark task as MERGE_READY
-        let conn = self.db.lock();
-        let now = Utc::now().to_rfc3339();
-        conn.execute("UPDATE tasks SET state = 'MERGE_READY', updated_at = ?1 WHERE id = ?2", [&now, task_id]).ok();
-        drop(conn);
+        // Mark task as MERGE_READY (validated; errors propagate - D19). Skip the no-op
+        // self-leg when the task is already MERGE_READY (reconcile auto-heal carry-over).
+        if task.state != TaskState::MergeReady {
+            self.transition_task_state(
+                task_id,
+                &[TaskState::Review, TaskState::Verifying],
+                TaskState::MergeReady,
+                None,
+                "TASK_ENQUEUED_FOR_MERGE",
+                json!({ "position": item.position, "branch": branch_name }),
+            )?;
+        }
 
-        self.emit_event(Some(project_id), Some(task_id), None, "TASK_ENQUEUED_FOR_MERGE", json!({ "position": item.position, "branch": branch_name }));
         Ok(item)
     }
 
+    /// Recomputes the canonical proof digest from a proof row's stored inputs, mirroring
+    /// VerificationEngine::generate_proof_bundle exactly: same length-prefixed field
+    /// encoding, same field order, same evidence-table queries and ORDER BYs. The
+    /// scope_violations rows are resolved for the row's OWN attempt_id (the same value the
+    /// digest hashed and the row persisted) rather than the latest attempt, so per-attempt
+    /// append-only history recomputes deterministically (D10/D28).
+    fn recompute_proof_hash_on_conn(
+        conn: &rusqlite::Connection,
+        row: &StoredProofRow,
+    ) -> Result<String, String> {
+        fn push_field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        fn push_list_count(hasher: &mut Sha256, len: usize) {
+            hasher.update((len as u64).to_be_bytes());
+        }
+
+        let mut files_changed: Vec<String> =
+            serde_json::from_str(&row.files_changed_json).unwrap_or_default();
+        files_changed.sort();
+
+        let mut runs_stmt = conn
+            .prepare(
+                "SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at, timed_out FROM verification_runs WHERE task_id = ?1 AND commit_sha = ?2 ORDER BY id ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let verification_runs: Vec<VerificationRun> = runs_stmt
+            .query_map(rusqlite::params![row.task_id, row.head_sha], |row| {
+                Ok(VerificationRun {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    check_id: row.get(3)?,
+                    check_name: row.get(4)?,
+                    commit_sha: row.get(5)?,
+                    command: row.get(6)?,
+                    exit_code: row.get(7)?,
+                    stdout: row.get(8)?,
+                    stderr: row.get(9)?,
+                    duration_ms: row.get(10)?,
+                    is_passed: row.get(11)?,
+                    is_stale: row.get(12)?,
+                    executed_at: row.get(13)?,
+                    timed_out: row.get(14)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+
+        let mut evals_stmt = conn
+            .prepare(
+                "SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 AND commit_sha = ?2 ORDER BY id ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let evaluator_results: Vec<EvaluatorResult> = evals_stmt
+            .query_map(rusqlite::params![row.task_id, row.head_sha], |row| {
+                Ok(EvaluatorResult {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    attempt_id: row.get(2)?,
+                    criterion_id: row.get(3)?,
+                    evaluator_name: row.get(4)?,
+                    evaluator_type: row.get(5)?,
+                    evaluator_version: row.get(6)?,
+                    commit_sha: row.get(7)?,
+                    exit_code: row.get(8)?,
+                    stdout_output: row.get(9)?,
+                    stderr_output: row.get(10)?,
+                    output_sha256: row.get(11)?,
+                    duration_ms: row.get(12)?,
+                    passed: row.get(13)?,
+                    evaluated_at: row.get(14)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+
+        let mut violations_stmt = conn
+            .prepare(
+                "SELECT id, task_id, agent_id, file_path, violation_type, detected_at, resolved FROM scope_violations WHERE task_id = ?1 AND attempt_id = ?2 ORDER BY id ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let scope_violations: Vec<ScopeViolation> = violations_stmt
+            .query_map(rusqlite::params![row.task_id, row.attempt_id], |row| {
+                Ok(ScopeViolation {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    file_path: row.get(3)?,
+                    violation_type: row.get(4)?,
+                    detected_at: row.get(5)?,
+                    resolved: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+
+        let mut hasher = Sha256::new();
+        push_field(&mut hasher, row.task_id.as_bytes());
+        push_field(&mut hasher, row.project_id.as_bytes());
+        push_field(&mut hasher, row.attempt_id.as_bytes());
+        push_field(&mut hasher, row.base_sha.as_bytes());
+        push_field(&mut hasher, row.head_sha.as_bytes());
+        push_list_count(&mut hasher, files_changed.len());
+        for f in &files_changed {
+            push_field(&mut hasher, f.as_bytes());
+        }
+        push_field(&mut hasher, row.diff_summary.as_bytes());
+        push_field(&mut hasher, row.criteria_json.as_bytes());
+        push_field(&mut hasher, row.steps_json.as_bytes());
+        push_list_count(&mut hasher, verification_runs.len());
+        for run in &verification_runs {
+            push_field(&mut hasher, run.check_name.as_bytes());
+            push_field(&mut hasher, run.exit_code.to_string().as_bytes());
+            push_field(&mut hasher, run.duration_ms.to_string().as_bytes());
+            push_field(&mut hasher, run.timed_out.to_string().as_bytes());
+            push_field(&mut hasher, run.stdout.as_bytes());
+            push_field(&mut hasher, run.stderr.as_bytes());
+        }
+        push_list_count(&mut hasher, evaluator_results.len());
+        for ev in &evaluator_results {
+            push_field(&mut hasher, ev.evaluator_name.as_bytes());
+            push_field(&mut hasher, ev.evaluator_version.as_bytes());
+            let result_json = serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string());
+            push_field(&mut hasher, result_json.as_bytes());
+        }
+        let violations_json =
+            serde_json::to_string(&scope_violations).unwrap_or_else(|_| "[]".to_string());
+        push_field(&mut hasher, violations_json.as_bytes());
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     // --- Agents ---
-    pub fn canonicalize_ide_identity(name: &str, agent_type: &str) -> (String, String, String, String) {
-        let combined = format!("{} {}", name, agent_type).to_lowercase().replace(['_', ' '], "-");
+    pub fn canonicalize_ide_identity(
+        name: &str,
+        agent_type: &str,
+    ) -> (String, String, String, String) {
+        let combined = format!("{} {}", name, agent_type)
+            .to_lowercase()
+            .replace(['_', ' '], "-");
         if combined.contains("antigravity") || combined.contains("agy") {
-            ("antigravity".into(), "Antigravity".into(), "IDE".into(), "Google Antigravity Advanced Agentic Coding Assistant".into())
+            (
+                "antigravity".into(),
+                "Antigravity".into(),
+                "IDE".into(),
+                "Google Antigravity Advanced Agentic Coding Assistant".into(),
+            )
         } else if combined.contains("claude") {
-            ("claude-code".into(), "Claude Code".into(), "CLI".into(), "Anthropic Claude Code Agentic Terminal Engine".into())
+            (
+                "claude-code".into(),
+                "Claude Code".into(),
+                "CLI".into(),
+                "Anthropic Claude Code Agentic Terminal Engine".into(),
+            )
         } else if combined.contains("cursor") {
-            ("cursor".into(), "Cursor".into(), "IDE".into(), "Cursor AI Coding Assistant".into())
+            (
+                "cursor".into(),
+                "Cursor".into(),
+                "IDE".into(),
+                "Cursor AI Coding Assistant".into(),
+            )
         } else if combined.contains("opencode") {
-            ("opencode".into(), "OpenCode".into(), "IDE".into(), "OpenCode Multi-Agent Orchestrator".into())
+            (
+                "opencode".into(),
+                "OpenCode".into(),
+                "IDE".into(),
+                "OpenCode Multi-Agent Orchestrator".into(),
+            )
         } else if combined.contains("codex") || combined.contains("openai") {
-            ("codex".into(), "OpenAI Codex".into(), "CLI".into(), "OpenAI Codex Agentic Coding Engine".into())
+            (
+                "codex".into(),
+                "OpenAI Codex".into(),
+                "CLI".into(),
+                "OpenAI Codex Agentic Coding Engine".into(),
+            )
         } else if combined.contains("gemini") {
-            ("gemini-cli".into(), "Gemini CLI".into(), "CLI".into(), "Google Gemini Developer CLI".into())
+            (
+                "gemini-cli".into(),
+                "Gemini CLI".into(),
+                "CLI".into(),
+                "Google Gemini Developer CLI".into(),
+            )
         } else if combined.contains("copilot") || combined.contains("vscode") {
-            ("copilot".into(), "GitHub Copilot".into(), "IDE".into(), "GitHub Copilot / VS Code Agent".into())
+            (
+                "copilot".into(),
+                "GitHub Copilot".into(),
+                "IDE".into(),
+                "GitHub Copilot / VS Code Agent".into(),
+            )
         } else if combined.contains("windsurf") || combined.contains("codeium") {
-            ("windsurf".into(), "Windsurf".into(), "IDE".into(), "Codeium Windsurf AI Cascade IDE".into())
+            (
+                "windsurf".into(),
+                "Windsurf".into(),
+                "IDE".into(),
+                "Codeium Windsurf AI Cascade IDE".into(),
+            )
         } else if combined.contains("junie") || combined.contains("jetbrains") {
-            ("junie".into(), "Junie".into(), "IDE".into(), "JetBrains Junie AI Assistant".into())
+            (
+                "junie".into(),
+                "Junie".into(),
+                "IDE".into(),
+                "JetBrains Junie AI Assistant".into(),
+            )
         } else if combined.contains("aider") {
-            ("aider".into(), "Aider".into(), "CLI".into(), "Aider AI Pair Programmer".into())
+            (
+                "aider".into(),
+                "Aider".into(),
+                "CLI".into(),
+                "Aider AI Pair Programmer".into(),
+            )
         } else {
             let clean_id = name.trim().to_lowercase().replace(['_', ' '], "-");
-            let id = if clean_id.is_empty() { "custom-agent".to_string() } else { clean_id };
+            let id = if clean_id.is_empty() {
+                "custom-agent".to_string()
+            } else {
+                clean_id
+            };
             let profile = format!("Custom AI Agent ({})", name);
-            let default_type = if agent_type.trim().is_empty() { "Implementer".to_string() } else { agent_type.to_string() };
+            let default_type = if agent_type.trim().is_empty() {
+                "Implementer".to_string()
+            } else {
+                agent_type.to_string()
+            };
             (id, name.to_string(), default_type, profile)
         }
     }
 
     pub fn register_agent(&self, name: &str, agent_type: &str) -> Result<Agent, String> {
-        let (canonical_id, canonical_name, default_type, profile) = Self::canonicalize_ide_identity(name, agent_type);
-        let actual_type = if agent_type.trim().is_empty() || agent_type == "Generic" { default_type } else { agent_type.to_string() };
+        let (canonical_id, canonical_name, default_type, profile) =
+            Self::canonicalize_ide_identity(name, agent_type);
+        let actual_type = if agent_type.trim().is_empty() || agent_type == "Generic" {
+            default_type
+        } else {
+            agent_type.to_string()
+        };
         let conn = self.db.lock();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let expires_str = (now + chrono::Duration::days(365)).to_rfc3339();
-        let session_token = format!("axf_sess_{}", canonical_id.replace('-', "_"));
+        // D11: session tokens must be unpredictable and non-forgeable. Same
+        // construction as the master MCP token (security/mod.rs): two random
+        // UUIDs plus nanos-of-now, SHA-256 hex, kept in the axf_sess_ namespace.
+        let raw = format!(
+            "{}-{}-{}",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(raw.as_bytes());
+        let session_token = format!("axf_sess_{}", hex::encode(hasher.finalize()));
 
         conn.execute(
             "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at, session_token)
@@ -1139,10 +2024,19 @@ impl CoordinatorEngine {
             last_heartbeat: now_str.clone(),
             created_at: now_str,
             session_token: Some(session_token),
+            active_task_id: None,
+            active_task_title: None,
+            last_seen_seconds: Some(0),
         };
 
         drop(conn);
-        self.emit_event(None, None, Some(&canonical_id), "AGENT_REGISTERED", json!({ "name": agent.name, "type": actual_type, "id": canonical_id }));
+        self.emit_event(
+            None,
+            None,
+            Some(&canonical_id),
+            "AGENT_REGISTERED",
+            json!({ "name": agent.name, "type": actual_type, "id": canonical_id }),
+        );
         Ok(agent)
     }
 
@@ -1173,6 +2067,9 @@ impl CoordinatorEngine {
                     last_heartbeat: row.get(5)?,
                     created_at: row.get(6)?,
                     session_token: Some(token.to_string()),
+                    active_task_id: None,
+                    active_task_title: None,
+                    last_seen_seconds: None,
                 })
             })
             .ok();
@@ -1181,7 +2078,8 @@ impl CoordinatorEngine {
             conn.execute(
                 "UPDATE agent_sessions SET last_activity_at = ?1 WHERE session_token = ?2",
                 rusqlite::params![now, token],
-            ).ok();
+            )
+            .ok();
         }
 
         agent
@@ -1196,13 +2094,18 @@ impl CoordinatorEngine {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        let rows_affected = conn.execute(
-            "UPDATE acceptance_criteria SET is_satisfied = 1 WHERE id = ?1 AND task_id = ?2",
-            rusqlite::params![criterion_id, task_id],
-        ).map_err(|e| e.to_string())?;
+        let rows_affected = conn
+            .execute(
+                "UPDATE acceptance_criteria SET is_satisfied = 1 WHERE id = ?1 AND task_id = ?2",
+                rusqlite::params![criterion_id, task_id],
+            )
+            .map_err(|e| e.to_string())?;
 
         if rows_affected == 0 {
-            return Err(format!("Criterion '{}' for task '{}' not found", criterion_id, task_id));
+            return Err(format!(
+                "Criterion '{}' for task '{}' not found",
+                criterion_id, task_id
+            ));
         }
 
         let ev_id = Uuid::new_v4().to_string();
@@ -1214,8 +2117,33 @@ impl CoordinatorEngine {
         ).ok();
 
         drop(conn);
-        self.emit_event(None, Some(task_id), None, "CRITERIA_SATISFIED", json!({ "criterion_id": criterion_id }));
+        self.emit_event(
+            None,
+            Some(task_id),
+            None,
+            "CRITERIA_SATISFIED",
+            json!({ "criterion_id": criterion_id }),
+        );
         Ok(())
+    }
+
+    pub fn touch_agent_activity(&self, agent_id: &str) {
+        if agent_id.trim().is_empty() {
+            return;
+        }
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
+        let conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
+            rusqlite::params![now, agent_id, canonical_id],
+        )
+        .ok();
+        conn.execute(
+            "UPDATE agent_sessions SET last_activity_at = ?1 WHERE agent_id = ?2 OR agent_id = ?3",
+            rusqlite::params![now, agent_id, canonical_id],
+        )
+        .ok();
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, String> {
@@ -1236,25 +2164,415 @@ impl CoordinatorEngine {
                     last_heartbeat: row.get(5)?,
                     created_at: row.get(6)?,
                     session_token: None,
+                    active_task_id: None,
+                    active_task_title: None,
+                    last_seen_seconds: None,
                 })
             })
             .map_err(|e| e.to_string())?;
 
-        let mut res = Vec::new();
-        for r in rows.flatten() {
-            res.push(r);
+        let mut raw_agents: Vec<Agent> = rows.flatten().collect();
+        let now = Utc::now();
+
+        // Dynamically evaluate live status and in-flight tasks for each agent
+        for agent in &mut raw_agents {
+            let last_dt = chrono::DateTime::parse_from_rfc3339(&agent.last_heartbeat)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now);
+            let elapsed_secs = (now - last_dt).num_seconds().max(0);
+            agent.last_seen_seconds = Some(elapsed_secs);
+
+            // Query active in-flight task assigned to this agent (canonical ID or raw ID)
+            let active_task: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT id, title FROM tasks WHERE (assigned_agent_id = ?1 OR assigned_agent_id = ?2) AND state IN ('RUNNING', 'VERIFYING') AND is_stale = 0 ORDER BY updated_at DESC LIMIT 1",
+                    [&agent.id, &agent.name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+
+            if let Some((t_id, t_title)) = active_task {
+                agent.active_task_id = Some(t_id);
+                agent.active_task_title = Some(t_title);
+                if elapsed_secs > 120 {
+                    // Silent > 2 minutes with in-flight task
+                    agent.status = "DISCONNECTED".to_string();
+                } else {
+                    agent.status = "WORKING".to_string();
+                }
+            } else if elapsed_secs > 120 {
+                agent.status = "DISCONNECTED".to_string();
+            } else {
+                agent.status = "IDLE".to_string();
+            }
         }
-        Ok(res)
+
+        Ok(raw_agents)
     }
 
+    /// Unregisters an agent with complete transactional cleanup: every non-DONE
+    /// task it owns is cancelled (scope leases released, masterplan steps
+    /// reverted to PENDING, merge-queue entries removed, CANCELLED + stale),
+    /// any masterplan steps still CLAIMED by the agent are reverted, remaining
+    /// scope leases are released, ACTIVE agent_runs are terminated (agent_runs
+    /// has no FK to agents; the CANCELLED tasks persist), and the agent row is
+    /// deleted (cascades sessions). All of this runs inside ONE transaction —
+    /// any failure aborts and returns Err, leaving no partial cleanup. Worktree
+    /// removal (containment-checked) and event emission happen after commit,
+    /// since both lock the DB.
     pub fn unregister_agent(&self, agent_id: &str) -> Result<(), String> {
-        let conn = self.db.lock();
-        conn.execute("UPDATE tasks SET assigned_agent_id = NULL WHERE assigned_agent_id = ?1", [agent_id]).ok();
-        conn.execute("DELETE FROM scope_leases WHERE agent_id = ?1", [agent_id]).ok();
-        conn.execute("DELETE FROM agents WHERE id = ?1", [agent_id]).map_err(|e| e.to_string())?;
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
+
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start unregister transaction: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        // 1. Collect every task owned by the agent. DONE is excluded: it is
+        //    final (the merge path owns its worktree lifecycle) and cancelling
+        //    it is illegal by design.
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, project_id, worktree_path FROM tasks
+                 WHERE (assigned_agent_id = ?1 OR assigned_agent_id = ?2) AND state != 'DONE'",
+            )
+            .map_err(|e| e.to_string())?;
+        let owned: Vec<(String, String, Option<String>)> = stmt
+            .query_map([agent_id, &canonical_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        drop(stmt);
+
+        // 2. Unclaim every owned task via the shared cancellation semantics
+        for (tid, _, _) in &owned {
+            cancel_task_inner(
+                &tx,
+                tid,
+                Some("Agent unregistered: task reclaimed to masterplan pending backlog"),
+            )?;
+        }
+
+        // 3. Revert any masterplan steps still CLAIMED by the agent
+        tx.execute(
+            "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1 WHERE (claimed_agent_id = ?2 OR claimed_agent_id = ?3) AND status = 'CLAIMED'",
+            params![now, agent_id, canonical_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // 4. Release any remaining scope leases held by the agent
+        tx.execute(
+            "DELETE FROM scope_leases WHERE agent_id = ?1 OR agent_id = ?2",
+            params![agent_id, canonical_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // 5. Terminate ACTIVE agent runs: safe state transition, not deletion
+        //    (the runs reference task_id rows that persist as CANCELLED)
+        tx.execute(
+            "UPDATE agent_runs SET status = 'FAILED', finished_at = ?1 WHERE (agent_id = ?2 OR agent_id = ?3) AND status = 'ACTIVE'",
+            params![now, agent_id, canonical_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // 6. Delete the agent row (cascades agent_sessions)
+        tx.execute(
+            "DELETE FROM agents WHERE id = ?1 OR id = ?2",
+            params![agent_id, canonical_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit agent unregistration: {}", e))?;
         drop(conn);
 
-        self.emit_event(None, None, Some(agent_id), "AGENT_UNREGISTERED", json!({ "agent_id": agent_id }));
+        // 7. Post-commit: containment-checked worktree cleanup for every
+        //    unclaimed task (git ops only, no DB access while worktrees move)
+        for (tid, proj_id, wt_path) in &owned {
+            if let Some(ref wt_path) = wt_path {
+                let p = Path::new(wt_path);
+                if p.exists() {
+                    if let Ok(projs) = self.list_projects() {
+                        if let Some(proj) = projs.into_iter().find(|pr| pr.id == *proj_id) {
+                            let repo_path = Path::new(&proj.path);
+                            let managed_roots =
+                                vec![self.worktrees_root.clone(), repo_path.join(".agentxflow")];
+                            if self.git.is_managed_worktree(repo_path, &managed_roots, p) {
+                                let _ = self.git.remove_worktree(repo_path, &managed_roots, p);
+                                let _ = crate::git::GitService::safe_remove_dir_all(p);
+                            } else {
+                                warn!(
+                                    "Refusing to delete unmanaged worktree path {:?} during agent unregistration",
+                                    p
+                                );
+                                self.emit_event(
+                                    Some(proj_id.as_str()),
+                                    Some(tid.as_str()),
+                                    Some(agent_id),
+                                    "WORKTREE_SAFETY_REFUSAL",
+                                    json!({ "path": wt_path }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 8. Post-commit: event emission (each cancelled task + the unregister)
+        for (tid, proj_id, _) in &owned {
+            self.emit_event(
+                Some(proj_id.as_str()),
+                Some(tid.as_str()),
+                Some(agent_id),
+                "TASK_CANCELLED",
+                json!({ "task_id": tid, "reason": "Agent unregistered" }),
+            );
+        }
+        self.emit_event(
+            None,
+            None,
+            Some(agent_id),
+            "AGENT_UNREGISTERED",
+            json!({ "agent_id": agent_id }),
+        );
+        Ok(())
+    }
+
+    /// Safely unclaims all active tasks for an agent: reverts masterplan steps to PENDING, releases scopes, and cleans worktrees
+    pub fn unclaim_agent_tasks(&self, agent_id: &str) -> Result<Vec<String>, String> {
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM tasks WHERE (assigned_agent_id = ?1 OR assigned_agent_id = ?2) AND state IN ('RUNNING', 'VERIFYING') AND is_stale = 0")
+            .map_err(|e| e.to_string())?;
+
+        let task_ids: Vec<String> = stmt
+            .query_map([agent_id, &canonical_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        drop(stmt);
+        drop(conn);
+
+        let mut unassigned = Vec::new();
+        for tid in &task_ids {
+            if let Ok(cancelled_task) = self.cancel_task(
+                tid,
+                Some(agent_id),
+                Some("Reclaimed to masterplan pending backlog by user/coordinator"),
+            ) {
+                unassigned.push(cancelled_task.id);
+            }
+        }
+
+        self.emit_event(
+            None,
+            None,
+            Some(agent_id),
+            "AGENT_TASKS_UNCLAIMED",
+            json!({ "agent_id": agent_id, "reclaimed_tasks": unassigned }),
+        );
+        Ok(unassigned)
+    }
+
+    /// Periodic stale-recovery sweep (defects D21/D37). Recovers state orphaned by
+    /// disconnected agents. Idempotent, safe transitions only:
+    ///   1. Revoke sessions past `expires_at` (delete `agent_sessions` rows; the
+    ///      session lookup in get_agent_by_session already enforces expiry, so this
+    ///      is cleanup — deleting the row also kills the dead session's token).
+    ///   2. Cancel RUNNING/VERIFYING/CLAIMING tasks whose assigned agent's
+    ///      `last_heartbeat` is older than STALE_AGENT_GRACE (or whose agent row no
+    ///      longer exists) through the same safe unclaim path as Task 10.1
+    ///      (CANCELLED + stale, steps -> PENDING, worktree removed, merge-queue
+    ///      entry removed). Never touches MERGE_READY/DONE/BLOCKED/CANCELLED tasks.
+    ///   3. Revert masterplan steps still CLAIMED whose `claimed_agent_id` no longer
+    ///      exists (agent deleted) back to PENDING with claimed_agent_id NULL.
+    ///
+    /// Emits STALE_RECOVERY events per recovered item. Post-commit work (worktree
+    /// removal + event emission) runs after the transaction commits, since both
+    /// lock the DB.
+    pub fn stale_recovery_sweep(&self) -> Result<(), String> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let stale_before = (now - chrono::Duration::seconds(STALE_AGENT_GRACE)).to_rfc3339();
+
+        // ---- Phase 1: collect everything on the live connection ----
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start stale-recovery transaction: {}", e))?;
+
+        // 1. Revoke expired sessions
+        let revoked_sessions: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM agent_sessions WHERE expires_at <= ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([&now_str], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            let ids = rows.flatten().collect();
+            drop(stmt);
+            tx.execute(
+                "DELETE FROM agent_sessions WHERE expires_at <= ?1",
+                [&now_str],
+            )
+            .map_err(|e| e.to_string())?;
+            ids
+        };
+
+        // 2. Collect stale in-flight tasks: assigned agent heartbeat older than
+        //    STALE_AGENT_GRACE, or the assigned agent row is gone entirely.
+        let stale_tasks: Vec<(String, String, Option<String>, Option<String>)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT t.id, t.project_id, t.worktree_path, t.assigned_agent_id
+                     FROM tasks t
+                     WHERE t.state IN ('RUNNING', 'VERIFYING', 'CLAIMING')
+                       AND t.is_stale = 0
+                       AND t.assigned_agent_id IS NOT NULL AND t.assigned_agent_id != ''
+                       AND (
+                         NOT EXISTS (
+                           SELECT 1 FROM agents a
+                           WHERE a.id = t.assigned_agent_id OR a.name = t.assigned_agent_id
+                         )
+                         OR EXISTS (
+                           SELECT 1 FROM agents a
+                           WHERE (a.id = t.assigned_agent_id OR a.name = t.assigned_agent_id)
+                             AND a.last_heartbeat < ?1
+                         )
+                       )",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([&stale_before], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+
+        // 3. Collect CLAIMED masterplan steps whose claiming agent no longer exists
+        let orphaned_steps: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT s.id FROM masterplan_steps s
+                     WHERE s.status = 'CLAIMED'
+                       AND (s.claimed_agent_id IS NULL OR NOT EXISTS (
+                         SELECT 1 FROM agents a WHERE a.id = s.claimed_agent_id
+                       ))",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+
+        // ---- Phase 2: act on the transaction ----
+        for (tid, _, _, _) in &stale_tasks {
+            cancel_task_inner(
+                &tx,
+                tid,
+                Some("Stale agent recovery: task reclaimed to masterplan pending backlog"),
+            )?;
+        }
+        for sid in &orphaned_steps {
+            tx.execute(
+                "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1 WHERE id = ?2 AND status = 'CLAIMED'",
+                params![now_str, sid],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit stale-recovery sweep: {}", e))?;
+        drop(conn);
+
+        // ---- Phase 3: post-commit work (worktree removal + events; both lock DB) ----
+        for (tid, proj_id, wt_path, agent_id) in &stale_tasks {
+            if let Some(ref wt_path) = wt_path {
+                let p = Path::new(wt_path);
+                if p.exists() {
+                    if let Ok(projs) = self.list_projects() {
+                        if let Some(proj) = projs.into_iter().find(|pr| pr.id == *proj_id) {
+                            let repo_path = Path::new(&proj.path);
+                            let managed_roots =
+                                vec![self.worktrees_root.clone(), repo_path.join(".agentxflow")];
+                            if self.git.is_managed_worktree(repo_path, &managed_roots, p) {
+                                let _ = self.git.remove_worktree(repo_path, &managed_roots, p);
+                                let _ = crate::git::GitService::safe_remove_dir_all(p);
+                            } else {
+                                warn!(
+                                    "Refusing to delete unmanaged worktree path {:?} during stale recovery",
+                                    p
+                                );
+                                self.emit_event(
+                                    Some(proj_id.as_str()),
+                                    Some(tid.as_str()),
+                                    agent_id.as_deref(),
+                                    "WORKTREE_SAFETY_REFUSAL",
+                                    json!({ "path": wt_path }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            self.emit_event(
+                Some(proj_id.as_str()),
+                Some(tid.as_str()),
+                agent_id.as_deref(),
+                "STALE_RECOVERY",
+                json!({ "kind": "task", "task_id": tid, "reason": "assigned agent heartbeat stale" }),
+            );
+        }
+        for sid in &orphaned_steps {
+            self.emit_event(
+                None,
+                None,
+                None,
+                "STALE_RECOVERY",
+                json!({ "kind": "masterplan_step", "step_id": sid, "reason": "claiming agent no longer exists" }),
+            );
+        }
+        for sid in &revoked_sessions {
+            self.emit_event(
+                None,
+                None,
+                None,
+                "STALE_RECOVERY",
+                json!({ "kind": "session", "session_id": sid, "reason": "session expired" }),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Forces an agent to IDLE state, unclaiming any active tasks and resetting heartbeat
+    pub fn force_agent_idle(&self, agent_id: &str) -> Result<(), String> {
+        let _ = self.unclaim_agent_tasks(agent_id);
+        let conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
+
+        conn.execute(
+            "UPDATE agents SET status = 'IDLE', last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
+            rusqlite::params![now, agent_id, canonical_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        drop(conn);
+        self.emit_event(
+            None,
+            None,
+            Some(agent_id),
+            "AGENT_STATUS_CHANGED",
+            json!({ "agent_id": agent_id, "status": "IDLE" }),
+        );
         Ok(())
     }
 
@@ -1262,36 +2580,62 @@ impl CoordinatorEngine {
         if agent_id.trim().is_empty() {
             return false;
         }
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
         let conn = self.db.lock();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [agent_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE id = ?1 OR id = ?2",
+                [agent_id, &canonical_id],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         count > 0
     }
 
     pub fn agent_heartbeat(&self, agent_id: &str) -> Result<(), String> {
+        let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
         let conn = self.db.lock();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let expires_str = (now + chrono::Duration::hours(4)).to_rfc3339();
 
-        let updated = conn.execute(
-            "UPDATE agents SET last_heartbeat = ?1, status = 'WORKING' WHERE id = ?2",
-            params![now_str, agent_id],
-        ).map_err(|e| e.to_string())?;
+        let updated = conn
+            .execute(
+                "UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
+                rusqlite::params![now_str, agent_id, canonical_id],
+            )
+            .map_err(|e| e.to_string())?;
 
         if updated == 0 {
             return Err(format!("Agent '{}' not found", agent_id));
         }
 
         // Transactionally renew active scope leases for this agent
-        conn.execute("UPDATE scope_leases SET expires_at = ?1 WHERE agent_id = ?2", params![expires_str, agent_id]).ok();
+        conn.execute(
+            "UPDATE scope_leases SET expires_at = ?1 WHERE agent_id = ?2 OR agent_id = ?3",
+            params![expires_str, agent_id, canonical_id],
+        )
+        .ok();
 
+        // D29: slide the session expiry forward to now + SESSION_TTL_DAYS so active
+        // agents never expire; dead agents lose their session 30 days after their
+        // last heartbeat (the sweep in Task 10.2 reaps them).
+        let session_expires_str = (now + chrono::Duration::days(SESSION_TTL_DAYS)).to_rfc3339();
+        conn.execute(
+            "UPDATE agent_sessions SET expires_at = ?1 WHERE agent_id = ?2 OR agent_id = ?3",
+            params![session_expires_str, agent_id, canonical_id],
+        )
+        .ok();
+
+        drop(conn);
         Ok(())
     }
 
     pub fn get_project_context(&self, project_id: &str) -> Result<ProjectContextPack, String> {
-        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id)
+        let proj = self
+            .list_projects()?
+            .into_iter()
+            .find(|p| p.id == project_id)
             .ok_or_else(|| format!("Project '{}' not found", project_id))?;
 
         let conn = self.db.lock();
@@ -1311,7 +2655,9 @@ impl CoordinatorEngine {
 
         // 2. Real Project Rules
         let mut stmt_rules = conn
-            .prepare("SELECT rule_text FROM project_rules WHERE project_id = ?1 ORDER BY created_at ASC")
+            .prepare(
+                "SELECT rule_text FROM project_rules WHERE project_id = ?1 ORDER BY created_at ASC",
+            )
             .map_err(|e| e.to_string())?;
         let project_rules: Vec<String> = stmt_rules
             .query_map([project_id], |r| r.get(0))
@@ -1321,7 +2667,9 @@ impl CoordinatorEngine {
 
         // 3. Real Project Memory
         let mut stmt_mem = conn
-            .prepare("SELECT content FROM project_memory WHERE project_id = ?1 ORDER BY created_at DESC")
+            .prepare(
+                "SELECT content FROM project_memory WHERE project_id = ?1 ORDER BY created_at DESC",
+            )
             .map_err(|e| e.to_string())?;
         let project_memory: Vec<String> = stmt_mem
             .query_map([project_id], |r| r.get(0))
@@ -1342,7 +2690,10 @@ impl CoordinatorEngine {
     pub fn get_context_pack(&self, project_id: &str, task_id: &str) -> Result<ContextPack, String> {
         let task = self.get_task(task_id)?;
         if task.project_id != project_id {
-            return Err(format!("Task '{}' belongs to project '{}', not '{}'", task_id, task.project_id, project_id));
+            return Err(format!(
+                "Task '{}' belongs to project '{}', not '{}'",
+                task_id, task.project_id, project_id
+            ));
         }
 
         let proj_ctx = self.get_project_context(project_id)?;
@@ -1351,24 +2702,63 @@ impl CoordinatorEngine {
 
         // Steps & Criteria
         let mut stmt_steps = conn.prepare("SELECT id, task_id, order_index, title, description, is_mandatory, status, completed_at FROM task_steps WHERE task_id = ?1 ORDER BY order_index ASC").map_err(|e| e.to_string())?;
-        let steps: Vec<TaskStep> = stmt_steps.query_map([task_id], |r| {
-            Ok(TaskStep { id: r.get(0)?, task_id: r.get(1)?, order_index: r.get(2)?, title: r.get(3)?, description: r.get(4)?, is_mandatory: r.get(5)?, status: r.get(6)?, completed_at: r.get(7)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let steps: Vec<TaskStep> = stmt_steps
+            .query_map([task_id], |r| {
+                Ok(TaskStep {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    order_index: r.get(2)?,
+                    title: r.get(3)?,
+                    description: r.get(4)?,
+                    is_mandatory: r.get(5)?,
+                    status: r.get(6)?,
+                    completed_at: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         let mut stmt_crit = conn.prepare("SELECT id, task_id, criterion, is_satisfied, is_locked FROM acceptance_criteria WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let criteria: Vec<AcceptanceCriteria> = stmt_crit.query_map([task_id], |r| {
-            Ok(AcceptanceCriteria { id: r.get(0)?, task_id: r.get(1)?, criterion: r.get(2)?, is_satisfied: r.get(3)?, is_locked: r.get(4)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let criteria: Vec<AcceptanceCriteria> = stmt_crit
+            .query_map([task_id], |r| {
+                Ok(AcceptanceCriteria {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    criterion: r.get(2)?,
+                    is_satisfied: r.get(3)?,
+                    is_locked: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         // Blocking Dependencies
         let mut stmt_deps = conn.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1 AND dependency_type = 'BLOCKS'").map_err(|e| e.to_string())?;
-        let dependencies: Vec<String> = stmt_deps.query_map([task_id], |r| r.get(0)).map_err(|e| e.to_string())?.flatten().collect();
+        let dependencies: Vec<String> = stmt_deps
+            .query_map([task_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         // Scope Leases
         let mut stmt_leases = conn.prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
-        let leases: Vec<ScopeLease> = stmt_leases.query_map([task_id], |r| {
-            Ok(ScopeLease { id: r.get(0)?, task_id: r.get(1)?, agent_id: r.get(2)?, pattern: r.get(3)?, access_type: r.get(4)?, expires_at: r.get(5)?, created_at: r.get(6)? })
-        }).map_err(|e| e.to_string())?.flatten().collect();
+        let leases: Vec<ScopeLease> = stmt_leases
+            .query_map([task_id], |r| {
+                Ok(ScopeLease {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    pattern: r.get(3)?,
+                    access_type: r.get(4)?,
+                    expires_at: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
 
         Ok(ContextPack {
             project_id: proj_ctx.project_id,
@@ -1425,7 +2815,8 @@ impl CoordinatorEngine {
             let mut stmt = conn
                 .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND state != 'DONE' AND state != 'CANCELLED'")
                 .map_err(|e| e.to_string())?;
-            let ids = stmt.query_map([project_id], |r| r.get::<_, String>(0))
+            let ids = stmt
+                .query_map([project_id], |r| r.get::<_, String>(0))
                 .map_err(|e| e.to_string())?
                 .flatten()
                 .collect();
@@ -1433,10 +2824,16 @@ impl CoordinatorEngine {
         };
 
         for tid in &uncompleted_tasks {
-            let _ = self.cancel_task(tid, None, Some("Masterplan created/updated with new specification text"));
+            let _ = self.cancel_task(
+                tid,
+                None,
+                Some("Masterplan created/updated with new specification text"),
+            );
         }
 
-        let (plan_id, plan_title, require_approval, is_active) = if let Some((id, old_text)) = existing {
+        let (plan_id, plan_title, require_approval, is_active) = if let Some((id, old_text)) =
+            existing
+        {
             let conn = self.db.lock();
             let rev_id = Uuid::new_v4().to_string();
             let rev_num: i32 = conn.query_row(
@@ -1457,8 +2854,11 @@ impl CoordinatorEngine {
                 rusqlite::params![rev_id, id, project_id, rev_num, old_text, now],
             ).ok();
 
-            conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&id])
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
+                [&id],
+            )
+            .map_err(|e| e.to_string())?;
 
             conn.execute(
                 "UPDATE masterplans SET raw_text = ?1, status = 'UNSORTED', target_step_count = ?2, max_steps_per_agent = ?3, is_active = ?4, updated_at = ?5 WHERE id = ?6",
@@ -1477,7 +2877,13 @@ impl CoordinatorEngine {
             (id, title, true, true)
         };
 
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_UPDATED", json!({ "status": "UNSORTED", "plan_id": plan_id }));
+        self.emit_event(
+            Some(project_id),
+            None,
+            None,
+            "MASTERPLAN_UPDATED",
+            json!({ "status": "UNSORTED", "plan_id": plan_id }),
+        );
 
         Ok(Masterplan {
             id: plan_id,
@@ -1505,7 +2911,9 @@ impl CoordinatorEngine {
     ) -> Result<Masterplan, String> {
         let now = Utc::now().to_rfc3339();
         let plan_id = Uuid::new_v4().to_string();
-        let plan_title = title.filter(|t| !t.trim().is_empty()).unwrap_or("Masterplan");
+        let plan_title = title
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or("Masterplan");
 
         let mut conn = self.db.lock();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -1514,7 +2922,8 @@ impl CoordinatorEngine {
             tx.execute(
                 "UPDATE masterplans SET is_active = 0, updated_at = ?1 WHERE project_id = ?2",
                 params![now, project_id],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         }
 
         let is_act = if activate { 1 } else { 0 };
@@ -1527,7 +2936,13 @@ impl CoordinatorEngine {
         tx.commit().map_err(|e| e.to_string())?;
         drop(conn);
 
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_CREATED", json!({ "plan_id": plan_id, "title": plan_title, "is_active": activate }));
+        self.emit_event(
+            Some(project_id),
+            None,
+            None,
+            "MASTERPLAN_CREATED",
+            json!({ "plan_id": plan_id, "title": plan_title, "is_active": activate }),
+        );
 
         Ok(Masterplan {
             id: plan_id,
@@ -1544,7 +2959,10 @@ impl CoordinatorEngine {
         })
     }
 
-    pub fn list_masterplans_for_project(&self, project_id: &str) -> Result<Vec<Masterplan>, String> {
+    pub fn list_masterplans_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<Masterplan>, String> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
             "SELECT id, project_id, COALESCE(title, 'Masterplan'), raw_text, status, target_step_count, max_steps_per_agent, COALESCE(require_milestone_approval, 1), COALESCE(is_active, 0), created_at, updated_at
@@ -1552,21 +2970,23 @@ impl CoordinatorEngine {
              ORDER BY is_active DESC, updated_at DESC",
         ).map_err(|e| e.to_string())?;
 
-        let rows = stmt.query_map([project_id], |r| {
-            Ok(Masterplan {
-                id: r.get(0)?,
-                project_id: r.get(1)?,
-                title: r.get(2)?,
-                raw_text: r.get(3)?,
-                status: r.get(4)?,
-                target_step_count: r.get(5)?,
-                max_steps_per_agent: r.get(6)?,
-                require_milestone_approval: r.get::<_, i64>(7)? != 0,
-                is_active: r.get::<_, i64>(8)? != 0,
-                created_at: r.get(9)?,
-                updated_at: r.get(10)?,
+        let rows = stmt
+            .query_map([project_id], |r| {
+                Ok(Masterplan {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    title: r.get(2)?,
+                    raw_text: r.get(3)?,
+                    status: r.get(4)?,
+                    target_step_count: r.get(5)?,
+                    max_steps_per_agent: r.get(6)?,
+                    require_milestone_approval: r.get::<_, i64>(7)? != 0,
+                    is_active: r.get::<_, i64>(8)? != 0,
+                    created_at: r.get(9)?,
+                    updated_at: r.get(10)?,
+                })
             })
-        }).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
 
         Ok(rows.flatten().collect())
     }
@@ -1627,18 +3047,21 @@ impl CoordinatorEngine {
                 tx.execute(
                     "UPDATE masterplans SET is_active = 0, updated_at = ?1 WHERE project_id = ?2",
                     rusqlite::params![now, plan.project_id],
-                ).map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
             }
 
             tx.execute(
                 "UPDATE masterplans SET is_active = 1, updated_at = ?1 WHERE id = ?2",
                 rusqlite::params![now, masterplan_id],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         } else {
             tx.execute(
                 "UPDATE masterplans SET is_active = 0, updated_at = ?1 WHERE id = ?2",
                 rusqlite::params![now, masterplan_id],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         }
 
         tx.commit().map_err(|e| e.to_string())?;
@@ -1662,8 +3085,16 @@ impl CoordinatorEngine {
             .ok_or_else(|| format!("Masterplan '{}' not found", masterplan_id))?;
 
         let conn = self.db.lock();
-        conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [masterplan_id]).ok();
-        conn.execute("DELETE FROM masterplan_revisions WHERE masterplan_id = ?1", [masterplan_id]).ok();
+        conn.execute(
+            "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
+            [masterplan_id],
+        )
+        .ok();
+        conn.execute(
+            "DELETE FROM masterplan_revisions WHERE masterplan_id = ?1",
+            [masterplan_id],
+        )
+        .ok();
         conn.execute("DELETE FROM masterplans WHERE id = ?1", [masterplan_id])
             .map_err(|e| format!("Failed to delete masterplan: {}", e))?;
         drop(conn);
@@ -1679,7 +3110,11 @@ impl CoordinatorEngine {
         Ok(())
     }
 
-    pub fn set_masterplan_milestone_approval(&self, project_id: &str, require_approval: bool) -> Result<bool, String> {
+    pub fn set_masterplan_milestone_approval(
+        &self,
+        project_id: &str,
+        require_approval: bool,
+    ) -> Result<bool, String> {
         let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -1692,7 +3127,13 @@ impl CoordinatorEngine {
             )
         }).map_err(|e| format!("Failed to update milestone approval mode: {}", e))?;
         drop(conn);
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_UPDATED", json!({ "require_milestone_approval": require_approval }));
+        self.emit_event(
+            Some(project_id),
+            None,
+            None,
+            "MASTERPLAN_UPDATED",
+            json!({ "require_milestone_approval": require_approval }),
+        );
         Ok(require_approval)
     }
 
@@ -1767,7 +3208,10 @@ impl CoordinatorEngine {
         self.list_masterplan_steps_by_plan_id(project_id)
     }
 
-    pub fn list_masterplan_steps_by_plan_id(&self, masterplan_id: &str) -> Result<Vec<MasterplanStep>, String> {
+    pub fn list_masterplan_steps_by_plan_id(
+        &self,
+        masterplan_id: &str,
+    ) -> Result<Vec<MasterplanStep>, String> {
         let conn = self.db.lock();
         let mut stmt = conn
             .prepare(
@@ -1805,6 +3249,8 @@ impl CoordinatorEngine {
         &self,
         project_id: &str,
         steps: Vec<DecomposedStepInput>,
+        append: Option<bool>,
+        idempotency_key: Option<String>,
     ) -> Result<Vec<MasterplanStep>, String> {
         if steps.is_empty() {
             return Err("Cannot decompose masterplan with empty step list".to_string());
@@ -1814,10 +3260,42 @@ impl CoordinatorEngine {
             .get_masterplan(project_id)?
             .ok_or_else(|| format!("No masterplan found for project '{}'", project_id))?;
 
+        // D22: If an idempotency key is provided, check for a stored result.
+        // Reuse of the same key with the same plan returns stored steps;
+        // reuse with a different plan is rejected.
+        if let Some(ref key) = idempotency_key {
+            let conn = self.db.lock();
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT masterplan_id, result_json FROM masterplan_operations WHERE idempotency_key = ?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            drop(conn);
+
+            if let Some((stored_plan_id, result_json)) = existing {
+                if stored_plan_id != plan.id {
+                    return Err(format!(
+                        "Idempotency key '{}' is already bound to masterplan '{}', cannot reuse with masterplan '{}'",
+                        key, stored_plan_id, plan.id
+                    ));
+                }
+                let stored_steps: Vec<MasterplanStep> = serde_json::from_str(&result_json)
+                    .map_err(|e| {
+                        format!("Failed to deserialize stored idempotency result: {}", e)
+                    })?;
+                return Ok(stored_steps);
+            }
+        }
+
+        let is_append = append.unwrap_or(false);
         let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {}", e))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start transaction: {}", e))?;
 
         // Invariant check 1: Reject hostile re-decomposition if active claims exist, but allow idempotent retries
         let active_claims: i64 = tx
@@ -1831,13 +3309,18 @@ impl CoordinatorEngine {
         if active_claims > 0 {
             // Check for idempotent retry: if existing step count and step titles match
             let mut stmt_chk = tx.prepare("SELECT step_index, title FROM masterplan_steps WHERE masterplan_id = ?1 ORDER BY step_index ASC").map_err(|e| e.to_string())?;
-            let existing_chk: Vec<(i32, String)> = stmt_chk.query_map([&plan.id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?.flatten().collect();
+            let existing_chk: Vec<(i32, String)> = stmt_chk
+                .query_map([&plan.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .collect();
             drop(stmt_chk);
 
             if existing_chk.len() == steps.len() {
-                let is_identical = existing_chk.iter().zip(&steps).all(|(ext, inc)| {
-                    ext.0 == inc.step_index && ext.1.trim() == inc.title.trim()
-                });
+                let is_identical = existing_chk
+                    .iter()
+                    .zip(&steps)
+                    .all(|(ext, inc)| ext.0 == inc.step_index && ext.1.trim() == inc.title.trim());
                 if is_identical {
                     drop(tx);
                     drop(conn);
@@ -1867,15 +3350,30 @@ impl CoordinatorEngine {
             ));
         }
 
-        tx.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan.id])
+        if !is_append {
+            tx.execute(
+                "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
+                [&plan.id],
+            )
             .map_err(|e| e.to_string())?;
+        }
 
         let mut inserted_steps = Vec::new();
 
         for s in steps {
             let step_id = Uuid::new_v4().to_string();
             let suggested_scope = s.suggested_scope.unwrap_or_else(|| "src/**".to_string());
-            let criteria = s.acceptance_criteria.unwrap_or_else(|| "All automated tests pass".to_string());
+            let criteria = s
+                .acceptance_criteria
+                .unwrap_or_else(|| "All automated tests pass".to_string());
+
+            if is_append {
+                tx.execute(
+                    "DELETE FROM masterplan_steps WHERE masterplan_id = ?1 AND step_index = ?2",
+                    rusqlite::params![plan.id, s.step_index],
+                )
+                .ok();
+            }
 
             tx.execute(
                 "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at)
@@ -1903,14 +3401,30 @@ impl CoordinatorEngine {
         tx.execute(
             "UPDATE masterplans SET status = 'RESORTED', updated_at = ?1 WHERE id = ?2",
             params![now, plan.id],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
 
-        tx.commit().map_err(|e| format!("Failed to commit masterplan decomposition: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit masterplan decomposition: {}", e))?;
         drop(conn);
 
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_DECOMPOSED", json!({ "total_steps": inserted_steps.len(), "status": "RESORTED" }));
+        // D22: Store the decompose result for idempotency replay (best-effort;
+        // failure here is non-fatal since the decomposition already succeeded).
+        if let Some(ref key) = idempotency_key {
+            if let Ok(result_steps) = self.list_masterplan_steps_by_plan_id(&plan.id) {
+                if let Ok(result_json) = serde_json::to_string(&result_steps) {
+                    let conn = self.db.lock();
+                    let _ = conn.execute(
+                        "INSERT OR REPLACE INTO masterplan_operations (idempotency_key, masterplan_id, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![key, plan.id, result_json, now],
+                    );
+                }
+            }
+        }
 
-        Ok(inserted_steps)
+        self.emit_event(Some(project_id), None, None, "MASTERPLAN_DECOMPOSED", json!({ "total_steps": inserted_steps.len(), "status": "RESORTED", "is_append": is_append }));
+
+        self.list_masterplan_steps_by_plan_id(&plan.id)
     }
 
     /// Transactional, race-safe chunk reservation with complete compensation and atomic scope acquisition
@@ -1937,7 +3451,10 @@ impl CoordinatorEngine {
 
         if let Some(rc) = requested_count {
             if rc <= 0 {
-                return Err(format!("Invalid chunk count {}: requested count must be greater than 0.", rc));
+                return Err(format!(
+                    "Invalid chunk count {}: requested count must be greater than 0.",
+                    rc
+                ));
             }
         }
 
@@ -1945,7 +3462,9 @@ impl CoordinatorEngine {
         let now = Utc::now().to_rfc3339();
 
         // 1. Check active anti-hoarding limit inside transaction
-        let tx = conn.transaction().map_err(|e| format!("Failed to start transaction: {}", e))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start transaction: {}", e))?;
 
         let currently_active: i64 = tx
             .query_row(
@@ -2001,13 +3520,19 @@ impl CoordinatorEngine {
             ).map_err(|e| e.to_string())?;
         }
 
-        tx.commit().map_err(|e| format!("Failed to commit step reservation: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit step reservation: {}", e))?;
         drop(conn);
 
         let first_idx = reserved_steps.first().unwrap().1;
         let last_idx = reserved_steps.last().unwrap().1;
 
-        let task_title = format!("Masterplan Chunk: Steps {}-{} ({})", first_idx, last_idx, reserved_steps.first().unwrap().2);
+        let task_title = format!(
+            "Masterplan Chunk: Steps {}-{} ({})",
+            first_idx,
+            last_idx,
+            reserved_steps.first().unwrap().2
+        );
         let task_desc = reserved_steps
             .iter()
             .map(|(_, idx, title, desc, ..)| format!("Step #{}: {}\n{}", idx, title, desc))
@@ -2016,13 +3541,32 @@ impl CoordinatorEngine {
 
         let task_steps: Vec<(String, String, bool)> = reserved_steps
             .iter()
-            .map(|(_, idx, title, desc, ..)| (format!("Step #{}: {}", idx, title), desc.clone(), true))
+            .map(|(_, idx, title, desc, ..)| {
+                (format!("Step #{}: {}", idx, title), desc.clone(), true)
+            })
             .collect();
 
         let criteria: Vec<String> = reserved_steps
             .iter()
             .map(|(.., crit)| crit.clone())
             .collect();
+
+        let is_final_chunk = {
+            let conn = self.db.lock();
+            let remaining_pending: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status = 'PENDING'",
+                [&plan.id],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            remaining_pending == 0
+        };
+
+        let mut final_desc = task_desc;
+        let mut final_criteria = criteria;
+        if is_final_chunk {
+            final_desc.push_str("\n\n=================================================================\nFINAL RELEASE DELIVERY REQUIREMENTS (Final Masterplan Chunk):\nAs the agent completing the final step(s) of this masterplan, you must perform the Final Release Delivery:\n1. Build the production bundle / executable.\n2. Create or verify the automated launcher script (`run.bat` for Windows / `start.sh` for Unix or tech-stack launcher).\n3. Test and verify that the application launches successfully.\n4. Create or update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the complete application architecture, configuration, and exact step-by-step instructions on how to use the entire application.\n5. Commit all launcher scripts, build artifacts, and guide documentation before calling `task_submit`.\n=================================================================");
+            final_criteria.push("Automated launcher script (e.g. run.bat) created and tested, and comprehensive USER_GUIDE.md created".to_string());
+        }
 
         // 3. Create and Claim Task with atomic scope lease acquisition and complete rollback on collision
         let mut created_task_id: Option<String> = None;
@@ -2032,10 +3576,10 @@ impl CoordinatorEngine {
                 Some(&plan.id),
                 None,
                 &task_title,
-                &task_desc,
+                &final_desc,
                 "HIGH",
                 task_steps,
-                criteria,
+                final_criteria,
             )?;
             created_task_id = Some(task.id.clone());
 
@@ -2049,7 +3593,12 @@ impl CoordinatorEngine {
 
             if !scope_patterns.is_empty() {
                 // Authoritative atomic scope acquisition: failure bubbles immediately (NO .ok() silent ignore)
-                self.scope.acquire_scope(&claimed_task.id, agent_id, scope_patterns, "EXCLUSIVE_WRITE")?;
+                self.scope.acquire_scope(
+                    &claimed_task.id,
+                    agent_id,
+                    scope_patterns,
+                    "EXCLUSIVE_WRITE",
+                )?;
             }
 
             Ok(claimed_task)
@@ -2062,19 +3611,25 @@ impl CoordinatorEngine {
                     conn.execute(
                         "UPDATE masterplan_steps SET claimed_task_id = ?1 WHERE id = ?2",
                         params![claimed_task.id, id],
-                    ).ok();
+                    )
+                    .ok();
                 }
                 conn.execute(
                     "UPDATE masterplans SET status = 'EXECUTING', updated_at = ?1 WHERE id = ?2",
                     params![now, plan.id],
-                ).ok();
+                )
+                .ok();
                 Ok(claimed_task)
             }
             Err(err) => {
                 // Complete Compensation:
                 // 1. If task was created, release scopes, remove worktree, and cancel task
                 if let Some(ref tid) = created_task_id {
-                    let _ = self.cancel_task(tid, Some(agent_id), Some("Claim failed during scope acquisition or initialization"));
+                    let _ = self.cancel_task(
+                        tid,
+                        Some(agent_id),
+                        Some("Claim failed during scope acquisition or initialization"),
+                    );
                 }
                 // 2. Revert reserved steps back to PENDING
                 let conn = self.db.lock();
@@ -2089,16 +3644,21 @@ impl CoordinatorEngine {
         }
     }
 
-    pub fn reset_masterplan(&self, project_id: &str) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
+    pub fn reset_masterplan(
+        &self,
+        project_id: &str,
+        masterplan_id: Option<&str>,
+    ) -> Result<(), String> {
+        let _now = Utc::now().to_rfc3339();
 
-        // 1. Invalidate and cancel all in-flight unmerged tasks for this project and release their scopes
+        // 1. Invalidate and cancel all in-flight / non-cancelled tasks for this project and release their scopes
         let active_tasks: Vec<String> = {
             let conn = self.db.lock();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM tasks WHERE project_id = ?1 AND state != 'DONE' AND state != 'CANCELLED'"
-            ).map_err(|e| e.to_string())?;
-            let ids = stmt.query_map([project_id], |r| r.get::<_, String>(0))
+            let mut stmt = conn
+                .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND state != 'CANCELLED'")
+                .map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map([project_id], |r| r.get::<_, String>(0))
                 .map_err(|e| e.to_string())?
                 .flatten()
                 .collect();
@@ -2106,38 +3666,70 @@ impl CoordinatorEngine {
         };
 
         for tid in &active_tasks {
-            let _ = self.cancel_task(tid, None, Some("Masterplan was reset; active task invalidated"));
+            let _ = self.cancel_task(tid, None, Some("Masterplan was reset; task invalidated"));
         }
 
+        // 2. Fetch and delete the target masterplan(s) and all their associated steps
         let conn = self.db.lock();
-        let plan_opt: Option<(String, String)> = conn
-            .query_row(
-                "SELECT id, raw_text FROM masterplans WHERE project_id = ?1",
-                [project_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+        let plan_ids: Vec<String> = if let Some(mp_id) = masterplan_id {
+            if !mp_id.trim().is_empty() {
+                vec![mp_id.to_string()]
+            } else {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM masterplans WHERE project_id = ?1")
+                    .map_err(|e| e.to_string())?;
+                let ids = stmt
+                    .query_map([project_id], |r| r.get(0))
+                    .map_err(|e| e.to_string())?
+                    .flatten()
+                    .collect();
+                ids
+            }
+        } else {
+            let mut stmt = conn
+                .prepare("SELECT id FROM masterplans WHERE project_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map([project_id], |r| r.get(0))
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .collect();
+            ids
+        };
+
+        for pid in &plan_ids {
+            conn.execute(
+                "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
+                [pid],
             )
             .ok();
-
-        if let Some((plan_id, raw_text)) = plan_opt {
-            // Archive prior plan before reset
-            let rev_id = Uuid::new_v4().to_string();
-            let rev_num: i32 = conn.query_row(
-                "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM masterplan_revisions WHERE masterplan_id = ?1",
-                [&plan_id],
-                |r| r.get(0),
-            ).unwrap_or(1);
-
-            conn.execute(
-                "INSERT INTO masterplan_revisions (id, masterplan_id, project_id, revision_number, raw_text, reason, steps_snapshot_json, archived_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'Masterplan reset to empty', '[]', ?6)",
-                rusqlite::params![rev_id, plan_id, project_id, rev_num, raw_text, now],
-            ).ok();
-
-            conn.execute("DELETE FROM masterplan_steps WHERE masterplan_id = ?1", [&plan_id]).map_err(|e| e.to_string())?;
-            conn.execute("DELETE FROM masterplans WHERE id = ?1", [&plan_id]).map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM masterplans WHERE id = ?1", [pid])
+                .ok();
         }
         drop(conn);
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_RESET", json!({ "project_id": project_id }));
+
+        // On-disk cleanup: managed worktrees only. The user's primary checkout is a protected resource
+        // (master plan Invariant A) and is NEVER reset or cleaned by the coordinator.
+        if let Ok(proj) = self.get_project(project_id) {
+            let repo_path = Path::new(&proj.path);
+            let wt_dir = repo_path.join(".agentxflow").join("worktrees");
+            if wt_dir.exists() {
+                let _ = std::fs::remove_dir_all(&wt_dir);
+            }
+            // Prune git's worktree metadata for worktrees removed by cancel_task above.
+            let _ = self.git.run_git_cmd(repo_path, &["worktree", "prune"]);
+            // NOTE: the previous `git reset --hard HEAD` + `git clean -fd` on the primary checkout are GONE.
+            // Intentional, documented behavior change: reset wipes plan state + managed worktrees,
+            // never user files. Existing MCP/UI callers see the same return shape.
+        }
+
+        self.emit_event(
+            Some(project_id),
+            None,
+            None,
+            "MASTERPLAN_RESET",
+            json!({ "project_id": project_id, "masterplan_id": masterplan_id }),
+        );
         Ok(())
     }
 
@@ -2171,8 +3763,19 @@ impl CoordinatorEngine {
                 .map(|iter| iter.flatten().collect())
                 .unwrap_or_default();
 
-            for (plan_id, title, status, target_step_count, max_steps_per_agent, is_active, updated_at) in plans {
-                let mut step_stmt = match conn.prepare("SELECT status FROM masterplan_steps WHERE masterplan_id = ?1") {
+            for (
+                plan_id,
+                title,
+                status,
+                target_step_count,
+                max_steps_per_agent,
+                is_active,
+                updated_at,
+            ) in plans
+            {
+                let mut step_stmt = match conn
+                    .prepare("SELECT status FROM masterplan_steps WHERE masterplan_id = ?1")
+                {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
@@ -2182,9 +3785,18 @@ impl CoordinatorEngine {
                     .unwrap_or_default();
 
                 let total = step_statuses.len();
-                let pending = step_statuses.iter().filter(|s| s.as_str() == "PENDING").count();
-                let claimed = step_statuses.iter().filter(|s| s.as_str() == "CLAIMED" || s.as_str() == "IN_PROGRESS").count();
-                let completed = step_statuses.iter().filter(|s| s.as_str() == "COMPLETED").count();
+                let pending = step_statuses
+                    .iter()
+                    .filter(|s| s.as_str() == "PENDING")
+                    .count();
+                let claimed = step_statuses
+                    .iter()
+                    .filter(|s| s.as_str() == "CLAIMED" || s.as_str() == "IN_PROGRESS")
+                    .count();
+                let completed = step_statuses
+                    .iter()
+                    .filter(|s| s.as_str() == "COMPLETED")
+                    .count();
 
                 let next_action = if status == "UNSORTED" {
                     "masterplan_decompose".to_string()
@@ -2225,12 +3837,33 @@ impl CoordinatorEngine {
     }
 
     /// Automatically parses raw masterplan specification into structured execution steps
-    pub fn parse_masterplan_text_to_steps(&self, raw_text: &str, _target_step_count: i32) -> Result<Vec<DecomposedStepInput>, String> {
+    pub fn parse_masterplan_text_to_steps(
+        &self,
+        raw_text: &str,
+        _target_step_count: i32,
+    ) -> Result<Vec<DecomposedStepInput>, String> {
         let infer_scope = |title: &str, desc: &str| -> String {
             let lower = format!("{} {}", title, desc).to_lowercase();
-            if lower.contains("backend") || lower.contains("rust") || lower.contains("src-tauri") || lower.contains("tauri") || lower.contains("mcp") || lower.contains("coordinator") || lower.contains("sqlite") || lower.contains("migration") || lower.contains("database") {
+            if lower.contains("backend")
+                || lower.contains("rust")
+                || lower.contains("src-tauri")
+                || lower.contains("tauri")
+                || lower.contains("mcp")
+                || lower.contains("coordinator")
+                || lower.contains("sqlite")
+                || lower.contains("migration")
+                || lower.contains("database")
+            {
                 "src-tauri/**".to_string()
-            } else if lower.contains("frontend") || lower.contains("ui") || lower.contains("component") || lower.contains("react") || lower.contains("css") || lower.contains("view") || lower.contains("workbench") || lower.contains("modal") {
+            } else if lower.contains("frontend")
+                || lower.contains("ui")
+                || lower.contains("component")
+                || lower.contains("react")
+                || lower.contains("css")
+                || lower.contains("view")
+                || lower.contains("workbench")
+                || lower.contains("modal")
+            {
                 "src/**".to_string()
             } else if lower.contains("crates/") {
                 "crates/**".to_string()
@@ -2240,7 +3873,10 @@ impl CoordinatorEngine {
                 "apps/**".to_string()
             } else if lower.contains("test") || lower.contains("tests/") {
                 "tests/**".to_string()
-            } else if lower.contains("doc") || lower.contains("readme") || lower.contains("specification") {
+            } else if lower.contains("doc")
+                || lower.contains("readme")
+                || lower.contains("specification")
+            {
                 "*.md".to_string()
             } else {
                 "**".to_string()
@@ -2248,7 +3884,11 @@ impl CoordinatorEngine {
         };
 
         let mut steps = Vec::new();
-        let lines: Vec<&str> = raw_text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let lines: Vec<&str> = raw_text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
         let mut current_title: Option<String> = None;
         let mut current_desc: Vec<String> = Vec::new();
         let mut step_index = 1;
@@ -2259,7 +3899,12 @@ impl CoordinatorEngine {
                 || line.starts_with("### ")
                 || line.starts_with("Step ")
                 || line.starts_with("Phase ")
-                || (line.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && (line.contains(". ") || line.contains(": ")))
+                || (line
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                    && (line.contains(". ") || line.contains(": ")))
                 || line.starts_with("- [ ] ")
                 || line.starts_with("- [x] ");
 
@@ -2276,7 +3921,9 @@ impl CoordinatorEngine {
                         title,
                         description: desc,
                         suggested_scope: Some(scope),
-                        acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
+                        acceptance_criteria: Some(
+                            "Code builds cleanly and all verification tests pass.".to_string(),
+                        ),
                     });
                     step_index += 1;
                     current_desc.clear();
@@ -2311,7 +3958,9 @@ impl CoordinatorEngine {
                 title,
                 description: desc,
                 suggested_scope: Some(scope),
-                acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
+                acceptance_criteria: Some(
+                    "Code builds cleanly and all verification tests pass.".to_string(),
+                ),
             });
         }
 
@@ -2321,7 +3970,9 @@ impl CoordinatorEngine {
                 title: "Execute Masterplan Specification".to_string(),
                 description: raw_text.to_string(),
                 suggested_scope: Some("**".to_string()),
-                acceptance_criteria: Some("Code builds cleanly and all verification tests pass.".to_string()),
+                acceptance_criteria: Some(
+                    "Code builds cleanly and all verification tests pass.".to_string(),
+                ),
             });
         }
 
@@ -2329,12 +3980,21 @@ impl CoordinatorEngine {
     }
 
     /// Automatically processes the next serialized merge in queue for a project
-    pub fn process_next_merge(&self, project_id: &str) -> Result<Option<IntegrationAttempt>, String> {
-        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
+    pub fn process_next_merge(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<IntegrationAttempt>, String> {
+        let proj = self
+            .list_projects()?
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .ok_or("Project not found")?;
         let queue = self.merge.list_queue(project_id)?;
         let next_ready = queue.into_iter().find(|item| item.status == "READY");
         if let Some(item) = next_ready {
-            let attempt = self.merge.process_merge_by_id(&item.id, Path::new(&proj.path))?;
+            let attempt = self
+                .merge
+                .process_merge_by_id(&item.id, Path::new(&proj.path))?;
             if let Err(error) = self.scope.release_scope(&item.task_id) {
                 warn!(task_id = %item.task_id, %error, "Merged task scopes could not be released automatically");
             }
@@ -2353,11 +4013,13 @@ impl CoordinatorEngine {
             [task_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).ok();
-        let has_proof: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM proof_bundles WHERE task_id = ?1",
-            [task_id],
-            |r| r.get(0),
-        ).unwrap_or(false);
+        let has_proof: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM proof_bundles WHERE task_id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
         let queue_item: Option<(String, String, String)> = conn.query_row(
             "SELECT id, status, target_branch FROM merge_queue WHERE task_id = ?1 AND processed_at IS NULL",
             [task_id],
@@ -2381,17 +4043,26 @@ impl CoordinatorEngine {
                     .into_iter()
                     .find(|project| project.id == task.project_id)
                     .ok_or("Project not found")?;
-                let target_sha = self.git.get_ref_sha(Path::new(&project.path), target_branch)?;
-                let now = Utc::now().to_rfc3339();
+                let target_sha = self
+                    .git
+                    .get_ref_sha(Path::new(&project.path), target_branch)?;
                 let conn = self.db.lock();
                 conn.execute(
                     "UPDATE merge_queue SET base_sha = ?1, status = 'READY' WHERE id = ?2 AND status = 'STALE'",
                     params![target_sha, queue_id],
                 ).map_err(|e| e.to_string())?;
+                transition_task_state_on_conn(
+                    &conn,
+                    task_id,
+                    &[TaskState::Blocked],
+                    TaskState::MergeReady,
+                )
+                .map_err(|e| e.to_string())?;
                 conn.execute(
-                    "UPDATE tasks SET state = 'MERGE_READY', substate = 'NONE', updated_at = ?1 WHERE id = ?2",
-                    params![now, task_id],
-                ).map_err(|e| e.to_string())?;
+                    "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
+                    params![task_id],
+                )
+                .map_err(|e| e.to_string())?;
                 drop(conn);
                 task.state = TaskState::MergeReady;
                 queue_status = Some("READY".to_string());
@@ -2420,17 +4091,32 @@ impl CoordinatorEngine {
         target_step_count: i32,
         max_steps_per_agent: i32,
     ) -> Result<PreparedMasterplanSnapshot, String> {
-        let plan = self.create_or_update_masterplan(project_id, raw_text, target_step_count, max_steps_per_agent)?;
+        let plan = self.create_or_update_masterplan(
+            project_id,
+            raw_text,
+            target_step_count,
+            max_steps_per_agent,
+        )?;
         let parsed_steps = self.parse_masterplan_text_to_steps(raw_text, target_step_count)?;
-        let steps = self.decompose_masterplan(project_id, parsed_steps)?;
+        let steps = self.decompose_masterplan(project_id, parsed_steps, None, None)?;
 
-        let proj = self.list_projects()?.into_iter().find(|p| p.id == project_id).ok_or("Project not found")?;
+        let proj = self
+            .list_projects()?
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .ok_or("Project not found")?;
         let handoff_prompt = format!(
             "Claim next available chunk for project '{}' (ID: {}) located at '{}' using tool 'masterplan_claim_chunk'.",
             proj.name, proj.id, proj.path
         );
 
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_PREPARED", json!({ "plan_id": plan.id, "step_count": steps.len() }));
+        self.emit_event(
+            Some(project_id),
+            None,
+            None,
+            "MASTERPLAN_PREPARED",
+            json!({ "plan_id": plan.id, "step_count": steps.len() }),
+        );
 
         Ok(PreparedMasterplanSnapshot {
             masterplan: plan,
@@ -2444,7 +4130,11 @@ impl CoordinatorEngine {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn get_current_context(&self, caller_agent_id: Option<&str>, project_id_filter: Option<&str>) -> Result<CurrentContext, String> {
+    pub fn get_current_context(
+        &self,
+        caller_agent_id: Option<&str>,
+        project_id_filter: Option<&str>,
+    ) -> Result<CurrentContext, String> {
         let summaries = self.list_all_masterplans()?;
         let agents = self.list_agents()?;
         let conn = self.db.lock();
@@ -2462,9 +4152,21 @@ impl CoordinatorEngine {
                 )
                 .ok();
 
-            if let Some((task_id, project_id, task_title, task_state, worktree_path, project_name)) = active_task_opt {
-                let mut stmt_scopes = conn.prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
-                let rows = stmt_scopes.query_map([&task_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if let Some((
+                task_id,
+                project_id,
+                task_title,
+                task_state,
+                worktree_path,
+                project_name,
+            )) = active_task_opt
+            {
+                let mut stmt_scopes = conn
+                    .prepare("SELECT pattern FROM scope_leases WHERE task_id = ?1")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt_scopes
+                    .query_map([&task_id], |r| r.get(0))
+                    .map_err(|e| e.to_string())?;
                 let mut active_scopes: Vec<String> = Vec::new();
                 for pattern in rows.flatten() {
                     active_scopes.push(pattern);
@@ -2567,10 +4269,14 @@ impl CoordinatorEngine {
                     current_state: None,
                     last_updated: Some(proj.created_at.clone()),
                     next_recommended_action: "create_masterplan".to_string(),
-                    handoff_prompt: format!("Create masterplan for project '{}' ({}) in the AgentXFlow UI.", proj.name, proj.id),
+                    handoff_prompt: format!(
+                        "Create masterplan for project '{}' ({}) in the AgentXFlow UI.",
+                        proj.name, proj.id
+                    ),
                     active_agents_count: agents.len(),
                     pending_tasks_count: 0,
-                    instructions: "Create a masterplan in the AgentXFlow Workbench or add tasks.".to_string(),
+                    instructions: "Create a masterplan in the AgentXFlow Workbench or add tasks."
+                        .to_string(),
                 })
             } else {
                 Ok(CurrentContext {
@@ -2587,14 +4293,118 @@ impl CoordinatorEngine {
                     current_state: None,
                     last_updated: None,
                     next_recommended_action: "create_project".to_string(),
-                    handoff_prompt: "No projects created yet. Create a project in AgentXFlow.".to_string(),
+                    handoff_prompt: "No projects created yet. Create a project in AgentXFlow."
+                        .to_string(),
                     active_agents_count: agents.len(),
                     pending_tasks_count: 0,
-                    instructions: "Open AgentXFlow and create or import a Git repository.".to_string(),
+                    instructions: "Open AgentXFlow and create or import a Git repository."
+                        .to_string(),
                 })
             }
         }
     }
+}
+
+/// Validated task state transition on a caller-owned connection/transaction.
+/// Reads the current state, validates it against `from` AND `TaskState::can_transition_to`,
+/// then executes the UPDATE. Errors with "Illegal transition" when the current state is not
+/// an allowed source or the transition is absent from the legal transition table, and errors
+/// when the task does not exist (0 rows affected). The caller owns the transaction.
+pub(crate) fn transition_task_state_on_conn(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    from: &[TaskState],
+    to: TaskState,
+) -> Result<(), String> {
+    let current_state: String = conn
+        .query_row("SELECT state FROM tasks WHERE id = ?1", [task_id], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?;
+
+    let cur = TaskState::parse(&current_state);
+    if !from.contains(&cur) {
+        return Err(format!(
+            "Illegal transition: task '{}' is in state '{}' which is not an allowed source state ({:?})",
+            task_id, current_state, from
+        ));
+    }
+    if !cur.can_transition_to(&to) {
+        return Err(format!(
+            "Illegal transition: task '{}' is in state '{}' which cannot transition to '{}'",
+            task_id,
+            current_state,
+            to.as_str()
+        ));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let rows = conn
+        .execute(
+            "UPDATE tasks SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![to.as_str(), now, task_id],
+        )
+        .map_err(|e| format!("Failed to update task '{}' state: {}", task_id, e))?;
+
+    if rows == 0 {
+        return Err(format!("Task '{}' not found", task_id));
+    }
+    Ok(())
+}
+
+/// Transaction-body cancellation writes on a caller-owned connection/transaction:
+/// releases scope leases, reverts claimed masterplan steps to PENDING, removes
+/// merge-queue entries, and transitions the task to CANCELLED + stale.
+/// DONE is guarded by the caller (`cancel_task` rejects it before entering).
+/// Event emission and worktree cleanup are the caller's responsibility and must
+/// happen AFTER commit, since both lock the DB.
+pub(crate) fn cancel_task_inner(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    _reason: Option<&str>,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+
+    // 1. Release all scope leases held by this task
+    conn.execute("DELETE FROM scope_leases WHERE task_id = ?1", [task_id])
+        .map_err(|e| e.to_string())?;
+
+    // 2. Return any claimed masterplan steps back to PENDING
+    conn.execute(
+        "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1 WHERE claimed_task_id = ?2",
+        params![now, task_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 3. Remove from merge queue if present
+    conn.execute("DELETE FROM merge_queue WHERE task_id = ?1", [task_id])
+        .map_err(|e| e.to_string())?;
+
+    // 4. Update task state to CANCELLED and mark is_stale = 1
+    // (DONE is guarded by the caller, so every other state is a legal source)
+    transition_task_state_on_conn(
+        conn,
+        task_id,
+        &[
+            TaskState::Backlog,
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::Verified,
+            TaskState::Blocked,
+            TaskState::Review,
+            TaskState::MergeReady,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ],
+        TaskState::Cancelled,
+    )?;
+    conn.execute(
+        "UPDATE tasks SET substate = 'NONE', is_stale = 1 WHERE id = ?1",
+        [task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
