@@ -13,7 +13,8 @@ src-tauri/gen/schemas/
 # Environment & Local Configuration
 *.local
 .env
-.env.*.local
+.env.*
+!.env.example
 
 # Runtime Data, SQLite Databases & Lockfiles
 .agentxflow/
@@ -37,16 +38,29 @@ lerna-debug.log*
 .vscode/*
 !.vscode/extensions.json
 .idea/
+.fleet/
+*.sublime-project
+*.sublime-workspace
 .DS_Store
 Thumbs.db
 *.suo
+*.user
+*.userosv
+*.sln.docstates
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+*.bak
+*.orig
 
-# Local Scratch & Development Files
+# Internal Agent Plans & Scratch Files
 *.scratch.*
 scratch/
 .superpowers/
-[Mm]aster[Pp]lan*.txt
+docs/superpowers/
+docs/plans/
+plans/
+[Mm]aster[Pp]lan*
+*.plan.md
+*.todo.md

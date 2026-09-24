@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-09-24
+
+### Architecture & Build Tooling
+- **Windows PE Linker Symbol Limit Resolution**: Configured `crate-type = ["rlib"]` in `src-tauri/Cargo.toml`, completely resolving Windows PE 16-bit linker symbol table limit exceptions (`> 65,535` symbols) during binary compilation and linking under LLVM.
+- **Migration 18 (`0018_performance_indexes`)**: Added composite indexing on `tasks(project_id, masterplan_id, state)`, `masterplan_steps(claimed_task_id)`, and `tasks(state, is_stale, updated_at)` to eliminate table scans across active coordinator reconciliation sweeps.
+
+### State Machine & Coordinator Hardening
+- **TaskState::Claiming Parity**: Added full enum and transition parity for `TaskState::Claiming` matching Migration 13's SQLite constraint, ensuring atomic step reservations cleanly record claiming states without validation mismatches.
+- **Masterplan-Scoped Step Completion & Status Isolation**: Corrected merge completion queries to resolve and update the exact parent masterplan ID, eliminating cross-plan step counting and status pollution.
+- **Preserved Merge Integrity on Masterplan Resets**: Preflight reset validation aborts immediately if any associated task has reached `DONE` (merged) status, preventing uncoordinated resets from corrupting completed tasks and branches.
+- **Git Rename Porcelain Tokenization**: Enhanced `get_worktree_mutations` with `old -> new` path tokenization and quote stripping, preventing false `UNRESERVED_WRITE` lease violations during file renames.
+- **Policy Engine Hook Wiring**: Wired `PolicyEngine::evaluate_hook` directly into `task_workspace_write` (`pre-mutation`) and `task_workspace_exec` (`pre-command`), actively intercepting and blocking dangerous shell commands (`rm -rf /`, `format C:`, `git reset --hard`).
+- **DAG Dependency Integration**: Implemented `DagEngine::get_dependencies_for_project` and exposed `list_task_dependencies` Tauri IPC command, providing real-time blocker visualization in the UI.
+- **Offline & LTS MCP Bridge Resilience**: Corrected SQLite schema column references (`path`, `order_index`, `masterplan_id`) and wrapped `node:sqlite` in dynamic imports for clean Node 20 LTS proxy fallback.
+
+### User Interface & Design System Updates
+- **OKLCH Design Token System**: Replaced hardcoded CSS variables with a semantic OKLCH token system, providing high-contrast surfaces, status indicators, and monospace tabular typography.
+- **Bento Layout Mission Control**: Added a structured 12-column Bento telemetry dashboard displaying active execution streams, agent capacity status, and real-time merge status indicators.
+- **Tabular Displays & Controls**: Implemented segmented view controls (`List` / `Board` / `DAG`) in Work View, `tabular-nums` alignment, and activity indicators on running tasks.
+- **Virtualized Console**: Bottom log panel with status tags (`[DONE]`, `[HALT]`, `[WARN]`, `[INFO]`), bracketed timestamps, and collapsible panels.
+- **Proof Bundle Display Cards**: High-contrast commit chips and verification status tags in Review Center and Merge Queue.
+- **Live MCP Telemetry Indicator**: Header indicator displaying port status (`PORT: 7890`) and active connected agent counts.
+
+---
+
 ## [0.5.2] - 2026-09-03
 
 ### Concurrency & Isolation

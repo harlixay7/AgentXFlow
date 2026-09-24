@@ -48,7 +48,7 @@ AgentXFlow adheres to strict architectural invariants:
 
 Before submitting a pull request, ensure all test suites pass with zero warnings:
 ```bash
-# Run all backend unit and integration test suites across the workspace (151+ tests)
+# Run all backend unit and integration test suites across the workspace (171+ tests)
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 
 # Run hostile adversarial security & concurrency suite
@@ -72,8 +72,8 @@ npm run build
 
 ---
 
-## 4. Code Style & Tone
+## 4. Code Style & Documentation
 
-- Plain-spoken, technical, and systems-engineering focused.
-- Zero decorative fluff or filler.
-- Emojis are strictly disallowed in all code comments, protocol payloads, and technical markdown docs.
+- Maintain concise, precise systems-engineering terminology.
+- All code comments and documentation must follow standard technical style guidelines.
+- Commit messages follow the Conventional Commits specification.

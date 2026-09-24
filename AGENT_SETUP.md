@@ -1,8 +1,8 @@
 # AI Agent Setup Guide — AgentXFlow
 
-This document contains step-by-step instructions for AI agents (Claude Code, Antigravity, Cursor, Codex, OpenCode) tasked with setting up, building, and interacting with **AgentXFlow** (by **Viducia**).
+This document contains step-by-step instructions for AI coding agents (Google Antigravity, Claude Code, Cursor, OpenAI Codex, OpenCode) tasked with setting up, building, and interacting with **AgentXFlow** (by **Viducia**).
 
-Developer: **[harlixay7](https://github.com/harlixay7)**
+Developer: [harlixay7](https://github.com/harlixay7)
 
 ---
 
@@ -17,7 +17,7 @@ cargo -v     # Rust 1.80 or higher
 git --version
 ```
 
-If any prerequisite tool is missing, stop and inform the user.
+If any prerequisite tool is missing, stop and notify the user.
 
 ---
 
@@ -46,16 +46,16 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 ## 3. Run Quality Verification Gates
 
-Verify that all test suites compile and pass 100%:
+Verify that all test suites compile and pass:
 
 ```bash
-# 1. Run all backend unit and integration test suites across the workspace (151+ tests)
+# 1. Run all backend unit and integration test suites across the workspace (171+ tests)
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 
-# 2. Run complete A-to-Z pipeline integration test
+# 2. Run complete end-to-end pipeline test
 cargo test --test pipeline_a_to_z_test --manifest-path src-tauri/Cargo.toml
 
-# 3. Run 30-scenario hostile adversarial security test suite
+# 3. Run adversarial concurrency and security test suite
 cargo test --test adversarial_suite_test --manifest-path src-tauri/Cargo.toml
 
 # 4. Verify code formatting across all crates
@@ -75,9 +75,9 @@ npm run build
 
 ## 4. Starting the Coordinator Application
 
-To start the desktop application and boot the local Model Context Protocol (MCP) coordination server on `127.0.0.1:7890`:
+To start the desktop application and launch the local Model Context Protocol (MCP) server on `127.0.0.1:7890`:
 
-- On Windows: double-click `run.bat`
+- On Windows: run `run.bat`
 - Or via terminal:
 ```bash
 npm run tauri dev
@@ -89,7 +89,7 @@ npm run tauri dev
 
 AgentXFlow hosts an MCP server conforming to standard JSON-RPC 2.0 at `http://127.0.0.1:7890/mcp`.
 
-Authentication tokens are generated dynamically per coordinator instance. Copy your active token from the **MCP Gateway** tab in the desktop application.
+Authentication tokens are generated per coordinator instance. Copy your active token from the **Integrations** tab in the desktop application.
 
 ### OpenCode (`.mcp.json`)
 ```json
@@ -134,23 +134,25 @@ Authentication tokens are generated dynamically per coordinator instance. Copy y
 }
 ```
 
-### Antigravity
+### Google Antigravity
 The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) and installed in `~/.gemini/config/skills/agentxflow-coordinator/SKILL.md`.
+
+---
 
 ## 6. Supported Canonical AI IDE Platforms
 
 | IDE / Client | Canonical Name | Connection Type |
 |---|---|---|
-| **Google Antigravity** | `Antigravity` | Native MCP / Skill |
-| **Claude Code** | `Claude Code` | MCP Gateway / CLI |
-| **Cursor AI** | `Cursor` | MCP `.cursor/mcp.json` |
-| **OpenCode** | `OpenCode` | MCP Gateway / IDE |
-| **OpenAI Codex** | `OpenAI Codex` | MCP Gateway / CLI |
-| **Google Gemini CLI** | `Gemini CLI` | MCP Gateway / CLI |
-| **GitHub Copilot** | `GitHub Copilot` | MCP / VS Code Bridge |
-| **Codeium Windsurf** | `Windsurf` | MCP Cascade Gateway |
-| **JetBrains Junie** | `Junie` | MCP Integration |
-| **Aider** | `Aider` | MCP / CLI Pair |
+| Google Antigravity | `Antigravity` | Native MCP / Skill |
+| Claude Code | `Claude Code` | MCP Gateway / CLI |
+| Cursor | `Cursor` | MCP `.cursor/mcp.json` |
+| OpenCode | `OpenCode` | MCP Gateway / IDE |
+| OpenAI Codex | `OpenAI Codex` | MCP Gateway / CLI |
+| Google Gemini CLI | `Gemini CLI` | MCP Gateway / CLI |
+| GitHub Copilot | `GitHub Copilot` | MCP / VS Code Bridge |
+| Codeium Windsurf | `Windsurf` | MCP Cascade Gateway |
+| JetBrains Junie | `Junie` | MCP Integration |
+| Aider | `Aider` | MCP / CLI Pair |
 
 ---
 
@@ -160,32 +162,32 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 1. Context        -> Call agentxflow_current_context to discover active project, assigned task, and next action.
 2. Register       -> Call agent_register(name="<Your_IDE>") with your canonical IDE platform (e.g. "Antigravity", "Claude Code", "Cursor").
 3. Contract       -> Call project_context with project_id to fetch architectural rules and conventions.
-4. Masterplan     -> Call masterplan_get. If UNSORTED, act as Master Architect: decompose raw specification into high-fidelity steps via masterplan_decompose.
-5. Claim Chunk    -> Call masterplan_claim_chunk to allocate an isolated Git worktree (strictly capped by max_steps_per_agent).
+4. Masterplan     -> Call masterplan_get. If UNSORTED, decompose raw specification into structured steps via masterplan_decompose.
+5. Claim Chunk    -> Call masterplan_claim_chunk to allocate an isolated Git worktree (capped by max_steps_per_agent).
 6. Scope          -> Call scope_acquire with specific file globs before modifying code.
 7. Implement      -> Make changes strictly inside your allocated worktree path and verify locally.
 8. Step Evidence  -> Call task_complete_step with step_id and command verification evidence.
 9. Submit & Gate  -> Call task_submit. The coordinator automatically executes verification profiles, audits scope mutations, generates ProofBundle, and enqueues to merge queue.
 10. Milestone Handoff -> Inspect `next_action` in task_submit response:
-                     - If `REPORT_TO_USER`: Interactive Milestone mode is active. Stop calling tools immediately, present a milestone walkthrough in chat, and wait for user confirmation.
-                     - If `masterplan_claim_chunk`: Continuous Autonomous Swarm mode is active. Proceed immediately to claim the next chunk.
+                     - If `REPORT_TO_USER`: Milestone approval mode is active. Stop calling tools, present a milestone summary in chat, and wait for user confirmation.
+                     - If `masterplan_claim_chunk`: Continuous mode is active. Proceed immediately to claim the next chunk.
 ```
 
 ### Fundamental Coordination Invariants
 
-- **Zero Self-Certification**: Autonomous agents cannot mark their own criteria valid or bypass verification. All criteria satisfaction is derived exclusively from passing automated machine evaluators executed by the coordinator.
+- **Server-Side Quality Verification**: Autonomous agents cannot mark their own criteria valid or bypass verification. All criteria evaluation is performed by automated machine evaluators executed by the coordinator.
 - **Isolated Worktrees**: All code edits must occur inside `data_dir/AgentXFlow/worktrees/<project>/task-<id>` (primary) or the assigned AppData worktree path. Never edit the primary repository root directly.
-- **Attempt-Scoped Auditing**: Scope violations are bound to your active `attempt_id`. Acquiring missing scope leases cleanly clears violations on subsequent re-runs and submissions.
-- **Role-Based Authorization & Task Ownership**: Master authority is required for administrative coordinator actions (`merge_process`, `masterplan_reset`, `prepare_masterplan`, `masterplan_decompose`, `unclaim_agent_tasks`, `force_agent_idle`, `task_reconcile`). Task mutation tools (`scope_acquire`, `scope_release`, `task_complete_step`, `task_submit`, `task_cancel`, `task_requeue`, `merge_enqueue`) enforce strict task ownership and prevent cross-agent impersonation.
-- **Preflight-Safe Masterplan Reset & Blast Radius Isolation**: Reset operations preflight all candidate tasks before mutating state. Explicit masterplan reset (`masterplan_id`) cancels only target plan tasks and prunes git worktrees without touching other masterplans or their worktrees. The primary checkout is never modified.
+- **Attempt-Scoped Auditing**: Scope violations are bound to your active `attempt_id`. Acquiring missing scope leases clears violations on subsequent re-runs and submissions.
+- **Role-Based Authorization & Task Ownership**: Master authority is required for administrative coordinator actions (`merge_process`, `masterplan_reset`, `prepare_masterplan`, `masterplan_decompose`, `unclaim_agent_tasks`, `force_agent_idle`, `task_reconcile`). Task mutation tools (`scope_acquire`, `scope_release`, `task_complete_step`, `task_submit`, `task_cancel`, `task_requeue`, `merge_enqueue`) enforce task ownership.
+- **Preflight-Safe Masterplan Reset**: Reset operations preflight all candidate tasks before mutating state. Explicit masterplan reset (`masterplan_id`) cancels only target plan tasks and prunes git worktrees without touching other masterplans. The primary checkout is never modified.
 - **Deterministic Policy Precedence**: Security policies resolve deterministically using most-specific pattern precedence (`longest pattern length wins`) with `id ASC` tie-breaking. Default actions fail closed.
-- **Fail-Closed Merge Queue Serialization**: Merge candidate queue checks strictly enforce FIFO order and prevent concurrent integration on the same target branch. If queue state cannot be authoritatively queried, operations fail closed with errors rather than defaulting to zero.
-- **Hybrid Milestone Handoff**: When `require_milestone_approval` is enabled in the UI (Interactive Milestone Mode), agents pause after each chunk, report back in IDE chat, and await user instructions. In Continuous Autonomous Swarm Mode, agents claim subsequent chunks immediately.
-- **Transparent Activity Heartbeats**: Incoming MCP tool calls automatically refresh your agent session liveness timestamp. No background timer loops are needed.
-- **Cryptographic Session Lifetimes**: Session tokens are cryptographically unpredictable with a 30-day sliding activity window and a 365-day maximum lifetime.
-- **Final Step Release Delivery**: The agent completing the final step (Step N/N) must build the production bundle (`npm run build` / `cargo build --release`), create an automated launcher script (`run.bat` / `start.sh`) with dependency installation checks and browser auto-launch, verify that the app starts cleanly, and write a full `USER_GUIDE.md` / `HOW_TO_USE.md`.
-- **4-Phase Deep Architectural Decomposition**: Plans are organized into 4 full-stack phases (Phase 1 Runnable Baseline & Scaffolding [1-25], Phase 2 Domain Logic & Store Bindings [26-50], Phase 3 High-Fidelity UI Mounted into App.tsx/routes [51-75], Phase 4 Polish, Verification, Launchers & Docs [76-100]) using `append: true`.
-- **Real-Time Primary Workspace Synchronization**: Every merged task is automatically synchronized to the primary project directory on disk via `git reset --hard HEAD` and `git clean -fd`.
+- **Fail-Closed Merge Queue Serialization**: Merge candidate queue checks strictly enforce FIFO order and prevent concurrent integration on the same target branch. If queue state cannot be queried, operations fail closed with errors.
+- **Milestone Handoff Modes**: When milestone approval is enabled in the UI, agents pause after each chunk, report back in chat, and await user instructions. In continuous mode, agents claim subsequent chunks automatically.
+- **Transparent Activity Heartbeats**: Incoming MCP tool calls automatically refresh your agent session timestamp. No background timer loops are required.
+- **Cryptographic Session Lifetimes**: Session tokens are cryptographically generated with a 30-day sliding activity window and a 365-day maximum lifetime.
+- **Final Step Release Delivery**: The agent completing the final step (Step N/N) must build the production bundle (`npm run build` / `cargo build --release`), create a launcher script (`run.bat` / `start.sh`) with dependency checks, verify that the app starts cleanly, and write a full user guide (`USER_GUIDE.md` / `HOW_TO_USE.md`).
+- **Structured Architectural Decomposition**: Plans are organized into 4 phases (Phase 1 Baseline Scaffolding, Phase 2 Domain Logic & Store Bindings, Phase 3 UI Views & Component Mounting, Phase 4 Polish, Verification, Launchers & Docs) using `append: true`.
+- **Primary Workspace Synchronization**: Every merged task is synchronized to the primary project directory on disk via `git reset --hard HEAD` and `git clean -fd`.
 
 ---
 
@@ -199,7 +201,7 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 | `masterplan_list` | Any | _(none)_ | List all masterplans across all projects with status, step counts, and active handoffs. |
 | `masterplan_get` | Any | `project_id` | Inspect masterplan state, raw specification text, project identity, and architect decomposition instructions. |
 | `masterplan_status` | Any | `project_id` | Query plan progress stats, total steps, and step statuses. |
-| `masterplan_reset` | Master | `project_id`, `masterplan_id?` | Preflight-safe reset: verifies all candidate tasks are cancellable before mutating any state. When `masterplan_id` is specified, cancels only that plan's tasks, transactionally deletes plan records, and prunes git worktrees without touching unrelated plan worktrees. Project-wide reset cleans all plans and wipes `.agentxflow/worktrees`. User primary checkout is never modified. |
+| `masterplan_reset` | Master | `project_id`, `masterplan_id?` | Safe reset: verifies all candidate tasks are cancellable before mutating any state. When `masterplan_id` is specified, cancels only that plan's tasks, transactionally deletes plan records, and prunes git worktrees without touching unrelated plan worktrees. Project-wide reset cleans all plans and wipes `.agentxflow/worktrees`. User primary checkout is never modified. |
 | `prepare_masterplan` | Master | `project_id`, `raw_text`, `target_step_count?`, `max_steps_per_agent?` | Atomically save, parse, structure, and prepare a masterplan for agents. |
 | `masterplan_decompose` | Master | `project_id`, `steps`, `append?`, `idempotency_key?`, `compact?` | Normalize raw masterplan text into structured execution steps. Supports chunked decomposition with append mode, SHA-256 request hash idempotency checking, crash-atomic storage, and compact range continuation responses (`persisted_range`, `total_known`, `next_expected_range`, `continuation_required`). |
 | `masterplan_claim_chunk`| Agent (Self) / Master | `project_id`, `agent_id`, `count?` | Atomically claim next batch of steps (capped by limit) and allocate an isolated Git worktree. Enforces single-transaction atomic step-task binding. |
@@ -226,4 +228,3 @@ The canonical coordinator skill definition is located at [`SKILL.md`](SKILL.md) 
 | `task_workspace_read` | Task Owner / Master | `task_id`, `agent_id`, `file_path` | Read a file from the task's authoritative isolated worktree without path confusion or directory traversal. |
 | `task_workspace_write` | Task Owner / Master | `task_id`, `agent_id`, `file_path`, `content` | Write a file into the task's authoritative isolated worktree, verifying write scope leases and directory containment. |
 | `task_workspace_exec` | Task Owner / Master | `task_id`, `agent_id`, `command`, `args?`, `timeout_seconds?` | Execute a command strictly inside the task's isolated worktree with timeout protection and process tree killing. |
-
