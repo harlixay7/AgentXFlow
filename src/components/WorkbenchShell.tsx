@@ -12,7 +12,7 @@ import {
   CheckCircle,
   HelpCircle,
   BookOpen,
-  Sparkles,
+  Layers,
 } from 'lucide-react';
 import { MissionControlView } from './MissionControlView';
 import { WorkView } from './WorkView';
@@ -63,13 +63,20 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
   const [showGuideModal, setShowGuideModal] = useState(false);
 
+  const runningCount = tasks.filter((t) => t.state === 'RUNNING').length;
+  const activeTasksCount = tasks.filter((t) => t.state !== 'DONE').length;
+  const reviewCount = tasks.filter((t) => t.state === 'REVIEW' || t.state === 'MERGE_READY').length;
+  const pendingQueueCount = mergeQueue.filter((m) => !m.processed_at).length;
+  const workingAgents = agents.filter((a) => a.status === 'WORKING').length;
+  const idleAgents = agents.filter((a) => a.status === 'IDLE').length;
+
   return (
     <div className="workbench-shell">
       {/* Top Command Header */}
       <header className="top-command-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div className="brand-section" title="AgentXFlow by Viducia — Cross-Agent Engineering Coordinator by harlixay7" style={{ gap: 8 }}>
-            <Terminal size={14} style={{ color: 'var(--accent-blue)' }} />
+            <Terminal size={14} style={{ color: 'var(--accent-primary)' }} />
             <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.15 }}>
               <span style={{ fontWeight: 700, letterSpacing: '0.04em', fontSize: 12, color: 'var(--text-primary)' }}>AGENTXFLOW</span>
               <span style={{ fontSize: 9, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>by Viducia</span>
@@ -79,7 +86,7 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
           {/* Project Switcher */}
           <select
             className="input-field"
-            style={{ width: 180, height: 26, fontSize: 11, fontFamily: 'var(--font-mono)' }}
+            style={{ width: 170, height: 26, fontSize: 11, fontFamily: 'var(--font-mono)' }}
             value={activeProject?.id || ''}
             onChange={(e) => {
               const p = projects.find((x) => x.id === e.target.value);
@@ -115,26 +122,46 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
           <span className="kbd-shortcut" style={{ marginLeft: 'auto' }}>Ctrl+K</span>
         </div>
 
-        {/* Right Action Group */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          {/* Plain English Guide Button */}
-          <button
-            className="btn btn-secondary"
-            style={{ height: 26, fontSize: 11, color: 'var(--accent-blue)', borderColor: 'rgba(88, 166, 255, 0.4)' }}
-            onClick={() => setShowGuideModal(true)}
-            title="Open the step-by-step visual guide explaining how AgentXFlow coordinates agents"
-          >
-            <BookOpen size={12} /> How to Use
-          </button>
+        {/* Right Telemetry & Action Group */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {/* Telemetry MCP Pill */}
+          <div className="telemetry-pill" title="Localhost authoritative MCP coordinator daemon (127.0.0.1:7890)">
+            <span className="live-dot" />
+            <span>PORT: 7890</span>
+            <span style={{ color: 'var(--border-subtle)' }}>•</span>
+            <span style={{ color: 'var(--accent-mint)' }}>MCP V2</span>
+          </div>
 
           {/* Live Active Agent Counter */}
           <div
-            style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, fontFamily: 'var(--font-mono)', padding: '2px 8px', backgroundColor: 'var(--bg-input)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}
+            className="telemetry-pill"
+            style={{ backgroundColor: 'var(--bg-card)' }}
             title="Active agent connections communicating with internal MCP gateway (127.0.0.1:7890)"
           >
-            <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: agents.some((a) => a.status === 'WORKING') ? 'var(--accent-blue)' : agents.some(a => a.status === 'IDLE') ? 'var(--accent-green)' : 'var(--text-muted)' }} />
-            <span>{agents.filter((a) => a.status === 'WORKING').length} Working · {agents.filter((a) => a.status === 'IDLE').length} Idle</span>
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                backgroundColor: workingAgents > 0 ? 'var(--accent-mint)' : idleAgents > 0 ? 'var(--accent-green)' : 'var(--text-muted)',
+              }}
+            />
+            <span style={{ fontWeight: 600, color: workingAgents > 0 ? 'var(--accent-mint)' : 'var(--text-primary)' }}>
+              {workingAgents} WKG
+            </span>
+            <span style={{ color: 'var(--border-bright)' }}>/</span>
+            <span style={{ color: 'var(--text-secondary)' }}>{idleAgents} IDLE</span>
           </div>
+
+          {/* Workflow Guide Button */}
+          <button
+            className="btn btn-secondary"
+            style={{ height: 26, fontSize: 11, borderColor: 'var(--border-medium)' }}
+            onClick={() => setShowGuideModal(true)}
+            title="Open the step-by-step visual guide explaining how AgentXFlow coordinates agents"
+          >
+            <BookOpen size={12} /> Guide
+          </button>
         </div>
       </header>
 
@@ -148,49 +175,82 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
               onClick={() => setActiveTab('overview')}
               title="Overview dashboard: system health, running agent tasks, and high-priority alerts"
             >
-              <Activity size={13} /> Overview
+              <Activity size={13} />
+              <span style={{ flex: 1 }}>Overview</span>
+              {runningCount > 0 && (
+                <span className="nav-badge" style={{ color: 'var(--accent-amber)', backgroundColor: 'var(--bg-card)' }}>
+                  {runningCount} RUN
+                </span>
+              )}
             </div>
             <div
               className={`nav-item ${activeTab === 'masterplan' ? 'active' : ''}`}
               onClick={() => setActiveTab('masterplan')}
               title="Masterplan Hub: Ingest arbitrary plans, auto-decompose into structured checklists, and coordinate chunked execution"
             >
-              <Sparkles size={13} style={{ color: activeTab === 'masterplan' ? 'var(--accent-blue)' : undefined }} /> Masterplan Hub
+              <Layers size={13} style={{ color: activeTab === 'masterplan' ? 'var(--accent-primary)' : undefined }} />
+              <span style={{ flex: 1 }}>Masterplan Hub</span>
             </div>
             <div
               className={`nav-item ${activeTab === 'work' ? 'active' : ''}`}
               onClick={() => setActiveTab('work')}
               title="Work view: List, Board, and DAG view of all engineering tasks"
             >
-              <LayoutGrid size={13} /> Work (Tasks)
+              <LayoutGrid size={13} />
+              <span style={{ flex: 1 }}>Work (Tasks)</span>
+              {activeTasksCount > 0 && (
+                <span className="nav-badge">
+                  {activeTasksCount}
+                </span>
+              )}
             </div>
             <div
               className={`nav-item ${activeTab === 'agents' ? 'active' : ''}`}
               onClick={() => setActiveTab('agents')}
               title="Registered AI Agents, profiles, and ACP capability negotiations"
             >
-              <Cpu size={13} /> Agents & ACP
+              <Cpu size={13} />
+              <span style={{ flex: 1 }}>Agents & ACP</span>
+              <span className="nav-badge">
+                {agents.length}
+              </span>
             </div>
             <div
               className={`nav-item ${activeTab === 'review' ? 'active' : ''}`}
               onClick={() => setActiveTab('review')}
               title="Review center: inspect verified agent code diffs and SHA-256 Proof Bundles"
             >
-              <CheckCircle size={13} /> Review Center
+              <CheckCircle size={13} />
+              <span style={{ flex: 1 }}>Review Center</span>
+              {reviewCount > 0 && (
+                <span className="nav-badge" style={{ color: 'var(--accent-amber)', backgroundColor: 'var(--bg-card)' }}>
+                  {reviewCount}
+                </span>
+              )}
             </div>
             <div
               className={`nav-item ${activeTab === 'merge_queue' ? 'active' : ''}`}
               onClick={() => setActiveTab('merge_queue')}
               title="Serialized merge queue: background integration worktree merges into main"
             >
-              <GitMerge size={13} /> Merge Queue
+              <GitMerge size={13} />
+              <span style={{ flex: 1 }}>Merge Queue</span>
+              {pendingQueueCount > 0 && (
+                <span className="nav-badge" style={{ color: 'var(--accent-mint)', backgroundColor: 'var(--bg-card)' }}>
+                  {pendingQueueCount}
+                </span>
+              )}
             </div>
             <div
               className={`nav-item ${activeTab === 'integrations' ? 'active' : ''}`}
               onClick={() => setActiveTab('integrations')}
               title="Model Context Protocol (MCP 2024-11-05) setup instructions and 1-click config"
             >
-              <Plug size={13} /> MCP Gateway
+              <Plug size={13} />
+              <span style={{ flex: 1 }}>MCP Gateway</span>
+              <span className="nav-badge" style={{ color: 'var(--accent-mint)' }}>
+                7890
+              </span>
             </div>
           </div>
 
@@ -214,6 +274,7 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
             </div>
           </div>
         </nav>
+
 
         {/* Main Viewport */}
         <div className="main-viewport-container">

@@ -10,7 +10,7 @@ export function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [mergeQueue, setMergeQueue] = useState<MergeQueueItem[]>([]);
   const [events, setEvents] = useState<EventItem[]>([]);
-  const [dependencies] = useState<TaskDependency[]>([]);
+  const [dependencies, setDependencies] = useState<TaskDependency[]>([]);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
 
@@ -30,15 +30,17 @@ export function App() {
 
       const activeProjId = projectId || activeProject?.id || (projList.length > 0 ? projList[0].id : '');
       if (activeProjId) {
-        const [taskList, agentList, queueList] = await Promise.all([
+        const [taskList, agentList, queueList, depList] = await Promise.all([
           coordinatorApi.listTasks(activeProjId),
           coordinatorApi.listAgents(),
           coordinatorApi.listMergeQueue(activeProjId),
+          coordinatorApi.listTaskDependencies(activeProjId),
         ]);
         if (seq !== loadSeqRef.current) return;
         setTasks(taskList);
         setAgents(agentList);
         setMergeQueue(queueList);
+        setDependencies(depList);
       }
       if (seq === loadSeqRef.current) setSyncError(null);
     } catch (e) {

@@ -112,6 +112,11 @@ export const coordinatorApi = {
     return await invoke('get_task_dependencies', { taskId });
   },
 
+  async listTaskDependencies(projectId: string): Promise<TaskDependency[]> {
+    if (!isTauri) return [];
+    return await invoke('list_task_dependencies', { projectId });
+  },
+
   async listMergeQueue(projectId: string): Promise<MergeQueueItem[]> {
     if (!isTauri) return [];
     return await invoke('list_merge_queue', { projectId });

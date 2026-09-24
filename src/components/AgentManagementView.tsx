@@ -77,7 +77,7 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
             textAlign: 'center',
             backgroundColor: 'var(--bg-surface)',
             border: '1px dashed var(--border-medium)',
-            borderRadius: 'var(--radius-lg)',
+            borderRadius: 'var(--radius-card)',
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
@@ -86,17 +86,17 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
         >
           <div
             style={{
-              width: 48,
-              height: 48,
-              borderRadius: 24,
-              backgroundColor: 'rgba(88, 166, 255, 0.1)',
+              width: 44,
+              height: 44,
+              borderRadius: 'var(--radius-xs)',
+              backgroundColor: 'rgba(0, 216, 255, 0.1)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              color: 'var(--accent-blue)',
+              color: 'var(--accent-primary)',
             }}
           >
-            <Plug size={24} />
+            <Plug size={22} />
           </div>
           <div>
             <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', margin: 0 }}>No Agents Connected Yet</h3>
@@ -134,17 +134,18 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                 style={{
                   backgroundColor: 'var(--bg-surface)',
                   border: isWorking
-                    ? '1px solid rgba(88, 166, 255, 0.4)'
+                    ? '1px solid var(--accent-mint)'
                     : isDisconnected
-                    ? '1px solid rgba(240, 140, 0, 0.3)'
+                    ? '1px solid rgba(245, 166, 35, 0.4)'
                     : '1px solid var(--border-medium)',
-                  borderRadius: 'var(--radius-md)',
+                  borderRadius: 'var(--radius-card)',
                   padding: 14,
                   display: 'flex',
                   flexDirection: 'column',
                   gap: 10,
                   position: 'relative',
-                  boxShadow: isWorking ? '0 0 12px rgba(88, 166, 255, 0.1)' : 'none',
+                  boxShadow: isWorking ? '0 0 12px rgba(46, 204, 113, 0.12)' : 'none',
+                  transition: 'border-color var(--duration-tactical) var(--ease-tactical)',
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -153,26 +154,26 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                       style={{
                         width: 28,
                         height: 28,
-                        borderRadius: 6,
+                        borderRadius: 'var(--radius-xs)',
                         backgroundColor: isWorking
-                          ? 'rgba(88, 166, 255, 0.15)'
+                          ? 'rgba(46, 204, 113, 0.15)'
                           : isDisconnected
                           ? 'rgba(139, 148, 158, 0.15)'
-                          : 'rgba(63, 185, 80, 0.15)',
+                          : 'rgba(0, 216, 255, 0.12)',
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
                         color: isWorking
-                          ? 'var(--accent-blue)'
+                          ? 'var(--accent-mint)'
                           : isDisconnected
                           ? 'var(--text-muted)'
-                          : 'var(--accent-green)',
+                          : 'var(--accent-primary)',
                       }}
                     >
                       <Bot size={16} />
                     </div>
                     <div>
-                      <div style={{ fontWeight: 700, fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <div style={{ fontWeight: 700, fontSize: 12, display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-primary)' }}>
                         {a.name}
                         <span
                           style={{
@@ -180,7 +181,7 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                             height: 6,
                             borderRadius: '50%',
                             backgroundColor: isWorking
-                              ? 'var(--accent-blue)'
+                              ? 'var(--accent-mint)'
                               : isDisconnected
                               ? 'var(--text-muted)'
                               : 'var(--accent-green)',
@@ -189,7 +190,7 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                         />
                       </div>
                       <div style={{ color: 'var(--text-muted)', fontSize: 10 }}>
-                        {a.agent_type} · <span style={{ color: isDisconnected ? 'var(--accent-yellow)' : 'var(--text-secondary)' }}>{formatLastSeen()}</span>
+                        {a.agent_type} · <span style={{ color: isDisconnected ? 'var(--accent-amber)' : 'var(--text-secondary)' }}>{formatLastSeen()}</span>
                       </div>
                     </div>
                   </div>
@@ -213,7 +214,7 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                         alignItems: 'center',
                         justifyContent: 'center',
                         color: 'var(--accent-red)',
-                        borderColor: 'rgba(248, 81, 73, 0.3)',
+                        borderColor: 'rgba(239, 68, 68, 0.3)',
                       }}
                       onClick={() => handleRemoveAgent(a.id, a.name)}
                       disabled={deletingId === a.id}
@@ -229,9 +230,9 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                   <div
                     style={{
                       padding: '8px 10px',
-                      backgroundColor: 'rgba(88, 166, 255, 0.08)',
-                      border: '1px solid rgba(88, 166, 255, 0.2)',
-                      borderRadius: 'var(--radius-sm)',
+                      backgroundColor: 'rgba(0, 216, 255, 0.06)',
+                      border: '1px solid rgba(0, 216, 255, 0.2)',
+                      borderRadius: 'var(--radius-xs)',
                       fontSize: 11,
                       display: 'flex',
                       flexDirection: 'column',
@@ -239,10 +240,10 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                     }}
                   >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--accent-blue)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                        Current In-Flight Task
+                      <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--accent-primary)', textTransform: 'uppercase', letterSpacing: 0.5, fontFamily: 'var(--font-mono)' }}>
+                        In-Flight Execution
                       </span>
-                      <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>
+                      <span style={{ fontSize: 9, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
                         {a.active_task_id.slice(0, 8)}...
                       </span>
                     </div>
@@ -252,9 +253,9 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                   </div>
                 )}
 
-                <div style={{ padding: 8, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', fontSize: 10 }}>
-                  <div style={{ color: 'var(--text-muted)', marginBottom: 4, fontWeight: 600 }}>ASSIGNED PROFILE</div>
-                  <div style={{ color: 'var(--accent-blue)', fontWeight: 600 }}>{a.profile || 'Implementer'}</div>
+                <div style={{ padding: 8, backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-xs)', fontSize: 10, fontFamily: 'var(--font-mono)' }}>
+                  <div style={{ color: 'var(--text-muted)', marginBottom: 2, fontWeight: 600, fontSize: 9, letterSpacing: '0.04em' }}>ASSIGNED PROFILE</div>
+                  <div style={{ color: 'var(--accent-primary)', fontWeight: 600 }}>{a.profile || 'Implementer'}</div>
                 </div>
 
                 {/* Interactive State Recovery Controls */}
@@ -266,8 +267,8 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
                         flex: 1,
                         height: 26,
                         fontSize: 10,
-                        color: 'var(--accent-yellow)',
-                        borderColor: 'rgba(240, 140, 0, 0.3)',
+                        color: 'var(--accent-amber)',
+                        borderColor: 'rgba(245, 166, 35, 0.3)',
                       }}
                       onClick={async () => {
                         if (window.confirm(`Unclaim all in-flight tasks for ${a.name}? Steps will revert to PENDING and worktrees will be cleaned up.`)) {
@@ -334,7 +335,7 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
               maxWidth: 420,
               backgroundColor: 'var(--bg-surface)',
               border: '1px solid var(--border-bright)',
-              borderRadius: 'var(--radius-lg)',
+              borderRadius: 'var(--radius-card)',
               padding: 20,
               display: 'flex',
               flexDirection: 'column',
@@ -343,6 +344,7 @@ export const AgentManagementView: React.FC<AgentManagementViewProps> = ({ agents
             }}
             onClick={(e) => e.stopPropagation()}
           >
+
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Register Agent Instance</h3>
               <button

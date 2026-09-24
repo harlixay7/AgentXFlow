@@ -41,11 +41,11 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: '1px solid var(--border-medium)', paddingBottom: 14 }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <GitMerge size={18} style={{ color: 'var(--accent-blue)' }} />
+            <GitMerge size={18} style={{ color: 'var(--accent-primary)' }} />
             <h2 style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--font-mono)' }}>Serialized Merge Queue</h2>
           </div>
           <p style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4, maxWidth: 700, lineHeight: 1.5 }}>
-            Verified candidate branches integrated sequentially via isolated integration worktrees and atomic CAS ref updates.
+            Verified candidate branches integrated sequentially via isolated integration worktrees (<code style={{ color: 'var(--accent-primary)', fontFamily: 'var(--font-mono)' }}>.agentxflow/integration</code>) and atomic CAS ref updates.
           </p>
         </div>
         <button
@@ -61,14 +61,14 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
         <div
           style={{
             padding: '10px 14px',
-            borderRadius: 'var(--radius-sm)',
+            borderRadius: 'var(--radius-xs)',
             fontSize: 12,
             display: 'flex',
             alignItems: 'center',
             gap: 8,
-            backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
-            color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+            backgroundColor: feedback.type === 'success' ? 'rgba(46, 204, 113, 0.12)' : 'rgba(239, 68, 68, 0.12)',
+            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-mint)' : 'var(--accent-red)'}`,
+            color: feedback.type === 'success' ? 'var(--accent-mint)' : 'var(--accent-red)',
           }}
         >
           {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
@@ -77,10 +77,20 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
       )}
 
       {queue.length === 0 ? (
-        <div style={{ padding: 40, textAlign: 'center', backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)', color: 'var(--text-muted)', fontSize: 12 }}>
-          <CheckCircle2 size={24} style={{ color: 'var(--accent-green)', margin: '0 auto 8px auto' }} />
+        <div
+          style={{
+            padding: 40,
+            textAlign: 'center',
+            backgroundColor: 'var(--bg-surface)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-card)',
+            color: 'var(--text-muted)',
+            fontSize: 12,
+          }}
+        >
+          <CheckCircle2 size={24} style={{ color: 'var(--accent-mint)', margin: '0 auto 8px auto' }} />
           <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>Merge queue is clear</div>
-          <p style={{ fontSize: 11, marginTop: 4 }}>All verified task branches have been merged into the main branch.</p>
+          <p style={{ fontSize: 11, marginTop: 4 }}>All verified task branches have been cleanly integrated into the main branch.</p>
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -90,27 +100,45 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
               style={{
                 backgroundColor: 'var(--bg-surface)',
                 border: '1px solid var(--border-medium)',
-                borderRadius: 'var(--radius-md)',
+                borderRadius: 'var(--radius-card)',
                 padding: 14,
                 display: 'flex',
                 justifyContent: 'space-between',
                 alignItems: 'center',
+                transition: 'border-color var(--duration-tactical) var(--ease-tactical)',
               }}
             >
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                  <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--accent-blue)', userSelect: 'text' }}>#{item.position}</span>
+                  <span
+                    style={{
+                      fontWeight: 700,
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: 12,
+                      color: 'var(--accent-primary)',
+                      userSelect: 'text',
+                      fontVariantNumeric: 'tabular-nums',
+                    }}
+                  >
+                    #{String(item.position).padStart(2, '0')}
+                  </span>
                   <span
                     className={`badge ${item.status === 'READY' ? 'badge-READY' : item.status === 'MERGED' ? 'badge-DONE' : 'badge-BLOCKED'}`}
                     title={`Candidate merge status: ${item.status}`}
                   >
                     {item.status}
                   </span>
-                  <span style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', userSelect: 'text' }}>Task ID: {item.task_id}</span>
+                  <span style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)', userSelect: 'text' }}>
+                    Task ID: {item.task_id}
+                  </span>
                 </div>
-                <div style={{ fontSize: 11, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', userSelect: 'text' }}>
-                  Branch: <span style={{ color: 'var(--accent-blue)' }}>{item.branch_name}</span> → Target: <span style={{ color: 'var(--accent-green)' }}>{item.target_branch}</span>
-                  <span style={{ marginLeft: 12, color: 'var(--text-muted)' }}>HEAD: {item.head_sha ? item.head_sha.substring(0, 8) : 'N/A'}</span>
+                <div style={{ fontSize: 11, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', userSelect: 'text', display: 'flex', gap: 12, alignItems: 'center' }}>
+                  <span>
+                    Branch: <span style={{ color: 'var(--accent-primary)' }}>{item.branch_name}</span> → Target: <span style={{ color: 'var(--accent-mint)' }}>{item.target_branch}</span>
+                  </span>
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    HEAD: <code style={{ color: 'var(--accent-amber)' }}>{item.head_sha ? item.head_sha.substring(0, 8) : 'N/A'}</code>
+                  </span>
                 </div>
               </div>
 
@@ -130,3 +158,4 @@ export const MergeQueueView: React.FC<MergeQueueViewProps> = ({ queue, projectId
     </div>
   );
 };
+

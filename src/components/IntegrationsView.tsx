@@ -138,11 +138,11 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
       {/* View Header */}
       <div>
         <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'var(--font-mono)' }}>
-          <ShieldCheck size={18} style={{ color: 'var(--accent-blue)' }} />
+          <ShieldCheck size={18} style={{ color: 'var(--accent-mint)' }} />
           Localhost MCP Gateway & Multi-IDE Fleet Manager
         </h2>
         <p style={{ color: 'var(--text-secondary)', fontSize: 12, maxWidth: 850, lineHeight: 1.5 }}>
-          AgentXFlow runs an authoritative Model Context Protocol (MCP) server on <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-blue)' }}>127.0.0.1:7890</code>. Connect multiple agents and IDEs (Antigravity, Cursor, Claude Code, Codex, OpenCode) with each agent running in an isolated Git worktree.
+          AgentXFlow runs an authoritative Model Context Protocol (MCP) server on <code style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-primary)' }}>127.0.0.1:7890</code>. Connect multiple agents and IDEs (Antigravity, Cursor, Claude Code, Codex, OpenCode) with each agent running in an isolated Git worktree.
         </p>
       </div>
 
@@ -150,14 +150,14 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
         <div
           style={{
             padding: '10px 14px',
-            borderRadius: 'var(--radius-sm)',
+            borderRadius: 'var(--radius-xs)',
             fontSize: 12,
             display: 'flex',
             alignItems: 'center',
             gap: 8,
-            backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
-            color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+            backgroundColor: feedback.type === 'success' ? 'rgba(46, 204, 113, 0.12)' : 'rgba(239, 68, 68, 0.12)',
+            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-mint)' : 'var(--accent-red)'}`,
+            color: feedback.type === 'success' ? 'var(--accent-mint)' : 'var(--accent-red)',
           }}
         >
           {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
@@ -167,15 +167,16 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
 
       {/* Server Status Card */}
       {mcpInfo && (
-        <div style={{ padding: 16, backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-md)' }}>
+        <div style={{ padding: 16, backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-card)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-            <div style={{ fontWeight: 600, fontSize: 12, display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)' }}>
+            <div style={{ fontWeight: 600, fontSize: 12, display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'var(--font-mono)' }}>
               <span
                 style={{
                   width: 8,
                   height: 8,
                   borderRadius: '50%',
-                  backgroundColor: pingStatus === 'success' ? 'var(--accent-green)' : pingStatus === 'error' ? 'var(--accent-red)' : 'var(--text-muted)',
+                  backgroundColor: pingStatus === 'success' ? 'var(--accent-mint)' : pingStatus === 'error' ? 'var(--accent-red)' : 'var(--text-muted)',
+                  boxShadow: pingStatus === 'success' ? '0 0 8px var(--accent-mint)' : 'none',
                 }}
               />
               Gateway Status: {pingStatus === 'success' ? 'ONLINE (127.0.0.1:7890)' : pingStatus === 'error' ? 'OFFLINE / UNREACHABLE' : 'CHECKING...'}
@@ -204,22 +205,22 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10, fontFamily: 'var(--font-mono)', fontSize: 11 }}>
-            <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
-              <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>STREAMABLE HTTP ENDPOINT</div>
-              <div style={{ color: 'var(--accent-blue)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
+            <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-xs)' }}>
+              <div style={{ color: 'var(--text-muted)', fontSize: 9, fontWeight: 700, marginBottom: 2, letterSpacing: '0.04em' }}>STREAMABLE HTTP ENDPOINT</div>
+              <div style={{ color: 'var(--accent-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
                 <span style={{ userSelect: 'text' }}>{mcpInfo.url}</span>
                 <button
                   style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
                   onClick={() => copyText(mcpInfo.url, 'url')}
                   title="Copy MCP endpoint URL"
                 >
-                  {copiedKey === 'url' ? <Check size={12} style={{ color: 'var(--accent-green)' }} /> : <Copy size={12} />}
+                  {copiedKey === 'url' ? <Check size={12} style={{ color: 'var(--accent-mint)' }} /> : <Copy size={12} />}
                 </button>
               </div>
             </div>
 
-            <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
-              <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>BEARER BOOTSTRAP TOKEN</div>
+            <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-xs)' }}>
+              <div style={{ color: 'var(--text-muted)', fontSize: 9, fontWeight: 700, marginBottom: 2, letterSpacing: '0.04em' }}>BEARER BOOTSTRAP TOKEN</div>
               <div style={{ color: 'var(--text-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
                 <span style={{ userSelect: 'text' }}>{mcpInfo.token ? mcpInfo.token.substring(0, 16) + '...' : 'SECURE'}</span>
                 <button
@@ -227,7 +228,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                   onClick={() => copyText(mcpInfo.token, 'token')}
                   title="Copy bootstrap token"
                 >
-                  {copiedKey === 'token' ? <Check size={12} style={{ color: 'var(--accent-green)' }} /> : <Copy size={12} />}
+                  {copiedKey === 'token' ? <Check size={12} style={{ color: 'var(--accent-mint)' }} /> : <Copy size={12} />}
                 </button>
               </div>
             </div>
@@ -236,11 +237,11 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
       )}
 
       {/* Agent Fleet Manager Section */}
-      <div style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-md)', padding: 16 }}>
+      <div style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-card)', padding: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
           <div>
             <h3 style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--font-mono)', display: 'flex', alignItems: 'center', gap: 6 }}>
-              <Layers size={14} style={{ color: 'var(--accent-blue)' }} />
+              <Layers size={14} style={{ color: 'var(--accent-primary)' }} />
               Registered Agents & IDE Profiles ({agents.length})
             </h3>
             <p style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>
@@ -293,19 +294,20 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                 padding: 10,
                 backgroundColor: 'var(--bg-card)',
                 border: '1px solid var(--border-subtle)',
-                borderRadius: 'var(--radius-sm)',
+                borderRadius: 'var(--radius-card)',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
+                transition: 'border-color var(--duration-tactical) var(--ease-tactical)',
               }}
             >
               <div
                 style={{
                   width: 28,
                   height: 28,
-                  borderRadius: 'var(--radius-sm)',
-                  backgroundColor: ag.agent_type === 'Antigravity' ? 'rgba(88, 166, 255, 0.15)' : 'rgba(163, 113, 247, 0.15)',
-                  color: ag.agent_type === 'Antigravity' ? 'var(--accent-blue)' : 'var(--accent-purple)',
+                  borderRadius: 'var(--radius-xs)',
+                  backgroundColor: ag.agent_type === 'Antigravity' ? 'rgba(0, 216, 255, 0.12)' : 'rgba(46, 204, 113, 0.12)',
+                  color: ag.agent_type === 'Antigravity' ? 'var(--accent-primary)' : 'var(--accent-mint)',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
@@ -315,13 +317,13 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
                 <Bot size={15} />
               </div>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', userSelect: 'text' }}>
+                <div style={{ fontWeight: 600, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', userSelect: 'text', color: 'var(--text-primary)' }}>
                   {ag.name}
                 </div>
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', gap: 6, userSelect: 'text' }}>
                   <span>{ag.agent_type}</span>
                   <span>•</span>
-                  <span style={{ color: ag.status === 'WORKING' ? 'var(--accent-blue)' : ag.status === 'IDLE' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{ag.status}</span>
+                  <span style={{ color: ag.status === 'WORKING' ? 'var(--accent-mint)' : ag.status === 'IDLE' ? 'var(--accent-green)' : 'var(--text-muted)' }}>{ag.status}</span>
                 </div>
               </div>
             </div>
@@ -329,7 +331,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
         </div>
       </div>
 
-      <div style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-md)', overflow: 'hidden' }}>
+      <div style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-medium)', borderRadius: 'var(--radius-card)', overflow: 'hidden' }}>
         <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-input)' }}>
           <div
             className={`nav-item ${activeTab === 'antigravity' ? 'active' : ''}`}
@@ -339,6 +341,7 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
           >
             <FileText size={13} /> Antigravity IDE
           </div>
+
           <div
             className={`nav-item ${activeTab === 'cursor' ? 'active' : ''}`}
             style={{ borderRadius: 0, padding: '10px 16px', fontSize: 11 }}
