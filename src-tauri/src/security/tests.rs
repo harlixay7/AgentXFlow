@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 pub mod tests {
     use crate::security::{constant_time_eq, SecurityManager};
 

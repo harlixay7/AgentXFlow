@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -24,11 +24,12 @@ use crate::scheduler::{SchedulerConfig, SchedulerEngine};
 use crate::scope::ScopeManager;
 use crate::verification::VerificationEngine;
 
-/// Sliding session expiry window: every heartbeat pushes agent_sessions.expires_at
-/// to now + SESSION_TTL_DAYS, so active agents never expire while dead agents
-/// lose their session SESSION_TTL_DAYS after their last heartbeat. First sessions
-/// (registration) keep the historical 365-day window for backward compatibility.
-const SESSION_TTL_DAYS: i64 = 30;
+/// Initial session validity window upon registration/re-registration (days).
+pub const SESSION_INITIAL_TTL_DAYS: i64 = 365;
+
+/// Sliding session window extended upon active heartbeats (days): every heartbeat
+/// pushes agent_sessions.expires_at forward so active agents never expire.
+pub const SESSION_HEARTBEAT_SLIDE_DAYS: i64 = 30;
 
 /// Stale-recovery sweep cadence (seconds): the background loops in lib.rs invoke
 /// `stale_recovery_sweep` no more often than every SWEEP_INTERVAL.
@@ -38,6 +39,11 @@ pub const SWEEP_INTERVAL: u64 = 60;
 /// disconnected, so its in-flight RUNNING/VERIFYING/CLAIMING tasks are reclaimed
 /// by the sweep. Agents heartbeat on every tool call (see mcp/mod.rs).
 pub const STALE_AGENT_GRACE: i64 = 300;
+
+/// Bounded protection grace period for agents actively waiting for external IDE
+/// or user permission (TaskSubstate::WaitingForInput). Prevents premature reclamation
+/// during human code review while ensuring genuinely abandoned tasks are still reclaimed.
+pub const WAITING_PERMISSION_GRACE: i64 = 1800;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorEngine {
@@ -97,6 +103,7 @@ struct StoredProofRow {
     head_sha: String,
     files_changed_json: String,
     diff_summary: String,
+    verification_runs_json: String,
     criteria_json: String,
     steps_json: String,
     proof_hash: String,
@@ -201,11 +208,10 @@ impl CoordinatorEngine {
             })
             .map_err(|e| e.to_string())?;
 
-        let mut res = Vec::new();
-        for r in rows.flatten() {
-            res.push(r);
-        }
-        Ok(res)
+        let events: Vec<EventItem> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read event records: {}", e))?;
+        Ok(events)
     }
 
     /// Centralized validated task state transition: applies the transition atomically
@@ -263,10 +269,19 @@ impl CoordinatorEngine {
             let scanned = match conn
                 .prepare("SELECT id, project_id, worktree_path FROM tasks WHERE state = 'CLAIMING'")
             {
-                Ok(mut stmt) => stmt
+                Ok(mut stmt) => match stmt
                     .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                    .map(|iter| iter.flatten().collect())
-                    .unwrap_or_default(),
+                    .and_then(|iter| iter.collect::<Result<Vec<_>, _>>())
+                {
+                    Ok(tasks) => tasks,
+                    Err(e) => {
+                        failures.record(
+                            "claiming_task_scan",
+                            format!("failed to read interrupted CLAIMING tasks: {}", e),
+                        );
+                        Vec::new()
+                    }
+                },
                 Err(e) => {
                     failures.record(
                         "claiming_task_scan",
@@ -279,7 +294,8 @@ impl CoordinatorEngine {
         };
 
         for (t_id, p_id, wt_path) in interrupted_tasks {
-            if let Some(path_str) = wt_path {
+            let mut cleanup_failed = false;
+            if let Some(ref path_str) = wt_path {
                 let path = std::path::PathBuf::from(path_str.clone());
                 if path.exists() {
                     let repo_path: Option<std::path::PathBuf> = {
@@ -297,7 +313,7 @@ impl CoordinatorEngine {
                             .git
                             .is_managed_worktree(&repo_path, &managed_roots, &path)
                         {
-                            if let Err(e) = std::fs::remove_dir_all(&path) {
+                            if let Err(e) = crate::git::GitService::safe_remove_dir_all(&path) {
                                 failures.record(
                                     "worktree_cleanup",
                                     format!(
@@ -305,11 +321,16 @@ impl CoordinatorEngine {
                                         t_id, p_id, path, e
                                     ),
                                 );
+                                cleanup_failed = true;
                             }
                         } else {
                             warn!(
                                 "Refusing to delete unmanaged worktree path {:?} during startup reconciliation",
                                 path
+                            );
+                            failures.record(
+                                "worktree_safety_refusal",
+                                format!("task '{}': unmanaged path {:?}", t_id, path),
                             );
                             if let Err(e) = self.emit_event_checked(
                                 None,
@@ -327,69 +348,378 @@ impl CoordinatorEngine {
                                 );
                             }
                         }
+                    } else {
+                        cleanup_failed = true;
                     }
                 }
             }
+
             let conn = self.db.lock();
-            match transition_task_state_on_conn(
-                &conn,
-                &t_id,
-                &[TaskState::Backlog], // DB stores 'CLAIMING' which parses to Backlog (Task 4.1 parse quirk)
-                TaskState::Ready,
+            let now = Utc::now().to_rfc3339();
+
+            // Return any claimed masterplan steps back to PENDING
+            if let Err(e) = conn.execute(
+                "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1 WHERE claimed_task_id = ?2 AND status != 'COMPLETED'",
+                params![now, t_id],
             ) {
-                Ok(()) => {
-                    if let Err(e) = conn.execute(
-                        "UPDATE tasks SET substate = 'NONE', assigned_agent_id = NULL, worktree_path = NULL, branch_name = NULL WHERE id = ?1",
-                        [&t_id],
-                    ) {
+                failures.record(
+                    "claiming_step_restore",
+                    format!("task '{}' (project '{}'): failed to restore steps to PENDING: {}", t_id, p_id, e),
+                );
+            }
+
+            // Clean up any scope leases
+            if let Err(e) = conn.execute("DELETE FROM scope_leases WHERE task_id = ?1", [&t_id]) {
+                failures.record(
+                    "claiming_scope_cleanup",
+                    format!(
+                        "task '{}' (project '{}'): failed to delete scope leases: {}",
+                        t_id, p_id, e
+                    ),
+                );
+            }
+
+            if cleanup_failed {
+                // Recovery pointers MUST be preserved when cleanup fails:
+                // Do NOT clear worktree_path or branch_name.
+                // Transition task to BLOCKED with substate RECOVERABLE.
+                match transition_task_state_on_conn(
+                    &conn,
+                    &t_id,
+                    &[TaskState::Backlog],
+                    TaskState::Blocked,
+                ) {
+                    Ok(()) => {
+                        if let Err(e) = conn.execute(
+                            "UPDATE tasks SET substate = 'RECOVERABLE', updated_at = ?1 WHERE id = ?2",
+                            [&now, &t_id],
+                        ) {
+                            failures.record(
+                                "claiming_task_substate",
+                                format!("task '{}' (project '{}'): failed to set substate RECOVERABLE: {}", t_id, p_id, e),
+                            );
+                        }
+                    }
+                    Err(e) => {
                         failures.record(
-                            "claiming_task_cleanup",
+                            "claiming_task_transition_blocked",
                             format!(
-                                "task '{}' (project '{}'): failed to clear claim fields: {}",
+                                "task '{}' (project '{}'): failed to transition to BLOCKED: {}",
                                 t_id, p_id, e
                             ),
                         );
                     }
-                    if let Err(e) =
-                        conn.execute("DELETE FROM scope_leases WHERE task_id = ?1", [&t_id])
-                    {
-                        failures.record(
-                            "claiming_lease_cleanup",
-                            format!(
-                                "task '{}' (project '{}'): failed to release scope lease: {}",
-                                t_id, p_id, e
-                            ),
+                }
+                warn!(
+                    "Interrupted claiming task '{}' cleanup failed; preserved recovery pointers and transitioned to BLOCKED (substate RECOVERABLE)",
+                    t_id
+                );
+            } else {
+                // Successful cleanup: transition to READY and clear claim fields
+                match transition_task_state_on_conn(
+                    &conn,
+                    &t_id,
+                    &[TaskState::Claiming, TaskState::Backlog],
+                    TaskState::Ready,
+                ) {
+                    Ok(()) => {
+                        if let Err(e) = conn.execute(
+                            "UPDATE tasks SET substate = 'NONE', assigned_agent_id = NULL, worktree_path = NULL, branch_name = NULL, updated_at = ?1 WHERE id = ?2",
+                            [&now, &t_id],
+                        ) {
+                            failures.record(
+                                "claiming_task_cleanup",
+                                format!(
+                                    "task '{}' (project '{}'): failed to clear claim fields: {}",
+                                    t_id, p_id, e
+                                ),
+                            );
+                        }
+                        info!(
+                            "Reconciled interrupted claiming task '{}' -> reset to READY",
+                            t_id
                         );
+                    }
+                    Err(e) => {
+                        failures.record(
+                            "claiming_task_transition",
+                            format!("task '{}' (project '{}'): {}", t_id, p_id, e),
+                        );
+                        warn!(
+                            "Failed to reconcile interrupted claiming task '{}' to READY: {}",
+                            t_id, e
+                        );
+                    }
+                }
+            }
+            drop(conn);
+        }
+
+        // 2. Reconcile merge queue items interrupted during checks
+        let running_merge_items: Vec<(String, String, String, String, String)> = {
+            let conn = self.db.lock();
+            let scanned = match conn.prepare(
+                "SELECT id, project_id, task_id, target_branch, head_sha FROM merge_queue WHERE status = 'RUNNING_CHECKS'",
+            ) {
+                Ok(mut stmt) => match stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                    .and_then(|iter| iter.collect::<Result<Vec<_>, _>>())
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        failures.record(
+                            "merge_queue_reset",
+                            format!("failed to read RUNNING_CHECKS merge items: {}", e),
+                        );
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    failures.record(
+                        "merge_queue_reset",
+                        format!("could not scan RUNNING_CHECKS merge items: {}", e),
+                    );
+                    Vec::new()
+                }
+            };
+            scanned
+        };
+
+        for (q_id, p_id, t_id, target_branch, head_sha) in running_merge_items {
+            let repo_path: Option<std::path::PathBuf> = {
+                let conn = self.db.lock();
+                conn.query_row("SELECT path FROM projects WHERE id = ?1", [&p_id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+                .map(std::path::PathBuf::from)
+            };
+
+            let ancestor_check = if let Some(ref repo_path) = repo_path {
+                self.git.is_ancestor(repo_path, &head_sha, &target_branch)
+            } else {
+                Err(format!("Project '{}' repository path not found", p_id))
+            };
+
+            let conn = self.db.lock();
+            let now = Utc::now().to_rfc3339();
+
+            match ancestor_check {
+                Ok(crate::git::GitAncestorResult::Ancestor) => {
+                    // Git merge succeeded before interruption -> finalize state in SQLite (MERGED, DONE, COMPLETED steps)
+                    if let Err(e) = conn.execute(
+                        "UPDATE merge_queue SET status = 'MERGED', processed_at = ?1 WHERE id = ?2",
+                        [&now, &q_id],
+                    ) {
+                        failures.record("merge_reconcile_finalize", e.to_string());
+                    }
+                    if let Err(e) = transition_task_state_on_conn(
+                        &conn,
+                        &t_id,
+                        &[
+                            TaskState::MergeReady,
+                            TaskState::Verifying,
+                            TaskState::Review,
+                        ],
+                        TaskState::Done,
+                    ) {
+                        failures.record("merge_task_transition_done", e);
+                    } else {
+                        if let Err(e) = conn
+                            .execute("UPDATE tasks SET substate = 'NONE' WHERE id = ?1", [&t_id])
+                        {
+                            failures.record("merge_task_clear_substate", e.to_string());
+                        }
+                    }
+
+                    // Complete associated masterplan steps
+                    if let Err(e) = conn.execute(
+                        "UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2 AND status != 'COMPLETED'",
+                        [&now, &t_id],
+                    ) {
+                        failures.record("masterplan_steps_finalize", e.to_string());
+                    }
+                    match conn.query_row(
+                        "SELECT COUNT(*) FROM masterplan_steps ms
+                         JOIN masterplans mp ON ms.masterplan_id = mp.id
+                         WHERE mp.project_id = ?1 AND ms.status != 'COMPLETED'",
+                        [&p_id],
+                        |r| r.get::<_, i64>(0),
+                    ) {
+                        Ok(0) => {
+                            if let Err(e) = conn.execute(
+                                "UPDATE masterplans SET status = 'COMPLETED', updated_at = ?1 WHERE project_id = ?2",
+                                [&now, &p_id],
+                            ) {
+                                failures.record("masterplan_complete", e.to_string());
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            failures.record("masterplan_count_pending", e.to_string());
+                        }
                     }
                     info!(
-                        "Reconciled interrupted claiming task '{}' -> reset to READY",
-                        t_id
+                        "Reconciled merge queue item '{}' for task '{}': Git merge was already applied; finalized to MERGED/DONE/COMPLETED in SQLite",
+                        q_id, t_id
+                    );
+                }
+                Ok(crate::git::GitAncestorResult::NotAncestor) => {
+                    // Git merge was not applied -> safely revert queue status to READY
+                    if let Err(e) = conn.execute(
+                        "UPDATE merge_queue SET status = 'READY' WHERE id = ?1",
+                        [&q_id],
+                    ) {
+                        failures.record("merge_queue_reset", e.to_string());
+                    }
+                    info!(
+                        "Reconciled interrupted merge queue item '{}' for task '{}' -> reset status to READY",
+                        q_id, t_id
                     );
                 }
                 Err(e) => {
+                    // Check if repo and target_branch are valid, but head_sha is not a valid commit in the repo
+                    let target_branch_exists = repo_path
+                        .as_ref()
+                        .map(|rp| self.git.get_ref_sha(rp, &target_branch).is_ok())
+                        .unwrap_or(false);
+                    let is_invalid_head = e.contains("Not a valid commit name")
+                        || e.contains("not a valid commit name");
+
+                    if target_branch_exists && is_invalid_head {
+                        // The target branch is valid and healthy, but head_sha does not exist in the repository.
+                        // An object not present in the repository could not possibly be an ancestor of target_branch.
+                        // Safely reset merge_queue status to READY.
+                        if let Err(err) = conn.execute(
+                            "UPDATE merge_queue SET status = 'READY' WHERE id = ?1",
+                            [&q_id],
+                        ) {
+                            failures.record("merge_queue_reset", err.to_string());
+                        }
+                        info!(
+                            "Reconciled unapplied merge queue item '{}' (non-existent head_sha '{}') -> reset status to READY",
+                            q_id, head_sha
+                        );
+                    } else {
+                        // True Git/command/ref failure: fail-closed!
+                        // DO NOT revert to READY! Preserve state and record failure.
+                        failures.record(
+                            "merge_queue_reconcile_git_unknown",
+                            format!(
+                                "task '{}' (project '{}'): could not determine ancestor status: {}",
+                                t_id, p_id, e
+                            ),
+                        );
+                        warn!(
+                            "Merge reconciliation could not determine Git ancestor status for queue item '{}' (task '{}'): {}. Leaving queue item intact to prevent duplicate merge.",
+                            q_id, t_id, e
+                        );
+                    }
+                }
+            }
+            drop(conn);
+        }
+
+        // 2b. Reconcile tasks whose merge was finalized in merge_queue but task or steps lagged
+        let lagged_merged: Vec<(String, String)> = {
+            let conn = self.db.lock();
+            let scanned = match conn.prepare(
+                "SELECT t.id, t.project_id FROM tasks t
+                 JOIN merge_queue mq ON mq.task_id = t.id
+                 WHERE mq.status = 'MERGED' AND (
+                     t.state != 'DONE' OR EXISTS (
+                         SELECT 1 FROM masterplan_steps ms WHERE ms.claimed_task_id = t.id AND ms.status != 'COMPLETED'
+                     )
+                 )",
+            ) {
+                Ok(mut stmt) => match stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .and_then(|iter| iter.collect::<Result<Vec<_>, _>>())
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        failures.record("lagged_merge_scan", format!("failed to read lagged merge rows: {}", e));
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    failures.record("lagged_merge_scan", e.to_string());
+                    Vec::new()
+                }
+            };
+            scanned
+        };
+
+        for (t_id, p_id) in lagged_merged {
+            let conn = self.db.lock();
+            let now = Utc::now().to_rfc3339();
+            if let Err(e) = transition_task_state_on_conn(
+                &conn,
+                &t_id,
+                &[
+                    TaskState::MergeReady,
+                    TaskState::Verifying,
+                    TaskState::Review,
+                    TaskState::Running,
+                ],
+                TaskState::Done,
+            ) {
+                failures.record(
+                    "lagged_merge_task_transition",
+                    format!("task '{}' (project '{}'): {}", t_id, p_id, e),
+                );
+            } else {
+                if let Err(e) =
+                    conn.execute("UPDATE tasks SET substate = 'NONE' WHERE id = ?1", [&t_id])
+                {
                     failures.record(
-                        "claiming_task_transition",
+                        "lagged_merge_task_substate",
                         format!("task '{}' (project '{}'): {}", t_id, p_id, e),
                     );
-                    warn!(
-                        "Failed to reconcile interrupted claiming task '{}' to READY: {}",
-                        t_id, e
+                }
+            }
+
+            if let Err(e) = conn.execute(
+                "UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2 AND status != 'COMPLETED'",
+                [&now, &t_id],
+            ) {
+                failures.record(
+                    "lagged_merge_steps_complete",
+                    format!("task '{}' (project '{}'): {}", t_id, p_id, e),
+                );
+            }
+
+            match conn.query_row(
+                "SELECT COUNT(*) FROM masterplan_steps ms
+                 JOIN masterplans mp ON ms.masterplan_id = mp.id
+                 WHERE mp.project_id = ?1 AND ms.status != 'COMPLETED'",
+                [&p_id],
+                |r| r.get::<_, i64>(0),
+            ) {
+                Ok(0) => {
+                    if let Err(e) = conn.execute(
+                        "UPDATE masterplans SET status = 'COMPLETED', updated_at = ?1 WHERE project_id = ?2",
+                        [&now, &p_id],
+                    ) {
+                        failures.record(
+                            "lagged_merge_plan_complete",
+                            format!("project '{}': {}", p_id, e),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    failures.record(
+                        "lagged_merge_count_pending",
+                        format!("project '{}': {}", p_id, e),
                     );
                 }
             }
             drop(conn);
         }
 
-        // 2. Reset merge queue items interrupted during checks
-        let conn = self.db.lock();
-        if let Err(e) = conn.execute(
-            "UPDATE merge_queue SET status = 'READY' WHERE status = 'RUNNING_CHECKS'",
-            [],
-        ) {
-            failures.record("merge_queue_reset", e.to_string());
-        }
-
         // 3. Mark expired scope leases
+        let conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
         if let Err(e) = conn.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now]) {
             failures.record("scope_lease_cleanup", e.to_string());
@@ -397,9 +727,13 @@ impl CoordinatorEngine {
 
         // 4. Reconcile orphaned claimed masterplan steps whose tasks are missing or cancelled
         if let Err(e) = conn.execute(
-            "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL
-             WHERE status = 'CLAIMED' AND (claimed_task_id IS NULL OR claimed_task_id IN (SELECT id FROM tasks WHERE state = 'CANCELLED' OR is_stale = 1))",
-            [],
+            "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1
+             WHERE status = 'CLAIMED' AND (
+                 claimed_task_id IS NULL
+                 OR claimed_task_id IN (SELECT id FROM tasks WHERE state IN ('CANCELLED', 'BLOCKED', 'FAILED') OR is_stale = 1)
+                 OR NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = masterplan_steps.claimed_task_id)
+             )",
+            [&now],
         ) {
             failures.record("masterplan_step_reset", e.to_string());
         }
@@ -433,7 +767,7 @@ impl CoordinatorEngine {
             return Err(format!("Path '{}' does not exist", path));
         }
 
-        if !self.git.is_git_repo(repo_path) {
+        if !self.git.check_is_git_repo(repo_path)? {
             info!(
                 "Directory '{}' is not a Git repository. Auto-initializing...",
                 path
@@ -441,15 +775,18 @@ impl CoordinatorEngine {
             self.git.init_repo(repo_path)?;
         }
 
-        let conn = self.db.lock();
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin project transaction: {}", e))?;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO projects (id, name, path, master_spec, target_branch, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![id, name, path, master_spec, target_branch, now],
-        ).map_err(|e| e.to_string())?;
+        ).map_err(|e| format!("Failed to insert project: {}", e))?;
 
         // Initialize default project contract
         let contract_id = Uuid::new_v4().to_string();
@@ -457,19 +794,22 @@ impl CoordinatorEngine {
         hasher.update(master_spec.as_bytes());
         let contract_hash = hex::encode(hasher.finalize());
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO project_contracts (id, project_id, version, overview, architecture, rules_json, commands_json, testing_json, repo_map, security_constraints, contract_hash, created_at)
              VALUES (?1, ?2, 1, ?3, 'Standard Architecture', '[]', '[]', '[]', '', '[]', ?4, ?5)",
             params![contract_id, id, master_spec, contract_hash, now],
-        ).ok();
+        ).map_err(|e| format!("Failed to insert default project contract: {}", e))?;
 
         // Initialize baseline project rules
         let rule_id = Uuid::new_v4().to_string();
-        conn.execute(
+        tx.execute(
             "INSERT INTO project_rules (id, project_id, category, rule_text, strictness, created_at)
              VALUES (?1, ?2, 'SYSTEM', 'All mutations must occur inside assigned Git worktrees and within granted scope leases.', 'MANDATORY', ?3)",
             params![rule_id, id, now],
-        ).ok();
+        ).map_err(|e| format!("Failed to insert baseline project rule: {}", e))?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit project creation transaction: {}", e))?;
 
         let proj = Project {
             id: id.clone(),
@@ -572,8 +912,8 @@ impl CoordinatorEngine {
             .map_err(|e| e.to_string())?;
 
         let mut res = Vec::new();
-        for r in rows.flatten() {
-            res.push(r);
+        for r in rows {
+            res.push(r.map_err(|e| format!("Failed to decode project row: {}", e))?);
         }
         Ok(res)
     }
@@ -610,11 +950,12 @@ impl CoordinatorEngine {
         steps: Vec<(String, String, bool)>,
         criteria: Vec<String>,
     ) -> Result<Task, String> {
-        let conn = self.db.lock();
+        let mut conn = self.db.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO tasks (id, project_id, masterplan_id, masterplan_revision_id, title, description, state, substate, priority, is_stale, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'BACKLOG', 'NONE', ?7, 0, ?8, ?8)",
             params![id, project_id, masterplan_id, masterplan_revision_id, title, description, priority, now],
@@ -622,22 +963,26 @@ impl CoordinatorEngine {
 
         for (idx, (step_title, step_desc, is_mand)) in steps.into_iter().enumerate() {
             let step_id = Uuid::new_v4().to_string();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO task_steps (id, task_id, order_index, title, description, is_mandatory, status)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING')",
                 params![step_id, id, idx as i32 + 1, step_title, step_desc, is_mand],
-            ).ok();
+            ).map_err(|e| format!("Failed to create task step: {}", e))?;
         }
 
         for crit in criteria {
             let crit_id = Uuid::new_v4().to_string();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO acceptance_criteria (id, task_id, criterion, is_satisfied, is_locked)
                  VALUES (?1, ?2, ?3, 0, 0)",
                 params![crit_id, id, crit],
             )
-            .ok();
+            .map_err(|e| format!("Failed to create acceptance criterion: {}", e))?;
         }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit task transaction: {}", e))?;
+        drop(conn);
 
         let task = Task {
             id: id.clone(),
@@ -663,7 +1008,6 @@ impl CoordinatorEngine {
             updated_at: now,
         };
 
-        drop(conn);
         self.emit_event(
             Some(project_id),
             Some(&id),
@@ -734,8 +1078,8 @@ impl CoordinatorEngine {
             .query_map([project_id], map_row)
             .map_err(|e| e.to_string())?;
         let mut res = Vec::new();
-        for r in rows.flatten() {
-            res.push(r);
+        for r in rows {
+            res.push(r.map_err(|e| format!("Failed to decode task row: {}", e))?);
         }
 
         Ok(res)
@@ -785,9 +1129,16 @@ impl CoordinatorEngine {
 
         if let Some(caller) = caller_agent_id {
             if let Some(ref assigned) = task.assigned_agent_id {
-                if !assigned.is_empty() && assigned != caller {
+                let (canon_assigned, ..) = Self::canonicalize_ide_identity(assigned, "");
+                let (canon_caller, ..) = Self::canonicalize_ide_identity(caller, "");
+                if !assigned.is_empty() && assigned != caller && canon_assigned != canon_caller {
                     return Err(format!("Authorization error: Caller agent '{}' is not the owner of task '{}' (assigned to '{}')", caller, task_id, assigned));
                 }
+            } else {
+                return Err(format!(
+                    "Authorization error: Cannot cancel unassigned task '{}'",
+                    task_id
+                ));
             }
         }
 
@@ -806,7 +1157,7 @@ impl CoordinatorEngine {
         // Transaction-body cancellation writes (scope release, masterplan revert,
         // merge-queue removal, CANCELLED + stale). Event emission and worktree
         // cleanup happen after commit below: both lock the DB.
-        cancel_task_inner(&tx, task_id, reason)
+        cancel_task_inner(&tx, task_id, caller_agent_id, reason)
             .map_err(|e| format!("Failed to cancel task: {}", e))?;
 
         tx.commit()
@@ -883,8 +1234,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read task step row: {}", e))?;
 
         let mut stmt_crit = conn.prepare("SELECT id, task_id, criterion, is_satisfied, is_locked FROM acceptance_criteria WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let criteria: Vec<AcceptanceCriteria> = stmt_crit
@@ -898,8 +1249,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read acceptance criteria row: {}", e))?;
 
         let mut stmt_leases = conn.prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let leases: Vec<ScopeLease> = stmt_leases
@@ -915,8 +1266,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read scope lease row: {}", e))?;
 
         let mut stmt_deps = conn.prepare("SELECT id, task_id, depends_on_task_id, dependency_type, created_at FROM task_dependencies WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let dependencies: Vec<TaskDependency> = stmt_deps
@@ -930,8 +1281,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read task dependency row: {}", e))?;
 
         let mut stmt_runs = conn.prepare("SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at, timed_out FROM verification_runs WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let verification_runs: Vec<VerificationRun> = stmt_runs
@@ -955,8 +1306,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read verification run row: {}", e))?;
 
         let mut stmt_violations = conn.prepare("SELECT id, task_id, agent_id, file_path, violation_type, detected_at, resolved FROM scope_violations WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let violations: Vec<ScopeViolation> = stmt_violations
@@ -972,8 +1323,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read scope violation row: {}", e))?;
 
         let mut stmt_evidence = conn.prepare("SELECT id, task_id, step_id, evidence_type, source, payload_json, recorded_at FROM evidence_records WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let evidence_records: Vec<EvidenceRecord> = stmt_evidence
@@ -989,8 +1340,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read evidence record row: {}", e))?;
 
         let proof_bundle = conn.query_row(
             "SELECT task_id, project_id, agent_id, prompt, base_sha, head_sha, files_changed_json, diff_summary, proof_hash, generated_at, verification_runs_json FROM proof_bundles WHERE task_id = ?1 ORDER BY generated_at DESC LIMIT 1",
@@ -1111,14 +1462,6 @@ impl CoordinatorEngine {
             ));
         }
 
-        // Dependency gate check
-        if !self.dag.are_dependencies_satisfied(task_id)? {
-            return Err(format!(
-                "Cannot claim task '{}': Prerequisite dependencies are not yet DONE",
-                task_id
-            ));
-        }
-
         let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
@@ -1126,6 +1469,14 @@ impl CoordinatorEngine {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to start transaction: {}", e))?;
+
+        // Atomic dependency gate check on the active transaction connection
+        if !crate::dag::DagEngine::are_dependencies_satisfied_on_conn(&tx, task_id)? {
+            return Err(format!(
+                "Cannot claim task '{}': Prerequisite dependencies are not yet DONE",
+                task_id
+            ));
+        }
 
         let (project_id, current_state, current_assigned): (String, String, Option<String>) = tx
             .query_row(
@@ -1218,12 +1569,11 @@ impl CoordinatorEngine {
                 .create_worktree(repo_path, &worktree_dir, &branch_name, &target_branch)
         {
             // Full compensation on failure: validated CLAIMING -> READY reset.
-            // (DB stores 'CLAIMING' which parses to TaskState::Backlog - Task 4.1 parse quirk)
             let conn = self.db.lock();
             if let Err(te) = transition_task_state_on_conn(
                 &conn,
                 task_id,
-                &[TaskState::Backlog],
+                &[TaskState::Claiming, TaskState::Backlog],
                 TaskState::Ready,
             ) {
                 error!(
@@ -1277,7 +1627,7 @@ impl CoordinatorEngine {
         agent_id: Option<&str>,
         evidence_json: Option<&str>,
     ) -> Result<TaskStep, String> {
-        let conn = self.db.lock();
+        let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
         // Verify step and caller task ownership
@@ -1291,22 +1641,31 @@ impl CoordinatorEngine {
 
         if let Some(caller) = agent_id {
             if let Some(ref assigned) = assigned_agent {
-                if assigned != caller {
+                let (canon_assigned, ..) = Self::canonicalize_ide_identity(assigned, "");
+                let (canon_caller, ..) = Self::canonicalize_ide_identity(caller, "");
+                if assigned != caller && canon_assigned != canon_caller {
                     return Err(format!(
                         "Step ownership violation: Step belongs to task '{}' assigned to agent '{}', caller is '{}'",
                         task_id, assigned, caller
                     ));
                 }
+            } else {
+                return Err(format!(
+                    "Step ownership violation: Step belongs to unassigned task '{}', caller is '{}'",
+                    task_id, caller
+                ));
             }
         }
 
-        conn.execute(
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        tx.execute(
             "UPDATE task_steps SET status = 'COMPLETED', completed_at = ?1 WHERE id = ?2",
             params![now, step_id],
         )
         .map_err(|e| e.to_string())?;
 
-        let step = conn.query_row(
+        let step = tx.query_row(
             "SELECT id, task_id, order_index, title, description, is_mandatory, status, completed_at FROM task_steps WHERE id = ?1",
             [step_id],
             |row| {
@@ -1325,12 +1684,15 @@ impl CoordinatorEngine {
 
         if let Some(ev) = evidence_json {
             let ev_id = Uuid::new_v4().to_string();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO evidence_records (id, task_id, step_id, evidence_type, source, payload_json, recorded_at)
                  VALUES (?1, ?2, ?3, 'AGENT_NOTE', 'AGENT_REPORTED', ?4, ?5)",
                 params![ev_id, step.task_id, step_id, ev, now],
-            ).ok();
+            ).map_err(|e| format!("Failed to record step evidence record: {}", e))?;
         }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit step completion transaction: {}", e))?;
 
         drop(conn);
         self.emit_event(
@@ -1349,12 +1711,19 @@ impl CoordinatorEngine {
 
         // 1. Ownership enforcement
         if let Some(ref assigned) = task.assigned_agent_id {
-            if assigned != agent_id {
+            let (canon_assigned, ..) = Self::canonicalize_ide_identity(assigned, "");
+            let (canon_caller, ..) = Self::canonicalize_ide_identity(agent_id, "");
+            if assigned != agent_id && canon_assigned != canon_caller {
                 return Err(format!(
                     "Task ownership violation: Task '{}' is owned by agent '{}', not '{}'",
                     task_id, assigned, agent_id
                 ));
             }
+        } else {
+            return Err(format!(
+                "Task ownership violation: Task '{}' is not assigned to any agent",
+                task_id
+            ));
         }
 
         let _proj = self
@@ -1404,23 +1773,33 @@ impl CoordinatorEngine {
         .map_err(|e| format!("Failed to set task substate: {}", e))?;
 
         // Retrieve or create active task attempt with strict error propagation and run_number compatibility
-        let attempt_opt: Option<(String, i32)> = conn
+        let attempt_opt: Option<(String, i32)> = match conn
             .query_row(
                 "SELECT id, attempt_number FROM task_attempts WHERE task_id = ?1 AND status = 'ACTIVE' ORDER BY attempt_number DESC LIMIT 1",
                 [task_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
+            ) {
+                Ok(att) => Some(att),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to query active task attempt for task '{}': {}",
+                        task_id, e
+                    ))
+                }
+            };
 
         let (attempt_id, _attempt_num) = if let Some(att) = attempt_opt {
             att
         } else {
             let new_id = Uuid::new_v4().to_string();
-            let new_num: i32 = conn.query_row(
-                "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?1",
-                [task_id],
-                |r| r.get(0),
-            ).unwrap_or(1);
+            let new_num: i32 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?1",
+                    [task_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("Failed to compute next attempt number: {}", e))?;
             conn.execute(
                 "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, run_number, base_sha, worktree_path, status, started_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8)",
@@ -1518,9 +1897,22 @@ impl CoordinatorEngine {
                 )
                 .map_err(|e| format!("Failed to transition task to MERGE_READY: {}", e))?;
             }
+            let require_approval: bool = conn
+                .query_row(
+                    "SELECT require_milestone_approval FROM masterplans WHERE project_id = ?1 AND is_active = 1 LIMIT 1",
+                    [&task.project_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(true);
+            let substate = if require_approval {
+                "WAITING_FOR_INPUT"
+            } else {
+                "NONE"
+            };
+
             conn.execute(
-                "UPDATE tasks SET substate = 'NONE', head_sha = ?1 WHERE id = ?2",
-                params![head_sha, task_id],
+                "UPDATE tasks SET substate = ?1, head_sha = ?2 WHERE id = ?3",
+                params![substate, head_sha, task_id],
             )
             .map_err(|e| e.to_string())?;
 
@@ -1532,7 +1924,7 @@ impl CoordinatorEngine {
             conn.execute(
                 "UPDATE masterplan_steps SET status = 'COMPLETED', updated_at = ?1 WHERE claimed_task_id = ?2",
                 params![now_finished, task_id],
-            ).ok();
+            ).map_err(|e| format!("Failed to update masterplan steps to COMPLETED: {}", e))?;
             drop(conn);
 
             self.emit_event(
@@ -1620,9 +2012,9 @@ impl CoordinatorEngine {
         // from the row's stored inputs + evidence tables, and refuse to enqueue when the
         // stored proof_hash no longer matches - a tampered row cannot pass the gate.
         let conn = self.db.lock();
-        let proof_row: Option<StoredProofRow> = conn
+        let proof_row: Option<StoredProofRow> = match conn
             .query_row(
-                "SELECT task_id, project_id, attempt_id, base_sha, head_sha, files_changed_json, diff_summary, criteria_json, steps_json, proof_hash
+                "SELECT task_id, project_id, attempt_id, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash
                  FROM proof_bundles
                  WHERE task_id = ?1 AND head_sha = ?2
                  ORDER BY generated_at DESC, id DESC LIMIT 1",
@@ -1636,13 +2028,22 @@ impl CoordinatorEngine {
                         head_sha: r.get(4)?,
                         files_changed_json: r.get(5)?,
                         diff_summary: r.get(6)?,
-                        criteria_json: r.get(7)?,
-                        steps_json: r.get(8)?,
-                        proof_hash: r.get(9)?,
+                        verification_runs_json: r.get(7)?,
+                        criteria_json: r.get(8)?,
+                        steps_json: r.get(9)?,
+                        proof_hash: r.get(10)?,
                     })
                 },
-            )
-            .ok();
+            ) {
+                Ok(row) => Some(row),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to query proof bundle for task '{}' at HEAD {}: {}",
+                        task_id, head_sha, e
+                    ))
+                }
+            };
 
         let stored = match proof_row {
             Some(row) => row,
@@ -1735,12 +2136,9 @@ impl CoordinatorEngine {
         Ok(item)
     }
 
-    /// Recomputes the canonical proof digest from a proof row's stored inputs, mirroring
+    /// Recomputes the canonical proof digest from a proof row's stored snapshot inputs, mirroring
     /// VerificationEngine::generate_proof_bundle exactly: same length-prefixed field
-    /// encoding, same field order, same evidence-table queries and ORDER BYs. The
-    /// scope_violations rows are resolved for the row's OWN attempt_id (the same value the
-    /// digest hashed and the row persisted) rather than the latest attempt, so per-attempt
-    /// append-only history recomputes deterministically (D10/D28).
+    /// encoding, same field order, and exact evidence snapshot serialized at bundle creation time.
     fn recompute_proof_hash_on_conn(
         conn: &rusqlite::Connection,
         row: &StoredProofRow,
@@ -1757,63 +2155,40 @@ impl CoordinatorEngine {
             serde_json::from_str(&row.files_changed_json).unwrap_or_default();
         files_changed.sort();
 
-        let mut runs_stmt = conn
-            .prepare(
-                "SELECT id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at, timed_out FROM verification_runs WHERE task_id = ?1 AND commit_sha = ?2 ORDER BY id ASC",
-            )
-            .map_err(|e| e.to_string())?;
-        let verification_runs: Vec<VerificationRun> = runs_stmt
-            .query_map(rusqlite::params![row.task_id, row.head_sha], |row| {
-                Ok(VerificationRun {
-                    id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    check_id: row.get(3)?,
-                    check_name: row.get(4)?,
-                    commit_sha: row.get(5)?,
-                    command: row.get(6)?,
-                    exit_code: row.get(7)?,
-                    stdout: row.get(8)?,
-                    stderr: row.get(9)?,
-                    duration_ms: row.get(10)?,
-                    is_passed: row.get(11)?,
-                    is_stale: row.get(12)?,
-                    executed_at: row.get(13)?,
-                    timed_out: row.get(14)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+        let verification_runs: Vec<VerificationRun> =
+            serde_json::from_str(&row.verification_runs_json).unwrap_or_default();
 
         let mut evals_stmt = conn
             .prepare(
-                "SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 AND commit_sha = ?2 ORDER BY id ASC",
+                "SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 AND commit_sha = ?2 AND attempt_id = ?3 ORDER BY id ASC",
             )
             .map_err(|e| e.to_string())?;
         let evaluator_results: Vec<EvaluatorResult> = evals_stmt
-            .query_map(rusqlite::params![row.task_id, row.head_sha], |row| {
-                Ok(EvaluatorResult {
-                    id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    attempt_id: row.get(2)?,
-                    criterion_id: row.get(3)?,
-                    evaluator_name: row.get(4)?,
-                    evaluator_type: row.get(5)?,
-                    evaluator_version: row.get(6)?,
-                    commit_sha: row.get(7)?,
-                    exit_code: row.get(8)?,
-                    stdout_output: row.get(9)?,
-                    stderr_output: row.get(10)?,
-                    output_sha256: row.get(11)?,
-                    duration_ms: row.get(12)?,
-                    passed: row.get(13)?,
-                    evaluated_at: row.get(14)?,
-                })
-            })
+            .query_map(
+                rusqlite::params![row.task_id, row.head_sha, row.attempt_id],
+                |row| {
+                    Ok(EvaluatorResult {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        attempt_id: row.get(2)?,
+                        criterion_id: row.get(3)?,
+                        evaluator_name: row.get(4)?,
+                        evaluator_type: row.get(5)?,
+                        evaluator_version: row.get(6)?,
+                        commit_sha: row.get(7)?,
+                        exit_code: row.get(8)?,
+                        stdout_output: row.get(9)?,
+                        stderr_output: row.get(10)?,
+                        output_sha256: row.get(11)?,
+                        duration_ms: row.get(12)?,
+                        passed: row.get(13)?,
+                        evaluated_at: row.get(14)?,
+                    })
+                },
+            )
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read evaluator result row: {}", e))?;
 
         let mut violations_stmt = conn
             .prepare(
@@ -1833,8 +2208,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read scope violation row: {}", e))?;
 
         let mut hasher = Sha256::new();
         push_field(&mut hasher, row.task_id.as_bytes());
@@ -1977,7 +2352,7 @@ impl CoordinatorEngine {
         let conn = self.db.lock();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let expires_str = (now + chrono::Duration::days(365)).to_rfc3339();
+        let expires_str = (now + chrono::Duration::days(SESSION_INITIAL_TTL_DAYS)).to_rfc3339();
         // D11: session tokens must be unpredictable and non-forgeable. Same
         // construction as the master MCP token (security/mod.rs): two random
         // UUIDs plus nanos-of-now, SHA-256 hex, kept in the axf_sess_ namespace.
@@ -2014,19 +2389,68 @@ impl CoordinatorEngine {
             rusqlite::params![sess_id, canonical_id, session_token, now_str, expires_str],
         ).map_err(|e| format!("Failed to register agent session: {}", e))?;
 
+        // Authoritative reload of persisted canonical agent row
+        let (id, name_db, agent_type_db, profile_db, status_db, last_heartbeat_db, created_at_db): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT id, name, agent_type, profile, status, last_heartbeat, created_at FROM agents WHERE id = ?1",
+                [&canonical_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .map_err(|e| format!("Failed to reload canonical agent: {}", e))?;
+
+        let active_task: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, title FROM tasks WHERE (assigned_agent_id = ?1 OR assigned_agent_id = ?2) AND state IN ('RUNNING', 'VERIFYING') AND is_stale = 0 ORDER BY updated_at DESC LIMIT 1",
+                [&id, &canonical_name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        let (active_task_id, active_task_title) = match active_task {
+            Some((t_id, t_title)) => (Some(t_id), Some(t_title)),
+            None => (None, None),
+        };
+
+        let last_dt = chrono::DateTime::parse_from_rfc3339(&last_heartbeat_db)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or(now);
+        let elapsed_secs = (now - last_dt).num_seconds().max(0);
+
+        let final_status = if active_task_id.is_some() {
+            if elapsed_secs > 120 {
+                "DISCONNECTED".to_string()
+            } else {
+                "WORKING".to_string()
+            }
+        } else if elapsed_secs > 120 {
+            "DISCONNECTED".to_string()
+        } else if status_db == "WORKING" || status_db == "RUNNING" {
+            status_db
+        } else {
+            "IDLE".to_string()
+        };
+
         let agent = Agent {
             id: canonical_id.clone(),
-            name: canonical_name,
-            agent_type: actual_type.clone(),
-            profile,
-            status: "IDLE".to_string(),
+            name: name_db,
+            agent_type: agent_type_db,
+            profile: profile_db,
+            status: final_status,
             capabilities: AgentCapabilitySet::default(),
-            last_heartbeat: now_str.clone(),
-            created_at: now_str,
+            last_heartbeat: last_heartbeat_db,
+            created_at: created_at_db,
             session_token: Some(session_token),
-            active_task_id: None,
-            active_task_title: None,
-            last_seen_seconds: Some(0),
+            active_task_id,
+            active_task_title,
+            last_seen_seconds: Some(elapsed_secs),
         };
 
         drop(conn);
@@ -2091,10 +2515,12 @@ impl CoordinatorEngine {
         criterion_id: &str,
         evidence: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.db.lock();
+        let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        let rows_affected = conn
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        let rows_affected = tx
             .execute(
                 "UPDATE acceptance_criteria SET is_satisfied = 1 WHERE id = ?1 AND task_id = ?2",
                 rusqlite::params![criterion_id, task_id],
@@ -2110,11 +2536,14 @@ impl CoordinatorEngine {
 
         let ev_id = Uuid::new_v4().to_string();
         let note = evidence.unwrap_or("Manual User / Verification Sign-off");
-        conn.execute(
+        tx.execute(
             "INSERT INTO evidence_records (id, task_id, step_id, evidence_type, source, payload_json, recorded_at)
              VALUES (?1, ?2, NULL, 'USER_APPROVAL', 'COORDINATOR_OBSERVED', ?3, ?4)",
             rusqlite::params![ev_id, task_id, note, now],
-        ).ok();
+        ).map_err(|e| format!("Failed to record acceptance criterion evidence record: {}", e))?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit acceptance criterion satisfaction: {}", e))?;
 
         drop(conn);
         self.emit_event(
@@ -2252,6 +2681,7 @@ impl CoordinatorEngine {
             cancel_task_inner(
                 &tx,
                 tid,
+                None,
                 Some("Agent unregistered: task reclaimed to masterplan pending backlog"),
             )?;
         }
@@ -2379,6 +2809,65 @@ impl CoordinatorEngine {
         Ok(unassigned)
     }
 
+    /// Sets task substate to WAITING_FOR_INPUT and refreshes agent heartbeat.
+    /// Used when an agent is waiting for external IDE or user permission.
+    pub fn set_task_waiting_for_permission(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<(), String> {
+        let (canonical_id, ..) = Self::canonicalize_ide_identity(agent_id, "");
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start transaction: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        let assigned: Option<String> = tx
+            .query_row(
+                "SELECT assigned_agent_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?;
+
+        if let Some(ref aid) = assigned {
+            let (canon_assigned, ..) = Self::canonicalize_ide_identity(aid, "");
+            if aid != agent_id && canon_assigned != canonical_id {
+                return Err(format!(
+                    "Task ownership violation: Task '{}' is owned by '{}', caller is '{}'",
+                    task_id, aid, agent_id
+                ));
+            }
+        } else {
+            return Err(format!("Task '{}' is not assigned", task_id));
+        }
+
+        tx.execute(
+            "UPDATE tasks SET substate = 'WAITING_FOR_INPUT', updated_at = ?1 WHERE id = ?2",
+            params![now, task_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        tx.execute(
+            "UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
+            params![now, agent_id, canonical_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        tx.commit().map_err(|e| e.to_string())?;
+        drop(conn);
+
+        self.emit_event(
+            None,
+            Some(task_id),
+            Some(agent_id),
+            "TASK_WAITING_FOR_PERMISSION",
+            json!({ "task_id": task_id, "substate": "WAITING_FOR_INPUT" }),
+        );
+        Ok(())
+    }
+
     /// Periodic stale-recovery sweep (defects D21/D37). Recovers state orphaned by
     /// disconnected agents. Idempotent, safe transitions only:
     ///   1. Revoke sessions past `expires_at` (delete `agent_sessions` rows; the
@@ -2399,6 +2888,8 @@ impl CoordinatorEngine {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let stale_before = (now - chrono::Duration::seconds(STALE_AGENT_GRACE)).to_rfc3339();
+        let waiting_stale_before =
+            (now - chrono::Duration::seconds(WAITING_PERMISSION_GRACE)).to_rfc3339();
 
         // ---- Phase 1: collect everything on the live connection ----
         let mut conn = self.db.lock();
@@ -2414,7 +2905,9 @@ impl CoordinatorEngine {
             let rows = stmt
                 .query_map([&now_str], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
-            let ids = rows.flatten().collect();
+            let ids = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read expired session rows: {}", e))?;
             drop(stmt);
             tx.execute(
                 "DELETE FROM agent_sessions WHERE expires_at <= ?1",
@@ -2425,7 +2918,8 @@ impl CoordinatorEngine {
         };
 
         // 2. Collect stale in-flight tasks: assigned agent heartbeat older than
-        //    STALE_AGENT_GRACE, or the assigned agent row is gone entirely.
+        //    STALE_AGENT_GRACE (or WAITING_PERMISSION_GRACE if waiting for permission),
+        //    or the assigned agent row is gone entirely.
         let stale_tasks: Vec<(String, String, Option<String>, Option<String>)> = {
             let mut stmt = tx
                 .prepare(
@@ -2442,34 +2936,47 @@ impl CoordinatorEngine {
                          OR EXISTS (
                            SELECT 1 FROM agents a
                            WHERE (a.id = t.assigned_agent_id OR a.name = t.assigned_agent_id)
-                             AND a.last_heartbeat < ?1
+                             AND (
+                               (t.substate != 'WAITING_FOR_INPUT' AND a.last_heartbeat < ?1)
+                               OR (t.substate = 'WAITING_FOR_INPUT' AND a.last_heartbeat < ?2)
+                             )
                          )
                        )",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map([&stale_before], |r| {
+                .query_map([&stale_before, &waiting_stale_before], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })
                 .map_err(|e| e.to_string())?;
-            rows.flatten().collect()
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read stale task rows: {}", e))?
         };
 
-        // 3. Collect CLAIMED masterplan steps whose claiming agent no longer exists
+        // 3. Collect CLAIMED masterplan steps whose claiming agent no longer exists or whose task is dead/missing
         let orphaned_steps: Vec<String> = {
             let mut stmt = tx
                 .prepare(
                     "SELECT s.id FROM masterplan_steps s
                      WHERE s.status = 'CLAIMED'
-                       AND (s.claimed_agent_id IS NULL OR NOT EXISTS (
-                         SELECT 1 FROM agents a WHERE a.id = s.claimed_agent_id
-                       ))",
+                       AND (
+                         s.claimed_agent_id IS NULL
+                         OR s.claimed_task_id IS NULL
+                         OR NOT EXISTS (
+                           SELECT 1 FROM agents a WHERE a.id = s.claimed_agent_id OR a.name = s.claimed_agent_id
+                         )
+                         OR NOT EXISTS (
+                           SELECT 1 FROM tasks t WHERE t.id = s.claimed_task_id AND t.state IN ('RUNNING', 'VERIFYING', 'CLAIMING', 'VERIFIED', 'REVIEW', 'MERGE_READY')
+                         )
+                       )",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |r| r.get(0))
-                .map_err(|e| e.to_string())?;
-            rows.flatten().collect()
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read orphaned step rows: {}", e))?;
+            rows
         };
 
         // ---- Phase 2: act on the transaction ----
@@ -2477,6 +2984,7 @@ impl CoordinatorEngine {
             cancel_task_inner(
                 &tx,
                 tid,
+                None,
                 Some("Stale agent recovery: task reclaimed to masterplan pending backlog"),
             )?;
         }
@@ -2594,12 +3102,13 @@ impl CoordinatorEngine {
 
     pub fn agent_heartbeat(&self, agent_id: &str) -> Result<(), String> {
         let (canonical_id, _, _, _) = Self::canonicalize_ide_identity(agent_id, "");
-        let conn = self.db.lock();
+        let mut conn = self.db.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let expires_str = (now + chrono::Duration::hours(4)).to_rfc3339();
 
-        let updated = conn
+        let updated = tx
             .execute(
                 "UPDATE agents SET last_heartbeat = ?1 WHERE id = ?2 OR id = ?3",
                 rusqlite::params![now_str, agent_id, canonical_id],
@@ -2611,22 +3120,26 @@ impl CoordinatorEngine {
         }
 
         // Transactionally renew active scope leases for this agent
-        conn.execute(
+        tx.execute(
             "UPDATE scope_leases SET expires_at = ?1 WHERE agent_id = ?2 OR agent_id = ?3",
             params![expires_str, agent_id, canonical_id],
         )
-        .ok();
+        .map_err(|e| format!("Failed to renew scope leases on heartbeat: {}", e))?;
 
-        // D29: slide the session expiry forward to now + SESSION_TTL_DAYS so active
-        // agents never expire; dead agents lose their session 30 days after their
-        // last heartbeat (the sweep in Task 10.2 reaps them).
-        let session_expires_str = (now + chrono::Duration::days(SESSION_TTL_DAYS)).to_rfc3339();
-        conn.execute(
-            "UPDATE agent_sessions SET expires_at = ?1 WHERE agent_id = ?2 OR agent_id = ?3",
-            params![session_expires_str, agent_id, canonical_id],
+        // Slide the session expiry forward so active agents never expire.
+        let session_slide_expires_str =
+            (now + chrono::Duration::days(SESSION_HEARTBEAT_SLIDE_DAYS)).to_rfc3339();
+        tx.execute(
+            "UPDATE agent_sessions SET
+                expires_at = CASE WHEN expires_at < ?1 THEN ?1 ELSE expires_at END,
+                last_activity_at = ?2
+             WHERE agent_id = ?3 OR agent_id = ?4",
+            params![session_slide_expires_str, now_str, agent_id, canonical_id],
         )
-        .ok();
+        .map_err(|e| format!("Failed to renew agent session on heartbeat: {}", e))?;
 
+        tx.commit()
+            .map_err(|e| format!("Failed to commit heartbeat transaction: {}", e))?;
         drop(conn);
         Ok(())
     }
@@ -2662,8 +3175,8 @@ impl CoordinatorEngine {
         let project_rules: Vec<String> = stmt_rules
             .query_map([project_id], |r| r.get(0))
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read project rule row: {}", e))?;
 
         // 3. Real Project Memory
         let mut stmt_mem = conn
@@ -2674,8 +3187,8 @@ impl CoordinatorEngine {
         let project_memory: Vec<String> = stmt_mem
             .query_map([project_id], |r| r.get(0))
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read project memory row: {}", e))?;
 
         Ok(ProjectContextPack {
             project_id: proj.id,
@@ -2716,8 +3229,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read task step row: {}", e))?;
 
         let mut stmt_crit = conn.prepare("SELECT id, task_id, criterion, is_satisfied, is_locked FROM acceptance_criteria WHERE task_id = ?1").map_err(|e| e.to_string())?;
         let criteria: Vec<AcceptanceCriteria> = stmt_crit
@@ -2731,16 +3244,16 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read acceptance criteria row: {}", e))?;
 
         // Blocking Dependencies
         let mut stmt_deps = conn.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1 AND dependency_type = 'BLOCKS'").map_err(|e| e.to_string())?;
         let dependencies: Vec<String> = stmt_deps
             .query_map([task_id], |r| r.get(0))
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read task dependency row: {}", e))?;
 
         // Scope Leases
         let mut stmt_leases = conn.prepare("SELECT id, task_id, agent_id, pattern, access_type, expires_at, created_at FROM scope_leases WHERE task_id = ?1").map_err(|e| e.to_string())?;
@@ -2757,8 +3270,8 @@ impl CoordinatorEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read scope lease row: {}", e))?;
 
         Ok(ContextPack {
             project_id: proj_ctx.project_id,
@@ -2809,61 +3322,91 @@ impl CoordinatorEngine {
             })
         };
 
-        // Cancel all unmerged in-flight tasks and release scopes for the project
+        // Cancel unmerged in-flight tasks bound to this specific masterplan
         let uncompleted_tasks: Vec<String> = {
             let conn = self.db.lock();
-            let mut stmt = conn
-                .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND state != 'DONE' AND state != 'CANCELLED'")
-                .map_err(|e| e.to_string())?;
-            let ids = stmt
-                .query_map([project_id], |r| r.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .collect();
-            ids
+            if let Some((ref plan_id, _)) = existing {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM tasks WHERE masterplan_id = ?1 AND state != 'DONE' AND state != 'CANCELLED'")
+                    .map_err(|e| e.to_string())?;
+                let ids = stmt
+                    .query_map([plan_id], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .flatten()
+                    .collect();
+                ids
+            } else {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND masterplan_id IS NULL AND state != 'DONE' AND state != 'CANCELLED'")
+                    .map_err(|e| e.to_string())?;
+                let ids = stmt
+                    .query_map([project_id], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .flatten()
+                    .collect();
+                ids
+            }
         };
 
         for tid in &uncompleted_tasks {
-            let _ = self.cancel_task(
+            self.cancel_task(
                 tid,
                 None,
                 Some("Masterplan created/updated with new specification text"),
-            );
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to cancel in-flight task '{}' during masterplan update: {}",
+                    tid, e
+                )
+            })?;
         }
 
         let (plan_id, plan_title, require_approval, is_active) = if let Some((id, old_text)) =
             existing
         {
-            let conn = self.db.lock();
+            let mut conn = self.db.lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+
             let rev_id = Uuid::new_v4().to_string();
-            let rev_num: i32 = conn.query_row(
-                "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM masterplan_revisions WHERE masterplan_id = ?1",
-                [&id],
-                |r| r.get(0),
-            ).unwrap_or(1);
+            let rev_num: i32 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM masterplan_revisions WHERE masterplan_id = ?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("Failed to compute masterplan revision number: {}", e))?;
 
-            let (existing_title, existing_approval, existing_active): (String, bool, bool) = conn.query_row(
-                "SELECT COALESCE(title, 'Masterplan'), COALESCE(require_milestone_approval, 1), COALESCE(is_active, 1) FROM masterplans WHERE id = ?1",
-                [&id],
-                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)? != 0)),
-            ).unwrap_or(("Masterplan".to_string(), true, true));
+            let (existing_title, existing_approval, existing_active): (String, bool, bool) = tx
+                .query_row(
+                    "SELECT COALESCE(title, 'Masterplan'), COALESCE(require_milestone_approval, 1), COALESCE(is_active, 1) FROM masterplans WHERE id = ?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)? != 0)),
+                )
+                .map_err(|e| format!("Failed to query existing masterplan metadata: {}", e))?;
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO masterplan_revisions (id, masterplan_id, project_id, revision_number, raw_text, reason, steps_snapshot_json, archived_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'User edited masterplan specification', '[]', ?6)",
                 rusqlite::params![rev_id, id, project_id, rev_num, old_text, now],
-            ).ok();
+            )
+            .map_err(|e| format!("Failed to insert masterplan revision: {}", e))?;
 
-            conn.execute(
+            tx.execute(
                 "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
                 [&id],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Failed to delete existing masterplan steps: {}", e))?;
 
-            conn.execute(
+            tx.execute(
                 "UPDATE masterplans SET raw_text = ?1, status = 'UNSORTED', target_step_count = ?2, max_steps_per_agent = ?3, is_active = ?4, updated_at = ?5 WHERE id = ?6",
                 params![raw_text, target_step_count, max_steps_per_agent, if existing_active { 1 } else { 0 }, now, id],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| format!("Failed to update masterplan: {}", e))?;
+
+            tx.commit()
+                .map_err(|e| format!("Failed to commit masterplan update transaction: {}", e))?;
+
             (id, existing_title, existing_approval, existing_active)
         } else {
             let id = Uuid::new_v4().to_string();
@@ -3196,7 +3739,9 @@ impl CoordinatorEngine {
             })
             .map_err(|e| e.to_string())?;
 
-        let res: Vec<MasterplanStep> = rows.flatten().collect();
+        let res: Vec<MasterplanStep> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read masterplan step row: {}", e))?;
         drop(stmt);
         drop(conn);
 
@@ -3242,7 +3787,8 @@ impl CoordinatorEngine {
             })
             .map_err(|e| e.to_string())?;
 
-        Ok(rows.flatten().collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read masterplan step row: {}", e))
     }
 
     pub fn decompose_masterplan(
@@ -3256,30 +3802,65 @@ impl CoordinatorEngine {
             return Err("Cannot decompose masterplan with empty step list".to_string());
         }
 
+        let mut seen_indexes = std::collections::HashSet::new();
+        for s in &steps {
+            if s.step_index <= 0 {
+                return Err(format!(
+                    "Invalid step_index {}: step index must be positive (> 0)",
+                    s.step_index
+                ));
+            }
+            if !seen_indexes.insert(s.step_index) {
+                return Err(format!(
+                    "Duplicate step_index {} detected in decomposition payload",
+                    s.step_index
+                ));
+            }
+        }
+
         let plan = self
             .get_masterplan(project_id)?
             .ok_or_else(|| format!("No masterplan found for project '{}'", project_id))?;
 
-        // D22: If an idempotency key is provided, check for a stored result.
-        // Reuse of the same key with the same plan returns stored steps;
-        // reuse with a different plan is rejected.
-        if let Some(ref key) = idempotency_key {
-            let conn = self.db.lock();
-            let existing: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT masterplan_id, result_json FROM masterplan_operations WHERE idempotency_key = ?1",
-                    [key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .ok();
-            drop(conn);
+        let is_append = append.unwrap_or(false);
+        let mut conn = self.db.lock();
+        let now = Utc::now().to_rfc3339();
 
-            if let Some((stored_plan_id, result_json)) = existing {
+        let steps_json = serde_json::to_string(&steps).map_err(|e| e.to_string())?;
+        let mut hasher = Sha256::new();
+        hasher.update(steps_json.as_bytes());
+        let request_hash = hex::encode(hasher.finalize());
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start transaction: {}", e))?;
+
+        // Invariant 4 & K: If an idempotency key is provided, check for a stored result inside the transaction.
+        // Identical retry returns stored steps; conflicting retry with different payload is rejected.
+        if let Some(ref key) = idempotency_key {
+            let existing: Option<(String, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT masterplan_id, result_json, request_hash FROM masterplan_operations WHERE idempotency_key = ?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to check idempotency key: {}", e))?;
+
+            if let Some((stored_plan_id, result_json, stored_hash)) = existing {
                 if stored_plan_id != plan.id {
                     return Err(format!(
                         "Idempotency key '{}' is already bound to masterplan '{}', cannot reuse with masterplan '{}'",
                         key, stored_plan_id, plan.id
                     ));
+                }
+                if let Some(ref sh) = stored_hash {
+                    if sh != &request_hash {
+                        return Err(format!(
+                            "Conflicting retry: idempotency key '{}' reused with different step contents",
+                            key
+                        ));
+                    }
                 }
                 let stored_steps: Vec<MasterplanStep> = serde_json::from_str(&result_json)
                     .map_err(|e| {
@@ -3289,68 +3870,88 @@ impl CoordinatorEngine {
             }
         }
 
-        let is_append = append.unwrap_or(false);
-        let mut conn = self.db.lock();
-        let now = Utc::now().to_rfc3339();
+        if is_append {
+            // Invariant check L: In append mode, never overwrite a CLAIMED or COMPLETED step unless it is an identical retry
+            for s in &steps {
+                let existing: Option<(String, String, String)> = tx
+                    .query_row(
+                        "SELECT status, title, description FROM masterplan_steps WHERE masterplan_id = ?1 AND step_index = ?2",
+                        rusqlite::params![plan.id, s.step_index],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Failed to query step #{} status in masterplan: {}", s.step_index, e))?;
 
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Failed to start transaction: {}", e))?;
-
-        // Invariant check 1: Reject hostile re-decomposition if active claims exist, but allow idempotent retries
-        let active_claims: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status != 'PENDING'",
-                [&plan.id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
-        if active_claims > 0 {
-            // Check for idempotent retry: if existing step count and step titles match
-            let mut stmt_chk = tx.prepare("SELECT step_index, title FROM masterplan_steps WHERE masterplan_id = ?1 ORDER BY step_index ASC").map_err(|e| e.to_string())?;
-            let existing_chk: Vec<(i32, String)> = stmt_chk
-                .query_map([&plan.id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .collect();
-            drop(stmt_chk);
-
-            if existing_chk.len() == steps.len() {
-                let is_identical = existing_chk
-                    .iter()
-                    .zip(&steps)
-                    .all(|(ext, inc)| ext.0 == inc.step_index && ext.1.trim() == inc.title.trim());
-                if is_identical {
-                    drop(tx);
-                    drop(conn);
-                    return self.list_masterplan_steps_by_plan_id(&plan.id);
+                if let Some((status, existing_title, existing_desc)) = existing {
+                    if status != "PENDING" {
+                        // Allow identical retry of already claimed/completed step without error, but reject any modification
+                        let is_identical = existing_title.trim() == s.title.trim()
+                            && existing_desc.trim() == s.description.trim();
+                        if !is_identical {
+                            return Err(format!(
+                                "Cannot overwrite step #{}: Step is already {} in masterplan",
+                                s.step_index, status
+                            ));
+                        }
+                    }
                 }
             }
+        } else {
+            // Invariant check 1: Reject hostile re-decomposition if active claims exist, but allow idempotent retries
+            let active_claims: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status != 'PENDING'",
+                    [&plan.id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("Failed to query active claims: {}", e))?;
 
-            return Err(format!(
-                "Cannot re-decompose masterplan: {} step(s) are actively claimed, in-progress, or completed. Reset the plan first via 'reset_masterplan' or submit active chunks.",
-                active_claims
-            ));
-        }
+            if active_claims > 0 {
+                let mut stmt_chk = tx
+                    .prepare(
+                        "SELECT step_index, title FROM masterplan_steps WHERE masterplan_id = ?1 ORDER BY step_index ASC",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let existing_chk: Vec<(i32, String)> = stmt_chk
+                    .query_map([&plan.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed to decode existing step check rows: {}", e))?;
+                drop(stmt_chk);
 
-        // Invariant check 2: Reject re-decomposition if any active non-stale tasks are currently in flight for the project
-        let active_project_tasks: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND state IN ('RUNNING', 'VERIFYING', 'VERIFIED', 'REVIEW', 'MERGE_READY') AND is_stale = 0",
-                [project_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+                if existing_chk.len() == steps.len() {
+                    let is_identical = existing_chk.iter().zip(&steps).all(|(ext, inc)| {
+                        ext.0 == inc.step_index && ext.1.trim() == inc.title.trim()
+                    });
+                    if is_identical {
+                        drop(tx);
+                        drop(conn);
+                        return self.list_masterplan_steps_by_plan_id(&plan.id);
+                    }
+                }
 
-        if active_project_tasks > 0 {
-            return Err(format!(
-                "Cannot re-decompose masterplan: {} active task(s) are currently in flight for project '{}'. Complete, submit, or cancel active tasks first (or call reset_masterplan).",
-                active_project_tasks, project_id
-            ));
-        }
+                return Err(format!(
+                    "Cannot re-decompose masterplan: {} step(s) are actively claimed, in-progress, or completed. Reset the plan first via 'reset_masterplan' or submit active chunks.",
+                    active_claims
+                ));
+            }
 
-        if !is_append {
+            // Invariant check 2: Reject re-decomposition if active tasks are in flight for this masterplan
+            let active_project_tasks: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE masterplan_id = ?1 AND state IN ('RUNNING', 'VERIFYING', 'VERIFIED', 'REVIEW', 'MERGE_READY') AND is_stale = 0",
+                    [&plan.id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("Failed to query active project tasks: {}", e))?;
+
+            if active_project_tasks > 0 {
+                return Err(format!(
+                    "Cannot re-decompose masterplan: {} active task(s) are currently in flight for masterplan '{}'. Complete, submit, or cancel active tasks first (or call reset_masterplan).",
+                    active_project_tasks, plan.id
+                ));
+            }
+
             tx.execute(
                 "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
                 [&plan.id],
@@ -3358,44 +3959,36 @@ impl CoordinatorEngine {
             .map_err(|e| e.to_string())?;
         }
 
-        let mut inserted_steps = Vec::new();
-
         for s in steps {
-            let step_id = Uuid::new_v4().to_string();
             let suggested_scope = s.suggested_scope.unwrap_or_else(|| "src/**".to_string());
             let criteria = s
                 .acceptance_criteria
                 .unwrap_or_else(|| "All automated tests pass".to_string());
 
             if is_append {
-                tx.execute(
-                    "DELETE FROM masterplan_steps WHERE masterplan_id = ?1 AND step_index = ?2",
-                    rusqlite::params![plan.id, s.step_index],
-                )
-                .ok();
+                let existing_id: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM masterplan_steps WHERE masterplan_id = ?1 AND step_index = ?2",
+                        rusqlite::params![plan.id, s.step_index],
+                        |r| r.get(0),
+                    )
+                    .ok();
+
+                if let Some(id) = existing_id {
+                    tx.execute(
+                        "UPDATE masterplan_steps SET title = ?1, description = ?2, suggested_scope = ?3, acceptance_criteria = ?4, updated_at = ?5 WHERE id = ?6 AND status = 'PENDING'",
+                        params![s.title, s.description, suggested_scope, criteria, now, id],
+                    ).map_err(|e| e.to_string())?;
+                    continue;
+                }
             }
 
+            let step_id = Uuid::new_v4().to_string();
             tx.execute(
                 "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'PENDING', ?8, ?8)",
                 params![step_id, plan.id, s.step_index, s.title, s.description, suggested_scope, criteria, now],
             ).map_err(|e| e.to_string())?;
-
-            inserted_steps.push(MasterplanStep {
-                id: step_id,
-                masterplan_id: plan.id.clone(),
-                step_index: s.step_index,
-                title: s.title,
-                description: s.description,
-                suggested_scope,
-                acceptance_criteria: criteria,
-                status: "PENDING".to_string(),
-                claimed_agent_id: None,
-                claimed_task_id: None,
-                completed_at: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            });
         }
 
         tx.execute(
@@ -3404,27 +3997,54 @@ impl CoordinatorEngine {
         )
         .map_err(|e| e.to_string())?;
 
+        // Query the complete resulting step list within the transaction for exactness
+        let mut stmt_res = tx.prepare(
+            "SELECT id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, claimed_agent_id, claimed_task_id, completed_at, created_at, updated_at
+             FROM masterplan_steps WHERE masterplan_id = ?1 ORDER BY step_index ASC"
+        ).map_err(|e| e.to_string())?;
+
+        let resulting_steps: Vec<MasterplanStep> = stmt_res
+            .query_map([&plan.id], |r| {
+                Ok(MasterplanStep {
+                    id: r.get(0)?,
+                    masterplan_id: r.get(1)?,
+                    step_index: r.get(2)?,
+                    title: r.get(3)?,
+                    description: r.get(4)?,
+                    suggested_scope: r.get(5)?,
+                    acceptance_criteria: r.get(6)?,
+                    status: r.get(7)?,
+                    claimed_agent_id: r.get(8)?,
+                    claimed_task_id: r.get(9)?,
+                    completed_at: r.get(10)?,
+                    created_at: r.get(11)?,
+                    updated_at: r.get(12)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode resulting step rows: {}", e))?;
+        drop(stmt_res);
+
+        // Invariant 4: Persist the idempotency record inside the exact same transaction before commit
+        if let Some(ref key) = idempotency_key {
+            let result_json = serde_json::to_string(&resulting_steps)
+                .map_err(|e| format!("Failed to serialize decomposition steps: {}", e))?;
+            tx.execute(
+                "INSERT INTO masterplan_operations (idempotency_key, masterplan_id, result_json, request_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(idempotency_key) DO UPDATE SET result_json = excluded.result_json, request_hash = excluded.request_hash",
+                params![key, plan.id, result_json, request_hash, now],
+            )
+            .map_err(|e| format!("Failed to record idempotency operation: {}", e))?;
+        }
+
         tx.commit()
             .map_err(|e| format!("Failed to commit masterplan decomposition: {}", e))?;
         drop(conn);
 
-        // D22: Store the decompose result for idempotency replay (best-effort;
-        // failure here is non-fatal since the decomposition already succeeded).
-        if let Some(ref key) = idempotency_key {
-            if let Ok(result_steps) = self.list_masterplan_steps_by_plan_id(&plan.id) {
-                if let Ok(result_json) = serde_json::to_string(&result_steps) {
-                    let conn = self.db.lock();
-                    let _ = conn.execute(
-                        "INSERT OR REPLACE INTO masterplan_operations (idempotency_key, masterplan_id, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-                        params![key, plan.id, result_json, now],
-                    );
-                }
-            }
-        }
+        self.emit_event(Some(project_id), None, None, "MASTERPLAN_DECOMPOSED", json!({ "total_steps": resulting_steps.len(), "status": "RESORTED", "is_append": is_append }));
 
-        self.emit_event(Some(project_id), None, None, "MASTERPLAN_DECOMPOSED", json!({ "total_steps": inserted_steps.len(), "status": "RESORTED", "is_append": is_append }));
-
-        self.list_masterplan_steps_by_plan_id(&plan.id)
+        Ok(resulting_steps)
     }
 
     /// Transactional, race-safe chunk reservation with complete compensation and atomic scope acquisition
@@ -3440,6 +4060,8 @@ impl CoordinatorEngine {
                 agent_id
             ));
         }
+
+        let (canonical_agent_id, ..) = Self::canonicalize_ide_identity(agent_id, "");
 
         let plan = self
             .get_masterplan(project_id)?
@@ -3461,18 +4083,18 @@ impl CoordinatorEngine {
         let mut conn = self.db.lock();
         let now = Utc::now().to_rfc3339();
 
-        // 1. Check active anti-hoarding limit inside transaction
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to start transaction: {}", e))?;
 
+        // 1. Check active anti-hoarding limit inside transaction (Fail-Closed)
         let currently_active: i64 = tx
             .query_row(
-                "SELECT COUNT(*) FROM masterplan_steps WHERE claimed_agent_id = ?1 AND status = 'CLAIMED'",
-                [agent_id],
+                "SELECT COUNT(*) FROM masterplan_steps WHERE (claimed_agent_id = ?1 OR claimed_agent_id = ?2) AND status = 'CLAIMED'",
+                [agent_id, &canonical_agent_id],
                 |r| r.get(0),
             )
-            .unwrap_or(0);
+            .map_err(|e| format!("Failed to query active claims for agent '{}': {}", agent_id, e))?;
 
         if currently_active >= plan.max_steps_per_agent as i64 {
             return Err(format!(
@@ -3484,7 +4106,7 @@ impl CoordinatorEngine {
         let allowed = (plan.max_steps_per_agent as i64 - currently_active).max(1) as i32;
         let count = requested_count.unwrap_or(allowed).min(allowed).max(1);
 
-        // 2. Select and atomically reserve pending steps
+        // 2. Select pending steps (Fail-Closed)
         let mut stmt = tx
             .prepare("SELECT id, step_index, title, description, suggested_scope, acceptance_criteria FROM masterplan_steps WHERE masterplan_id = ?1 AND status = 'PENDING' ORDER BY step_index ASC LIMIT ?2")
             .map_err(|e| e.to_string())?;
@@ -3503,8 +4125,10 @@ impl CoordinatorEngine {
             .map_err(|e| e.to_string())?;
 
         let mut reserved_steps = Vec::new();
-        for r in reserved_steps_iter.flatten() {
-            reserved_steps.push(r);
+        for r in reserved_steps_iter {
+            let step =
+                r.map_err(|e| format!("Failed to read pending masterplan step row: {}", e))?;
+            reserved_steps.push(step);
         }
         drop(stmt);
 
@@ -3512,20 +4136,17 @@ impl CoordinatorEngine {
             return Err("No pending steps available in masterplan. All steps are either claimed or completed.".to_string());
         }
 
-        let step_ids: Vec<String> = reserved_steps.iter().map(|(id, ..)| id.clone()).collect();
-        for id in &step_ids {
-            tx.execute(
-                "UPDATE masterplan_steps SET status = 'CLAIMED', claimed_agent_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![agent_id, now, id],
-            ).map_err(|e| e.to_string())?;
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Failed to commit step reservation: {}", e))?;
-        drop(conn);
-
         let first_idx = reserved_steps.first().unwrap().1;
         let last_idx = reserved_steps.last().unwrap().1;
+
+        let total_pending: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status = 'PENDING'",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Failed to query pending step count: {}", e))?;
+        let is_final_chunk = total_pending <= reserved_steps.len() as i64;
 
         let task_title = format!(
             "Masterplan Chunk: Steps {}-{} ({})",
@@ -3551,97 +4172,221 @@ impl CoordinatorEngine {
             .map(|(.., crit)| crit.clone())
             .collect();
 
-        let is_final_chunk = {
-            let conn = self.db.lock();
-            let remaining_pending: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1 AND status = 'PENDING'",
-                [&plan.id],
-                |r| r.get(0),
-            ).unwrap_or(0);
-            remaining_pending == 0
-        };
-
         let mut final_desc = task_desc;
         let mut final_criteria = criteria;
         if is_final_chunk {
-            final_desc.push_str("\n\n=================================================================\nFINAL RELEASE DELIVERY REQUIREMENTS (Final Masterplan Chunk):\nAs the agent completing the final step(s) of this masterplan, you must perform the Final Release Delivery:\n1. Build the production bundle / executable.\n2. Create or verify the automated launcher script (`run.bat` for Windows / `start.sh` for Unix or tech-stack launcher).\n3. Test and verify that the application launches successfully.\n4. Create or update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the complete application architecture, configuration, and exact step-by-step instructions on how to use the entire application.\n5. Commit all launcher scripts, build artifacts, and guide documentation before calling `task_submit`.\n=================================================================");
-            final_criteria.push("Automated launcher script (e.g. run.bat) created and tested, and comprehensive USER_GUIDE.md created".to_string());
+            final_desc.push_str("\n\n=================================================================\nFINAL RELEASE DELIVERY REQUIREMENTS (Final Masterplan Chunk):\nAs the agent completing the final step(s) of this masterplan, you must perform the Final Release Delivery:\n1. Build the production bundle / executable.\n2. Create or verify the automated launcher script (`run.bat` for Windows / `start.sh` for Unix or tech-stack launcher).\n   - Windows launcher MUST resolve paths from script location (`cd /d \"%~dp0\"`), check exit status on dependency install/build (`if %errorlevel% neq 0 pause`), start server, and auto-open the browser (`start http://localhost:<port>`).\n3. Test and verify that the application launches successfully.\n4. Create or update a comprehensive user manual (`USER_GUIDE.md` / `HOW_TO_USE.md`) explaining the complete application architecture, configuration, and exact step-by-step instructions on how to use the entire application.\n5. Commit all launcher scripts, build artifacts, and guide documentation before calling `task_submit`.\n=================================================================");
+            final_criteria.push("Automated launcher script (e.g. run.bat with cd /d %~dp0 and errorlevel checks) created and tested, and comprehensive USER_GUIDE.md created".to_string());
         }
 
-        // 3. Create and Claim Task with atomic scope lease acquisition and complete rollback on collision
-        let mut created_task_id: Option<String> = None;
-        let task_res = (|| -> Result<Task, String> {
-            let task = self.create_task_internal(
-                project_id,
-                Some(&plan.id),
-                None,
-                &task_title,
-                &final_desc,
-                "HIGH",
-                task_steps,
-                final_criteria,
-            )?;
-            created_task_id = Some(task.id.clone());
+        let task_id = Uuid::new_v4().to_string();
 
-            let claimed_task = self.claim_task(&task.id, agent_id)?;
+        let (proj_path, target_branch): (String, String) = tx
+            .query_row(
+                "SELECT path, target_branch FROM projects WHERE id = ?1",
+                [project_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("Project '{}' not found: {}", project_id, e))?;
 
-            let scope_patterns: Vec<String> = reserved_steps
-                .iter()
-                .map(|(.., scope, _)| scope.clone())
-                .filter(|s| !s.trim().is_empty())
-                .collect();
+        let repo_path = Path::new(&proj_path);
+        let branch_name = format!("agentxflow/task-{}", task_id);
+        let worktree_dir = self
+            .worktrees_root
+            .join(project_id)
+            .join(format!("task-{}", task_id));
+        let worktree_path_str = worktree_dir.to_string_lossy().to_string();
 
-            if !scope_patterns.is_empty() {
-                // Authoritative atomic scope acquisition: failure bubbles immediately (NO .ok() silent ignore)
-                self.scope.acquire_scope(
-                    &claimed_task.id,
-                    agent_id,
-                    scope_patterns,
-                    "EXCLUSIVE_WRITE",
-                )?;
-            }
-
-            Ok(claimed_task)
-        })();
-
-        match task_res {
-            Ok(claimed_task) => {
-                let conn = self.db.lock();
-                for id in &step_ids {
-                    conn.execute(
-                        "UPDATE masterplan_steps SET claimed_task_id = ?1 WHERE id = ?2",
-                        params![claimed_task.id, id],
-                    )
-                    .ok();
-                }
-                conn.execute(
-                    "UPDATE masterplans SET status = 'EXECUTING', updated_at = ?1 WHERE id = ?2",
-                    params![now, plan.id],
+        let base_sha = self
+            .git
+            .get_ref_sha(repo_path, &target_branch)
+            .map_err(|e| {
+                format!(
+                    "Failed to resolve base commit '{}' for claim of task '{}': {}",
+                    target_branch, task_id, e
                 )
-                .ok();
-                Ok(claimed_task)
-            }
-            Err(err) => {
-                // Complete Compensation:
-                // 1. If task was created, release scopes, remove worktree, and cancel task
-                if let Some(ref tid) = created_task_id {
-                    let _ = self.cancel_task(
-                        tid,
-                        Some(agent_id),
-                        Some("Claim failed during scope acquisition or initialization"),
-                    );
-                }
-                // 2. Revert reserved steps back to PENDING
-                let conn = self.db.lock();
-                for id in &step_ids {
-                    conn.execute(
-                        "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL WHERE id = ?1",
-                        [id],
-                    ).ok();
-                }
-                Err(format!("Failed to claim masterplan chunk: {}", err))
+            })?;
+
+        // 3. Insert Task in CLAIMING state into tasks table on tx
+        tx.execute(
+            "INSERT INTO tasks (id, project_id, masterplan_id, masterplan_revision_id, title, description, state, substate, priority, is_stale, assigned_agent_id, worktree_path, branch_name, base_sha, created_at, updated_at)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'CLAIMING', 'CLAIMING', 'HIGH', 0, ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![task_id, project_id, plan.id, task_title, final_desc, canonical_agent_id, worktree_path_str, branch_name, base_sha, now],
+        ).map_err(|e| format!("Failed to insert chunk task: {}", e))?;
+
+        // Insert task_steps
+        for (idx, (step_title, step_desc, is_mand)) in task_steps.into_iter().enumerate() {
+            let step_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO task_steps (id, task_id, order_index, title, description, is_mandatory, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING')",
+                params![step_id, task_id, idx as i32 + 1, step_title, step_desc, is_mand],
+            ).map_err(|e| format!("Failed to insert task step: {}", e))?;
+        }
+
+        // Insert acceptance criteria
+        for crit in final_criteria {
+            let crit_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO acceptance_criteria (id, task_id, criterion, is_satisfied, is_locked)
+                 VALUES (?1, ?2, ?3, 0, 0)",
+                params![crit_id, task_id, crit],
+            )
+            .map_err(|e| format!("Failed to insert acceptance criterion: {}", e))?;
+        }
+
+        // 4. Atomic Scope Lease Acquisition on tx
+        let scope_patterns: Vec<String> = reserved_steps
+            .iter()
+            .map(|(.., scope, _)| scope.clone())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+
+        if !scope_patterns.is_empty() {
+            self.scope.acquire_scope_tx(
+                &tx,
+                &task_id,
+                &canonical_agent_id,
+                scope_patterns,
+                "EXCLUSIVE_WRITE",
+            )?;
+        }
+
+        // 5. Authoritatively bind masterplan steps to task_id on tx
+        for (id, _idx, title, ..) in &reserved_steps {
+            let rows_affected = tx
+                .execute(
+                    "UPDATE masterplan_steps SET status = 'CLAIMED', claimed_agent_id = ?1, claimed_task_id = ?2, updated_at = ?3 WHERE id = ?4 AND status = 'PENDING'",
+                    params![canonical_agent_id, task_id, now, id],
+                )
+                .map_err(|e| e.to_string())?;
+            if rows_affected != 1 {
+                return Err(format!(
+                    "Step {} ('{}') is no longer pending (concurrent claim)",
+                    id, title
+                ));
             }
         }
+
+        // 6. Update masterplan status to EXECUTING
+        tx.execute(
+            "UPDATE masterplans SET status = 'EXECUTING', updated_at = ?1 WHERE id = ?2",
+            params![now, plan.id],
+        )
+        .map_err(|e| format!("Failed to update masterplan status: {}", e))?;
+
+        // 7. Commit the entire atomic reservation transaction
+        tx.commit()
+            .map_err(|e| format!("Failed to commit chunk claim transaction: {}", e))?;
+        drop(conn);
+
+        // 8. Cut isolated Git worktree on disk
+        if worktree_dir.exists() {
+            let managed_roots = vec![self.worktrees_root.clone(), repo_path.join(".agentxflow")];
+            if self
+                .git
+                .is_managed_worktree(repo_path, &managed_roots, &worktree_dir)
+            {
+                let _ = self
+                    .git
+                    .remove_worktree(repo_path, &managed_roots, &worktree_dir);
+                let _ = crate::git::GitService::safe_remove_dir_all(&worktree_dir);
+            } else {
+                warn!(
+                    "Refusing to remove unmanaged path {:?} during chunk claim re-cut",
+                    worktree_dir
+                );
+            }
+        }
+
+        if let Err(e) =
+            self.git
+                .create_worktree(repo_path, &worktree_dir, &branch_name, &target_branch)
+        {
+            // Rollback on worktree failure: cancel task and restore steps to PENDING
+            let conn = self.db.lock();
+            let _ = cancel_task_inner(
+                &conn,
+                &task_id,
+                None,
+                Some("Worktree creation failed during masterplan chunk claim"),
+            );
+            return Err(format!(
+                "Failed to create worktree for chunk task '{}': {}",
+                task_id, e
+            ));
+        }
+
+        // 9. Worktree ready: transition task state to RUNNING
+        {
+            let conn = self.db.lock();
+            let transition_res = transition_task_state_on_conn(
+                &conn,
+                &task_id,
+                &[TaskState::Claiming, TaskState::Backlog],
+                TaskState::Running,
+            );
+            match transition_res {
+                Ok(()) => {
+                    if let Err(e) = conn.execute(
+                        "UPDATE tasks SET substate = 'NONE', updated_at = ?1 WHERE id = ?2",
+                        [&now, &task_id],
+                    ) {
+                        let _ = conn.execute(
+                            "UPDATE tasks SET state = 'BLOCKED', substate = 'RECOVERABLE', updated_at = ?1 WHERE id = ?2",
+                            [&now, &task_id],
+                        );
+                        drop(conn);
+                        self.emit_event(
+                            Some(project_id),
+                            Some(&task_id),
+                            Some(&canonical_agent_id),
+                            "TASK_CLAIM_FINALIZATION_FAILED",
+                            json!({ "task_id": task_id, "error": e.to_string() }),
+                        );
+                        return Err(format!("Failed to finalize task claim in database: {}", e));
+                    }
+                }
+                Err(e) => {
+                    let _ = conn.execute(
+                        "UPDATE tasks SET state = 'BLOCKED', substate = 'RECOVERABLE', updated_at = ?1 WHERE id = ?2",
+                        [&now, &task_id],
+                    );
+                    drop(conn);
+                    self.emit_event(
+                        Some(project_id),
+                        Some(&task_id),
+                        Some(&canonical_agent_id),
+                        "TASK_CLAIM_FINALIZATION_FAILED",
+                        json!({ "task_id": task_id, "error": e.to_string() }),
+                    );
+                    return Err(format!("Failed to transition task claim to RUNNING: {}", e));
+                }
+            }
+        }
+
+        self.emit_event(
+            Some(project_id),
+            Some(&task_id),
+            Some(&canonical_agent_id),
+            "TASK_CLAIMED",
+            json!({ "agent_id": canonical_agent_id, "chunk_steps": reserved_steps.len() }),
+        );
+        self.emit_event(
+            Some(project_id),
+            Some(&task_id),
+            Some(&canonical_agent_id),
+            "MASTERPLAN_CHUNK_CLAIMED",
+            json!({
+                "task_id": task_id,
+                "agent_id": canonical_agent_id,
+                "step_range": [first_idx, last_idx],
+                "step_count": reserved_steps.len(),
+                "is_final_chunk": is_final_chunk
+            }),
+        );
+
+        self.get_task(&task_id)
     }
 
     pub fn reset_masterplan(
@@ -3650,77 +4395,152 @@ impl CoordinatorEngine {
         masterplan_id: Option<&str>,
     ) -> Result<(), String> {
         let _now = Utc::now().to_rfc3339();
+        let is_explicit = masterplan_id.map(|s| !s.trim().is_empty()).unwrap_or(false);
 
-        // 1. Invalidate and cancel all in-flight / non-cancelled tasks for this project and release their scopes
-        let active_tasks: Vec<String> = {
+        // 1. Validate masterplan target and project boundary
+        let plan_ids: Vec<String> = {
             let conn = self.db.lock();
-            let mut stmt = conn
-                .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND state != 'CANCELLED'")
-                .map_err(|e| e.to_string())?;
-            let ids = stmt
-                .query_map([project_id], |r| r.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .collect();
-            ids
-        };
-
-        for tid in &active_tasks {
-            let _ = self.cancel_task(tid, None, Some("Masterplan was reset; task invalidated"));
-        }
-
-        // 2. Fetch and delete the target masterplan(s) and all their associated steps
-        let conn = self.db.lock();
-        let plan_ids: Vec<String> = if let Some(mp_id) = masterplan_id {
-            if !mp_id.trim().is_empty() {
-                vec![mp_id.to_string()]
+            if let Some(mp_id) = masterplan_id {
+                let trimmed = mp_id.trim();
+                if !trimmed.is_empty() {
+                    let plan_proj: Result<String, _> = conn.query_row(
+                        "SELECT project_id FROM masterplans WHERE id = ?1",
+                        [trimmed],
+                        |r| r.get(0),
+                    );
+                    match plan_proj {
+                        Ok(p_id) => {
+                            if p_id != project_id {
+                                return Err(format!(
+                                    "Masterplan '{}' belongs to project '{}', not '{}'",
+                                    trimmed, p_id, project_id
+                                ));
+                            }
+                            vec![trimmed.to_string()]
+                        }
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            return Err(format!("Masterplan '{}' not found", trimmed));
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to query masterplan '{}': {}", trimmed, e));
+                        }
+                    }
+                } else {
+                    let mut stmt = conn
+                        .prepare("SELECT id FROM masterplans WHERE project_id = ?1")
+                        .map_err(|e| e.to_string())?;
+                    let ids: Result<Vec<String>, _> = stmt
+                        .query_map([project_id], |r| r.get(0))
+                        .map_err(|e| e.to_string())?
+                        .collect();
+                    ids.map_err(|e| e.to_string())?
+                }
             } else {
                 let mut stmt = conn
                     .prepare("SELECT id FROM masterplans WHERE project_id = ?1")
                     .map_err(|e| e.to_string())?;
-                let ids = stmt
+                let ids: Result<Vec<String>, _> = stmt
                     .query_map([project_id], |r| r.get(0))
                     .map_err(|e| e.to_string())?
-                    .flatten()
                     .collect();
-                ids
+                ids.map_err(|e| e.to_string())?
             }
-        } else {
-            let mut stmt = conn
-                .prepare("SELECT id FROM masterplans WHERE project_id = ?1")
-                .map_err(|e| e.to_string())?;
-            let ids = stmt
-                .query_map([project_id], |r| r.get(0))
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .collect();
-            ids
         };
 
-        for pid in &plan_ids {
-            conn.execute(
-                "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
-                [pid],
-            )
-            .ok();
-            conn.execute("DELETE FROM masterplans WHERE id = ?1", [pid])
-                .ok();
-        }
-        drop(conn);
+        // 2. Invalidate and cancel only tasks belonging to the target masterplan(s)
+        let active_tasks: Vec<String> = {
+            let conn = self.db.lock();
+            if is_explicit {
+                let trimmed = masterplan_id.unwrap().trim();
+                let mut stmt = conn
+                    .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND masterplan_id = ?2 AND state NOT IN ('CANCELLED', 'DONE')")
+                    .map_err(|e| e.to_string())?;
+                let ids: Result<Vec<String>, _> = stmt
+                    .query_map(params![project_id, trimmed], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect();
+                ids.map_err(|e| e.to_string())?
+            } else {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND state NOT IN ('CANCELLED', 'DONE')")
+                    .map_err(|e| e.to_string())?;
+                let ids: Result<Vec<String>, _> = stmt
+                    .query_map([project_id], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect();
+                ids.map_err(|e| e.to_string())?
+            }
+        };
 
-        // On-disk cleanup: managed worktrees only. The user's primary checkout is a protected resource
-        // (master plan Invariant A) and is NEVER reset or cleaned by the coordinator.
+        // 2a. Preflight validation: verify all selected tasks are cancellable before mutating any task
+        for tid in &active_tasks {
+            let task = self
+                .get_task(tid)
+                .map_err(|e| format!("Preflight check failed for task '{}': {}", tid, e))?;
+            if task.state == TaskState::Done {
+                return Err(format!(
+                    "Preflight rejection: Cannot cancel task '{}': Task is already DONE (merged)",
+                    tid
+                ));
+            }
+        }
+
+        let mut cancellation_errors = Vec::new();
+        for tid in &active_tasks {
+            if let Err(e) =
+                self.cancel_task(tid, None, Some("Masterplan was reset; task invalidated"))
+            {
+                cancellation_errors.push(format!("Task '{}': {}", tid, e));
+            }
+        }
+
+        if !cancellation_errors.is_empty() {
+            return Err(format!(
+                "Cannot reset masterplan: failed to cancel active task(s): {}",
+                cancellation_errors.join("; ")
+            ));
+        }
+
+        // 3. Fetch and delete the target masterplan(s) and all their associated steps & revisions transactionally
+        {
+            let mut conn = self.db.lock();
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Failed to begin reset transaction: {}", e))?;
+            for pid in &plan_ids {
+                tx.execute(
+                    "DELETE FROM masterplan_steps WHERE masterplan_id = ?1",
+                    [pid],
+                )
+                .map_err(|e| format!("Failed to delete masterplan steps: {}", e))?;
+                tx.execute(
+                    "DELETE FROM masterplan_revisions WHERE masterplan_id = ?1",
+                    [pid],
+                )
+                .map_err(|e| format!("Failed to delete masterplan revisions: {}", e))?;
+                tx.execute("DELETE FROM masterplans WHERE id = ?1", [pid])
+                    .map_err(|e| format!("Failed to delete masterplan: {}", e))?;
+            }
+            tx.commit()
+                .map_err(|e| format!("Failed to commit masterplan reset: {}", e))?;
+        }
+
+        // 4. On-disk cleanup: managed worktrees only using hardened safe deletion.
+        // The user's primary checkout is a protected resource and is NEVER reset or cleaned.
         if let Ok(proj) = self.get_project(project_id) {
             let repo_path = Path::new(&proj.path);
-            let wt_dir = repo_path.join(".agentxflow").join("worktrees");
-            if wt_dir.exists() {
-                let _ = std::fs::remove_dir_all(&wt_dir);
+            if !is_explicit {
+                let wt_dir = repo_path.join(".agentxflow").join("worktrees");
+                if wt_dir.exists() {
+                    GitService::safe_remove_dir_all(&wt_dir).map_err(|e| {
+                        format!("Failed to clean worktrees directory {:?}: {}", wt_dir, e)
+                    })?;
+                }
             }
             // Prune git's worktree metadata for worktrees removed by cancel_task above.
-            let _ = self.git.run_git_cmd(repo_path, &["worktree", "prune"]);
-            // NOTE: the previous `git reset --hard HEAD` + `git clean -fd` on the primary checkout are GONE.
-            // Intentional, documented behavior change: reset wipes plan state + managed worktrees,
-            // never user files. Existing MCP/UI callers see the same return shape.
+            self.git
+                .run_git_cmd(repo_path, &["worktree", "prune"])
+                .map_err(|e| format!("Failed to prune git worktrees: {}", e))?;
         }
 
         self.emit_event(
@@ -3739,14 +4559,13 @@ impl CoordinatorEngine {
         let mut summaries = Vec::new();
 
         for proj in projects {
-            let mut stmt = match conn.prepare(
-                "SELECT id, COALESCE(title, 'Masterplan'), status, target_step_count, max_steps_per_agent, COALESCE(is_active, 0), updated_at
-                 FROM masterplans WHERE project_id = ?1
-                 ORDER BY is_active DESC, updated_at DESC",
-            ) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, COALESCE(title, 'Masterplan'), status, target_step_count, max_steps_per_agent, COALESCE(is_active, 0), updated_at
+                     FROM masterplans WHERE project_id = ?1
+                     ORDER BY is_active DESC, updated_at DESC",
+                )
+                .map_err(|e| format!("Failed to prepare masterplans query for project '{}': {}", proj.id, e))?;
 
             let plans: Vec<(String, String, String, i32, i32, bool, String)> = stmt
                 .query_map([&proj.id], |r| {
@@ -3760,8 +4579,19 @@ impl CoordinatorEngine {
                         r.get(6)?,
                     ))
                 })
-                .map(|iter| iter.flatten().collect())
-                .unwrap_or_default();
+                .map_err(|e| {
+                    format!(
+                        "Failed to query masterplans for project '{}': {}",
+                        proj.id, e
+                    )
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    format!(
+                        "Failed to read masterplan row for project '{}': {}",
+                        proj.id, e
+                    )
+                })?;
 
             for (
                 plan_id,
@@ -3773,16 +4603,29 @@ impl CoordinatorEngine {
                 updated_at,
             ) in plans
             {
-                let mut step_stmt = match conn
+                let mut step_stmt = conn
                     .prepare("SELECT status FROM masterplan_steps WHERE masterplan_id = ?1")
-                {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
+                    .map_err(|e| {
+                        format!(
+                            "Failed to prepare masterplan steps query for plan '{}': {}",
+                            plan_id, e
+                        )
+                    })?;
                 let step_statuses: Vec<String> = step_stmt
                     .query_map([&plan_id], |r| r.get(0))
-                    .map(|iter| iter.flatten().collect())
-                    .unwrap_or_default();
+                    .map_err(|e| {
+                        format!(
+                            "Failed to query step statuses for plan '{}': {}",
+                            plan_id, e
+                        )
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        format!(
+                            "Failed to read step status row for plan '{}': {}",
+                            plan_id, e
+                        )
+                    })?;
 
                 let total = step_statuses.len();
                 let pending = step_statuses
@@ -4007,27 +4850,172 @@ impl CoordinatorEngine {
     /// Reconciles task status, attempt, proof bundle, and merge queue health
     pub fn reconcile_task(&self, task_id: &str) -> Result<serde_json::Value, String> {
         let mut task = self.get_task(task_id)?;
+        let mut reconciliation_performed = false;
+
         let conn = self.db.lock();
-        let attempt: Option<(String, String)> = conn.query_row(
+        let attempt: Option<(String, String)> = match conn.query_row(
             "SELECT id, status FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
             [task_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        ).ok();
-        let has_proof: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM proof_bundles WHERE task_id = ?1",
-                [task_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        let queue_item: Option<(String, String, String)> = conn.query_row(
+        ) {
+            Ok(val) => Some(val),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                return Err(format!(
+                    "Database error reading task attempts for task '{}': {}",
+                    task_id, e
+                ));
+            }
+        };
+
+        let has_proof: bool = match conn.query_row(
+            "SELECT COUNT(*) > 0 FROM proof_bundles WHERE task_id = ?1",
+            [task_id],
+            |r| r.get(0),
+        ) {
+            Ok(val) => val,
+            Err(e) => {
+                return Err(format!(
+                    "Database error reading proof bundles for task '{}': {}",
+                    task_id, e
+                ));
+            }
+        };
+
+        let queue_item: Option<(String, String, String)> = match conn.query_row(
             "SELECT id, status, target_branch FROM merge_queue WHERE task_id = ?1 AND processed_at IS NULL",
             [task_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).ok();
+        ) {
+            Ok(val) => Some(val),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                return Err(format!(
+                    "Database error reading merge queue for task '{}': {}",
+                    task_id, e
+                ));
+            }
+        };
         drop(conn);
 
         let mut queue_status = queue_item.as_ref().map(|(_, status, _)| status.clone());
+
+        // Authoritative Git ancestor check: if the task commit was already merged into
+        // the target branch (e.g. Git CAS update-ref succeeded before SQLite finalization),
+        // converge SQLite state immediately to MERGED, DONE, and COMPLETED steps.
+        if task.state != TaskState::Done {
+            let projs = self.list_projects()?;
+            if let Some(project) = projs.into_iter().find(|p| p.id == task.project_id) {
+                if let Some(ref head_sha) = task.head_sha {
+                    if !head_sha.trim().is_empty() {
+                        let repo_path = Path::new(&project.path);
+                        let target_branch = queue_item
+                            .as_ref()
+                            .map(|(_, _, tb)| tb.as_str())
+                            .unwrap_or(&project.target_branch);
+
+                        let anc_check = self.git.is_ancestor(repo_path, head_sha, target_branch);
+                        match anc_check {
+                            Ok(crate::git::GitAncestorResult::Ancestor) => {
+                                let mut conn = self.db.lock();
+                                let tx = conn.transaction().map_err(|e| {
+                                    format!("Failed to start reconciliation transaction: {}", e)
+                                })?;
+                                let now = Utc::now().to_rfc3339();
+
+                                tx.execute(
+                                    "UPDATE merge_queue SET status = 'MERGED', processed_at = ?1 WHERE task_id = ?2",
+                                    params![now, task_id],
+                                )
+                                .map_err(|e| format!("Failed to update merge queue in reconciliation: {}", e))?;
+
+                                transition_task_state_on_conn(
+                                    &tx,
+                                    task_id,
+                                    &[
+                                        TaskState::Backlog,
+                                        TaskState::Ready,
+                                        TaskState::Running,
+                                        TaskState::Verifying,
+                                        TaskState::Verified,
+                                        TaskState::Review,
+                                        TaskState::MergeReady,
+                                        TaskState::Blocked,
+                                    ],
+                                    TaskState::Done,
+                                )
+                                .map_err(|e| {
+                                    format!(
+                                        "Failed to transition task to DONE in reconciliation: {}",
+                                        e
+                                    )
+                                })?;
+
+                                tx.execute(
+                                    "UPDATE tasks SET substate = 'NONE', updated_at = ?1 WHERE id = ?2",
+                                    params![now, task_id],
+                                )
+                                .map_err(|e| format!("Failed to clear task substate: {}", e))?;
+
+                                tx.execute(
+                                    "UPDATE masterplan_steps SET status = 'COMPLETED', completed_at = ?1, updated_at = ?1 WHERE claimed_task_id = ?2 AND status != 'COMPLETED'",
+                                    params![now, task_id],
+                                )
+                                .map_err(|e| format!("Failed to complete masterplan steps: {}", e))?;
+
+                                let pending_remaining: i64 = tx
+                                    .query_row(
+                                        "SELECT COUNT(*) FROM masterplan_steps ms
+                                     JOIN masterplans mp ON ms.masterplan_id = mp.id
+                                     WHERE mp.project_id = ?1 AND ms.status != 'COMPLETED'",
+                                        [&task.project_id],
+                                        |r| r.get(0),
+                                    )
+                                    .map_err(|e| {
+                                        format!("Failed to count remaining masterplan steps: {}", e)
+                                    })?;
+
+                                if pending_remaining == 0 {
+                                    tx.execute(
+                                        "UPDATE masterplans SET status = 'COMPLETED', updated_at = ?1 WHERE project_id = ?2",
+                                        params![now, &task.project_id],
+                                    )
+                                    .map_err(|e| format!("Failed to complete masterplan: {}", e))?;
+                                }
+
+                                tx.execute(
+                                    "DELETE FROM scope_leases WHERE task_id = ?1",
+                                    [task_id],
+                                )
+                                .map_err(|e| format!("Failed to release scope leases: {}", e))?;
+
+                                tx.commit().map_err(|e| {
+                                    format!("Failed to commit reconciliation transaction: {}", e)
+                                })?;
+                                drop(conn);
+
+                                task.state = TaskState::Done;
+                                queue_status = Some("MERGED".to_string());
+                                reconciliation_performed = true;
+                            }
+                            Ok(crate::git::GitAncestorResult::NotAncestor) => {
+                                // Task commit is not in target branch; no Git merge convergence needed
+                            }
+                            Err(e) => {
+                                let is_invalid_head = e.contains("Not a valid commit name")
+                                    || e.contains("not a valid commit name");
+                                if !is_invalid_head {
+                                    return Err(format!(
+                                        "Unable to determine authoritative Git merge status for task '{}': {}",
+                                        task_id, e
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // A verified task can become stale while an earlier FIFO candidate is
         // merged. Rebase the queue expectation to the current target and let
@@ -4046,37 +5034,54 @@ impl CoordinatorEngine {
                 let target_sha = self
                     .git
                     .get_ref_sha(Path::new(&project.path), target_branch)?;
-                let conn = self.db.lock();
-                conn.execute(
+                let mut conn = self.db.lock();
+                let tx = conn
+                    .transaction()
+                    .map_err(|e| format!("Failed to begin queue rebase transaction: {}", e))?;
+                tx.execute(
                     "UPDATE merge_queue SET base_sha = ?1, status = 'READY' WHERE id = ?2 AND status = 'STALE'",
                     params![target_sha, queue_id],
-                ).map_err(|e| e.to_string())?;
+                ).map_err(|e| format!("Failed to update queue base_sha: {}", e))?;
                 transition_task_state_on_conn(
-                    &conn,
+                    &tx,
                     task_id,
                     &[TaskState::Blocked],
                     TaskState::MergeReady,
                 )
-                .map_err(|e| e.to_string())?;
-                conn.execute(
+                .map_err(|e| format!("Failed to transition task to MERGE_READY: {}", e))?;
+                tx.execute(
                     "UPDATE tasks SET substate = 'NONE' WHERE id = ?1",
                     params![task_id],
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Failed to update task substate: {}", e))?;
+                tx.commit()
+                    .map_err(|e| format!("Failed to commit queue rebase: {}", e))?;
                 drop(conn);
                 task.state = TaskState::MergeReady;
                 queue_status = Some("READY".to_string());
+                reconciliation_performed = true;
             }
         }
 
         // Auto-heal if MERGE_READY but not enqueued
-        if task.state == TaskState::MergeReady && queue_status.is_none() {
-            let _ = self.enqueue_task_by_id(&task.project_id, task_id);
+        if task.state == TaskState::MergeReady
+            && queue_status.is_none()
+            && self.enqueue_task_by_id(&task.project_id, task_id).is_ok()
+        {
+            reconciliation_performed = true;
         }
+
+        let state_repr =
+            if task.state == TaskState::Backlog && task.substate == TaskSubstate::Claiming {
+                "CLAIMING"
+            } else {
+                task.state.as_str()
+            };
 
         Ok(serde_json::json!({
             "task_id": task.id,
-            "state": task.state.as_str(),
+            "state": state_repr,
+            "reconciliation_status": if reconciliation_performed { "SUCCESSFULLY_RECONCILED" } else { "NO_REPAIR_NEEDED" },
             "attempt": attempt.map(|(id, st)| serde_json::json!({ "attempt_id": id, "status": st })),
             "has_proof_bundle": has_proof,
             "merge_queue_status": queue_status.unwrap_or_else(|| "NOT_ENQUEUED".to_string()),
@@ -4141,13 +5146,14 @@ impl CoordinatorEngine {
 
         // 1. If caller has an active running task, prioritize caller task context
         if let Some(agent_id) = caller_agent_id {
+            let (canon_caller, ..) = Self::canonicalize_ide_identity(agent_id, "");
             let active_task_opt: Option<(String, String, String, String, Option<String>, Option<String>)> = conn
                 .query_row(
                     "SELECT t.id, t.project_id, t.title, t.state, t.worktree_path, p.name FROM tasks t
                      JOIN projects p ON t.project_id = p.id
-                     WHERE t.assigned_agent_id = ?1 AND t.state IN ('RUNNING', 'CLAIMING', 'VERIFYING') AND t.is_stale = 0
+                     WHERE (t.assigned_agent_id = ?1 OR t.assigned_agent_id = ?2) AND t.state IN ('RUNNING', 'CLAIMING', 'VERIFYING') AND t.is_stale = 0
                      ORDER BY t.updated_at DESC LIMIT 1",
-                    [agent_id],
+                    [agent_id, &canon_caller],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )
                 .ok();
@@ -4167,10 +5173,9 @@ impl CoordinatorEngine {
                 let rows = stmt_scopes
                     .query_map([&task_id], |r| r.get(0))
                     .map_err(|e| e.to_string())?;
-                let mut active_scopes: Vec<String> = Vec::new();
-                for pattern in rows.flatten() {
-                    active_scopes.push(pattern);
-                }
+                let active_scopes: Vec<String> = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed to read active scope lease row: {}", e))?;
                 drop(stmt_scopes);
 
                 let active_attempt_id: Option<String> = conn
@@ -4303,6 +5308,238 @@ impl CoordinatorEngine {
             }
         }
     }
+
+    /// Problem 7: Authoritatively resolves the active worktree path for a task,
+    /// verifying caller ownership and ensuring the directory exists on disk.
+    pub fn get_task_workspace_path(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let conn = self.db.lock();
+        let (worktree_path, assigned_agent): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT worktree_path, assigned_agent_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?;
+        drop(conn);
+
+        // Caller authorization check
+        if !agent_id.is_empty()
+            && agent_id != "master"
+            && agent_id != "system"
+            && agent_id != "coordinator"
+        {
+            if let Some(ref assigned) = assigned_agent {
+                let (canon_assigned, ..) = Self::canonicalize_ide_identity(assigned, "");
+                let (canon_caller, ..) = Self::canonicalize_ide_identity(agent_id, "");
+                if assigned != agent_id && canon_assigned != canon_caller {
+                    return Err(format!(
+                        "Task ownership violation: Task '{}' belongs to agent '{}', caller is '{}'",
+                        task_id, assigned, agent_id
+                    ));
+                }
+            } else {
+                return Err(format!("Task '{}' is not assigned to any agent", task_id));
+            }
+        }
+
+        let wt_str = worktree_path
+            .ok_or_else(|| format!("Task '{}' has no worktree allocated yet", task_id))?;
+        let wt_path = std::path::PathBuf::from(wt_str);
+        if !wt_path.exists() {
+            return Err(format!(
+                "Task '{}' worktree path '{:?}' does not exist on disk",
+                task_id, wt_path
+            ));
+        }
+
+        Ok(wt_path)
+    }
+
+    /// Safely resolves and prevents directory traversal outside the task worktree
+    fn resolve_worktree_relative_path(
+        worktree_root: &Path,
+        relative_path: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let clean = relative_path.replace('\\', "/");
+        let clean = clean.trim_start_matches("./").trim_start_matches('/');
+
+        // Reject paths containing parent navigation components
+        for seg in clean.split('/') {
+            if seg == ".." {
+                return Err(format!(
+                    "Path traversal prohibited: relative path '{}' contains '..' segments",
+                    relative_path
+                ));
+            }
+        }
+
+        let target = worktree_root.join(clean);
+        Ok(target)
+    }
+
+    /// Problem 7: Reads a file from the task's authoritative isolated worktree
+    pub fn task_workspace_read(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        relative_path: &str,
+    ) -> Result<String, String> {
+        let worktree_dir = self.get_task_workspace_path(task_id, agent_id)?;
+        let target_file = Self::resolve_worktree_relative_path(&worktree_dir, relative_path)?;
+
+        if !crate::git::path_is_under_root(&target_file, &worktree_dir) {
+            return Err(format!(
+                "Path traversal prohibited: path '{}' escapes worktree boundary",
+                relative_path
+            ));
+        }
+
+        if !target_file.exists() {
+            return Err(format!(
+                "File '{}' not found in task worktree",
+                relative_path
+            ));
+        }
+
+        std::fs::read_to_string(&target_file)
+            .map_err(|e| format!("Failed to read file '{}': {}", relative_path, e))
+    }
+
+    /// Problem 7: Writes a file in the task's authoritative isolated worktree,
+    /// enforcing directory containment and write scope lease coverage.
+    pub fn task_workspace_write(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        relative_path: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let worktree_dir = self.get_task_workspace_path(task_id, agent_id)?;
+        let target_file = Self::resolve_worktree_relative_path(&worktree_dir, relative_path)?;
+
+        if !crate::git::path_is_under_root(&target_file, &worktree_dir) {
+            return Err(format!(
+                "Path traversal prohibited: path '{}' escapes worktree boundary",
+                relative_path
+            ));
+        }
+
+        let norm_path = relative_path.replace('\\', "/");
+        let clean_path = norm_path
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+
+        // Check write scope restrictions (fail-closed)
+        let violations = self.scope.audit_attempt_mutations(
+            task_id,
+            None,
+            agent_id,
+            std::slice::from_ref(&clean_path),
+        )?;
+
+        if !violations.is_empty() {
+            return Err(format!(
+                "Scope violation: File '{}' is not covered by any active exclusive write scope lease for task '{}'",
+                clean_path, task_id
+            ));
+        }
+
+        let project_id: String = {
+            let conn = self.db.lock();
+            conn.query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?
+        };
+
+        // Policy engine guardrail evaluation
+        let (action, reason) = self.policy.evaluate_hook(&project_id, "pre-mutation", &clean_path)?;
+        if action == "DENY" {
+            return Err(format!(
+                "Policy violation: file write to '{}' denied: {}",
+                clean_path,
+                reason.unwrap_or_else(|| "Blocked by security policy".to_string())
+            ));
+        }
+
+        if let Some(parent) = target_file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "Failed to create parent directory for '{}': {}",
+                    relative_path, e
+                )
+            })?;
+        }
+
+        std::fs::write(&target_file, content)
+            .map_err(|e| format!("Failed to write file '{}': {}", relative_path, e))
+    }
+
+    /// Problem 7: Executes a command strictly inside the task's worktree with bounded timeout
+    pub fn task_workspace_exec(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        command: &str,
+        args: Option<Vec<String>>,
+        timeout_secs: Option<u64>,
+    ) -> Result<crate::models::VerificationRun, String> {
+        let worktree_dir = self.get_task_workspace_path(task_id, agent_id)?;
+
+        let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(60).clamp(1, 300));
+        let full_cmd = if let Some(args_vec) = args {
+            if args_vec.is_empty() {
+                command.to_string()
+            } else {
+                let args_json = serde_json::to_string(&args_vec).unwrap_or_default();
+                crate::verification::build_command_with_args(command, &args_json)
+            }
+        } else {
+            command.to_string()
+        };
+
+        let project_id: String = {
+            let conn = self.db.lock();
+            conn.query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?
+        };
+
+        // Policy engine guardrail evaluation
+        let (action, reason) = self.policy.evaluate_hook(&project_id, "pre-command", &full_cmd)?;
+        if action == "DENY" {
+            return Err(format!(
+                "Policy violation: command execution '{}' denied: {}",
+                full_cmd,
+                reason.unwrap_or_else(|| "Blocked by security policy".to_string())
+            ));
+        }
+
+        let head_sha = self
+            .git
+            .get_head_sha(&worktree_dir)
+            .unwrap_or_else(|_| "HEAD".to_string());
+
+        self.verify.execute_check(
+            task_id,
+            "task_workspace_exec",
+            "WORKSPACE_EXEC",
+            &worktree_dir,
+            &head_sha,
+            &full_cmd,
+            timeout,
+        )
+    }
 }
 
 /// Validated task state transition on a caller-owned connection/transaction.
@@ -4361,17 +5598,51 @@ pub(crate) fn transition_task_state_on_conn(
 pub(crate) fn cancel_task_inner(
     conn: &rusqlite::Connection,
     task_id: &str,
+    caller_agent_id: Option<&str>,
     _reason: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(caller) = caller_agent_id {
+        let (state, assigned_agent): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, assigned_agent_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?;
+
+        if state == "DONE" {
+            return Err(format!(
+                "Cannot cancel task '{}': Task is already DONE (merged)",
+                task_id
+            ));
+        }
+
+        if let Some(ref assigned) = assigned_agent {
+            let (canon_assigned, ..) = CoordinatorEngine::canonicalize_ide_identity(assigned, "");
+            let (canon_caller, ..) = CoordinatorEngine::canonicalize_ide_identity(caller, "");
+            if !assigned.is_empty() && assigned != caller && canon_assigned != canon_caller {
+                return Err(format!(
+                    "Authorization error: Caller agent '{}' is not the owner of task '{}' (assigned to '{}')",
+                    caller, task_id, assigned
+                ));
+            }
+        } else {
+            return Err(format!(
+                "Authorization error: Cannot cancel unassigned task '{}'",
+                task_id
+            ));
+        }
+    }
+
     let now = Utc::now().to_rfc3339();
 
     // 1. Release all scope leases held by this task
     conn.execute("DELETE FROM scope_leases WHERE task_id = ?1", [task_id])
         .map_err(|e| e.to_string())?;
 
-    // 2. Return any claimed masterplan steps back to PENDING
+    // 2. Return any claimed masterplan steps back to PENDING (completed steps are strictly preserved)
     conn.execute(
-        "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1 WHERE claimed_task_id = ?2",
+        "UPDATE masterplan_steps SET status = 'PENDING', claimed_agent_id = NULL, claimed_task_id = NULL, updated_at = ?1 WHERE claimed_task_id = ?2 AND status != 'COMPLETED'",
         params![now, task_id],
     )
     .map_err(|e| e.to_string())?;

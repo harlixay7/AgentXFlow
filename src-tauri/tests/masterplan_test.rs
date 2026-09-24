@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::bool_assert_comparison
+)]
+
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::models::DecomposedStepInput;
@@ -392,4 +397,131 @@ fn test_idempotency_key_scoped_to_masterplan() {
         res.is_err(),
         "Reusing an idempotency key with a different masterplan_id must fail"
     );
+}
+
+#[test]
+fn test_decompose_crash_atomic_idempotency_lifecycle() {
+    let temp_repo = setup_temp_git_repo();
+    let temp_db = temp_repo.join("test_atomic_mp.sqlite");
+    let pool = DbPool::new(&temp_db).expect("Failed to initialize test DB");
+    let engine = CoordinatorEngine::new(pool.clone());
+
+    let proj = engine
+        .create_project(
+            "Atomic MP Test",
+            &temp_repo.to_string_lossy(),
+            "Spec",
+            "main",
+        )
+        .expect("Failed to create test project");
+
+    let plan = engine
+        .create_or_update_masterplan(&proj.id, "Plan text for atomic test", 3, 2)
+        .unwrap();
+
+    let steps = vec![
+        DecomposedStepInput {
+            step_index: 1,
+            title: "Atomic Step 1".into(),
+            description: "Desc 1".into(),
+            suggested_scope: Some("src/**".into()),
+            acceptance_criteria: Some("Criteria 1".into()),
+        },
+        DecomposedStepInput {
+            step_index: 2,
+            title: "Atomic Step 2".into(),
+            description: "Desc 2".into(),
+            suggested_scope: Some("src/**".into()),
+            acceptance_criteria: Some("Criteria 2".into()),
+        },
+    ];
+
+    let key = format!("atomic-idem-key-{}", uuid::Uuid::new_v4());
+
+    // 1. First call: creates steps + idempotency record atomically in single transaction
+    let result1 = engine
+        .decompose_masterplan(&proj.id, steps.clone(), None, Some(key.clone()))
+        .expect("Decomposition must succeed");
+    assert_eq!(result1.len(), 2);
+
+    // Verify both masterplan_steps and masterplan_operations rows exist
+    {
+        let conn = pool.lock();
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_count, 2, "Database must contain exactly 2 steps");
+
+        let op_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_operations WHERE idempotency_key = ?1 AND masterplan_id = ?2",
+                [&key, &plan.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            op_count, 1,
+            "Idempotency operation must be persisted in SQLite"
+        );
+    }
+
+    // 2. Replay with same idempotency key returns stored result without mutating steps
+    let result2 = engine
+        .decompose_masterplan(&proj.id, steps, None, Some(key.clone()))
+        .expect("Idempotent replay must succeed");
+    assert_eq!(result2.len(), 2);
+    assert_eq!(
+        result1[0].id, result2[0].id,
+        "Replay must return exact stored step records"
+    );
+    assert_eq!(
+        result1[1].id, result2[1].id,
+        "Replay must return exact stored step records"
+    );
+
+    // 3. Reusing the key with another project/plan fails closed
+    let other_dir = temp_repo.join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let proj2 = engine
+        .create_project(
+            "Another Project",
+            &other_dir.to_string_lossy(),
+            "Spec",
+            "main",
+        )
+        .unwrap();
+    let plan2 = engine
+        .create_or_update_masterplan(&proj2.id, "Plan 2", 2, 1)
+        .unwrap();
+
+    let hostile_steps = vec![DecomposedStepInput {
+        step_index: 1,
+        title: "Hostile".into(),
+        description: "Desc".into(),
+        suggested_scope: None,
+        acceptance_criteria: None,
+    }];
+
+    let cross_plan_err = engine.decompose_masterplan(&proj2.id, hostile_steps, None, Some(key));
+    assert!(
+        cross_plan_err.is_err(),
+        "Cross-plan key reuse must be rejected"
+    );
+
+    // Verify plan2 has no steps
+    {
+        let conn = pool.lock();
+        let plan2_steps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = ?1",
+                [&plan2.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan2_steps, 0, "Failed transaction must leave no steps");
+    }
 }

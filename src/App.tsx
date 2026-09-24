@@ -12,31 +12,38 @@ export function App() {
   const [events, setEvents] = useState<EventItem[]>([]);
   const [dependencies] = useState<TaskDependency[]>([]);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const lastSeqRef = useRef<number>(0);
+  const loadSeqRef = useRef<number>(0);
 
-  // Load initial data
-  const loadData = async () => {
+  // Load data with in-flight guard against stale state updates
+  const loadData = async (projectId?: string) => {
+    const seq = ++loadSeqRef.current;
     try {
       const projList = await coordinatorApi.listProjects();
+      if (seq !== loadSeqRef.current) return;
       setProjects(projList);
       if (projList.length > 0 && !activeProject) {
         setActiveProject(projList[0]);
       }
 
-      const activeProjId = activeProject?.id || (projList.length > 0 ? projList[0].id : '');
+      const activeProjId = projectId || activeProject?.id || (projList.length > 0 ? projList[0].id : '');
       if (activeProjId) {
         const [taskList, agentList, queueList] = await Promise.all([
           coordinatorApi.listTasks(activeProjId),
           coordinatorApi.listAgents(),
           coordinatorApi.listMergeQueue(activeProjId),
         ]);
+        if (seq !== loadSeqRef.current) return;
         setTasks(taskList);
         setAgents(agentList);
         setMergeQueue(queueList);
       }
+      if (seq === loadSeqRef.current) setSyncError(null);
     } catch (e) {
-      console.error('Failed to load AgentXFlow data:', e);
+      if (seq !== loadSeqRef.current) return;
+      setSyncError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -54,10 +61,12 @@ export function App() {
           const maxSeq = Math.max(...newEvents.map((e) => e.sequence));
           lastSeqRef.current = maxSeq;
           // Trigger targeted data refresh when meaningful events occur
-          loadData();
+          // Event-gap (500 rows) triggers a full catch-up refetch
+          loadData(activeProject?.id);
+          setSyncError(null);
         }
       } catch (e) {
-        // silent
+        setSyncError(e instanceof Error ? e.message : String(e));
       }
     }, 1000);
 
@@ -74,9 +83,10 @@ export function App() {
       events={events}
       dependencies={dependencies}
       selectedTask={selectedTask}
+      syncError={syncError}
       onSelectProject={(p) => setActiveProject(p)}
       onSelectTask={(t) => setSelectedTask(t)}
-      onRefresh={loadData}
+      onRefresh={() => loadData()}
     />
   );
 }

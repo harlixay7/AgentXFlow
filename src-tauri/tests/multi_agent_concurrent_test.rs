@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::bool_assert_comparison
+)]
+
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use std::process::Command;

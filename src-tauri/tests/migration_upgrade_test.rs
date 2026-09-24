@@ -1,4 +1,9 @@
-use agent_x_flow_lib::db::migrations::run_migrations;
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::bool_assert_comparison
+)]
+
+use agent_x_flow_lib::db::migrations::{run_migrations, verify_schema_integrity};
 use rusqlite::Connection;
 
 #[test]
@@ -140,9 +145,102 @@ fn test_legacy_database_migration_upgrade() {
         .unwrap();
     assert_eq!(retrieved_token, "axf_sess_test123");
 
-    // 7. Cleanup
+    // 7. Verify migrations v12–v16 schema changes
+    verify_v12_to_v16(&conn);
+
+    // 8. Cleanup
     drop(conn);
     std::fs::remove_file(temp_db_path).ok();
+}
+
+/// Verifies that migrations v12–v16 each applied correctly against a fully
+/// upgraded database. Called from the legacy-database upgrade test so that a
+/// break in any later migration is caught even if no dedicated per-migration
+/// test exists yet.
+fn verify_v12_to_v16(conn: &Connection) {
+    // ── v12: timed_out column on verification_runs ──────────────────────
+    let vr_cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(verification_runs)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(
+        vr_cols.contains(&"timed_out".to_string()),
+        "v12 must add timed_out column to verification_runs"
+    );
+
+    // ── v13: CHECK constraint on tasks.state ────────────────────────────
+    let err = conn
+        .execute(
+            "INSERT INTO tasks (id, project_id, title, description, state, created_at, updated_at)
+             VALUES ('task-exp', 'proj-legacy-1', 'Bad', 'Bad', 'EXPLODED', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("CHECK"),
+        "v13 CHECK must reject illegal state values, got: {}",
+        err
+    );
+
+    // ── v14: proof_bundles allows duplicate proof_hash (append-only) ────
+    conn.execute(
+        "INSERT INTO proof_bundles (id, task_id, project_id, attempt_number, prompt, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash, generated_at)
+         VALUES ('pb-dup-1', 'task-legacy-1', 'proj-legacy-1', 1, '', '', '', '[]', '', '[]', '[]', '[]', 'dup-hash', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .expect("v14 must allow inserting into proof_bundles");
+    conn.execute(
+        "INSERT INTO proof_bundles (id, task_id, project_id, attempt_number, prompt, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash, generated_at)
+         VALUES ('pb-dup-2', 'task-legacy-1', 'proj-legacy-1', 1, '', '', '', '[]', '', '[]', '[]', '[]', 'dup-hash', '2026-01-01T00:01:00Z')",
+        [],
+    )
+    .expect("v14 must allow duplicate proof_hash (append-only semantics)");
+
+    // ── v15: masterplan_operations table exists and accepts rows ─────────
+    let mo_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'masterplan_operations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(mo_exists, "v15 must create masterplan_operations table");
+    conn.execute(
+        "INSERT INTO masterplan_operations (idempotency_key, masterplan_id, result_json, created_at)
+         VALUES ('test-key', 'mp-1', '{}', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .expect("v15 masterplan_operations must accept rows");
+
+    // ── v16: session tokens rotated to fresh random values ──────────────
+    let token: String = conn
+        .query_row(
+            "SELECT session_token FROM agents WHERE id = 'agent-legacy-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        token.starts_with("axf_sess_") && token.len() > 20,
+        "v16 must rotate session tokens to unpredictable axf_sess_ values, got: {}",
+        token
+    );
+
+    // ── v17: request_hash column on masterplan_operations ────────────────
+    let mo_cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(masterplan_operations)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(
+        mo_cols.contains(&"request_hash".to_string()),
+        "v17 must add request_hash column to masterplan_operations"
+    );
 }
 
 #[test]
@@ -655,11 +753,189 @@ fn test_real_disk_database_initialization_if_present() {
                 db_path
             );
             let pool_res = agent_x_flow_lib::db::DbPool::new(&db_path);
-            assert!(
-                pool_res.is_ok(),
-                "Opening existing user on-disk DB must succeed: {:?}",
-                pool_res.err()
-            );
+            match pool_res {
+                Ok(_) => (),
+                Err(agent_x_flow_lib::error::CoordinatorError::Database(ref msg))
+                    if msg
+                        .contains("Another AgentXFlow coordinator instance is already running") =>
+                {
+                    println!(
+                        "Real disk database is locked by active coordinator instance; single-instance lock verified."
+                    );
+                }
+                Err(e) => panic!("Opening existing user on-disk DB must succeed: {:?}", e),
+            }
         }
     }
+}
+
+#[test]
+fn test_fresh_install_reopen_round_trip() {
+    let temp_db_path =
+        std::env::temp_dir().join(format!("round_trip_{}.sqlite", uuid::Uuid::new_v4()));
+
+    // ── Phase 1: fresh install ──────────────────────────────────────────
+    {
+        let mut conn = Connection::open(&temp_db_path).expect("Failed to open SQLite db");
+        run_migrations(&mut conn).expect("Fresh-install migrations must succeed");
+
+        // Insert representative data across key tables
+        conn.execute(
+            "INSERT INTO projects (id, name, path, master_spec, target_branch, created_at, updated_at)
+             VALUES ('proj-rt', 'Round Trip App', '/tmp/rt', 'Spec', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, description, state, created_at, updated_at)
+             VALUES ('task-rt', 'proj-rt', 'RT Task', 'Desc', 'BACKLOG', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO agents (id, name, agent_type, profile, status, last_heartbeat, created_at)
+             VALUES ('agent-rt', 'RT Agent', 'Antigravity', 'Lead', 'IDLE', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO agent_sessions (id, agent_id, session_token, created_at, expires_at, last_activity_at)
+             VALUES ('sess-rt', 'agent-rt', 'axf_sess_rt_token', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO proof_bundles (id, task_id, project_id, attempt_number, prompt, base_sha, head_sha, files_changed_json, diff_summary, verification_runs_json, criteria_json, steps_json, proof_hash, generated_at)
+             VALUES ('pb-rt', 'task-rt', 'proj-rt', 1, 'prompt', 'base', 'head', '[]', 'summary', '[]', '[]', '[]', 'rt-hash', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO task_attempts (id, task_id, agent_id, attempt_number, base_sha, run_number, worktree_path, status, started_at)
+             VALUES ('att-rt', 'task-rt', 'agent-rt', 1, 'base-sha', 1, '/tmp/rt-wt', 'COMPLETED', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO evaluator_results (id, task_id, attempt_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at)
+             VALUES ('ev-rt', 'task-rt', 'att-rt', 'schema_check', 'lint', '1.0.0', 'abc123', 0, 'ok', '', 'sha256', 100, 1, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Record applied migration count
+        let applied_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            applied_count >= 17,
+            "Fresh install must apply all migrations, got {}",
+            applied_count
+        );
+
+        // Verify schema integrity on the freshly installed DB
+        verify_schema_integrity(&conn).expect("Schema integrity must pass on fresh install");
+    }
+    // Connection dropped here — DB file persists on disk
+
+    // ── Phase 2: reopen and re-run migrations (idempotent no-op) ────────
+    {
+        let mut conn = Connection::open(&temp_db_path).expect("Failed to reopen SQLite db");
+        run_migrations(&mut conn)
+            .expect("Re-running migrations on an existing DB must succeed (idempotent)");
+
+        // Migration count must not have changed
+        let applied_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            applied_count_after, 17,
+            "Re-running migrations must not add new rows to _schema_migrations"
+        );
+
+        // Verify schema integrity after reopen
+        verify_schema_integrity(&conn)
+            .expect("Schema integrity must pass after reopen and idempotent re-run");
+
+        // Verify every inserted row can be read back (deserialized)
+        let proj_name: String = conn
+            .query_row("SELECT name FROM projects WHERE id = 'proj-rt'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(proj_name, "Round Trip App");
+
+        let task_title: String = conn
+            .query_row("SELECT title FROM tasks WHERE id = 'task-rt'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_title, "RT Task");
+
+        let agent_name: String = conn
+            .query_row("SELECT name FROM agents WHERE id = 'agent-rt'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(agent_name, "RT Agent");
+
+        let token: String = conn
+            .query_row(
+                "SELECT session_token FROM agent_sessions WHERE id = 'sess-rt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "axf_sess_rt_token");
+
+        let proof_hash: String = conn
+            .query_row(
+                "SELECT proof_hash FROM proof_bundles WHERE id = 'pb-rt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proof_hash, "rt-hash");
+
+        let att_status: String = conn
+            .query_row(
+                "SELECT status FROM task_attempts WHERE id = 'att-rt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(att_status, "COMPLETED");
+
+        let ev_name: String = conn
+            .query_row(
+                "SELECT evaluator_name FROM evaluator_results WHERE id = 'ev-rt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ev_name, "schema_check");
+
+        // Verify the CHECK constraint on tasks.state is enforced
+        let err = conn
+            .execute(
+                "INSERT INTO tasks (id, project_id, title, description, state, created_at, updated_at)
+                 VALUES ('task-bad', 'proj-rt', 'Bad', 'Bad', 'EXPLODED', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK"),
+            "CHECK constraint must be enforced after reopen, got: {}",
+            err
+        );
+    }
+
+    // ── Cleanup ─────────────────────────────────────────────────────────
+    std::fs::remove_file(temp_db_path).ok();
 }

@@ -165,6 +165,16 @@ fn get_all_migrations() -> Vec<Migration> {
             name: "rotate_session_tokens",
             run: migration_0016_rotate_session_tokens,
         },
+        Migration {
+            version: 17,
+            name: "masterplan_idempotency_request_hash",
+            run: migration_0017_masterplan_idempotency_request_hash,
+        },
+        Migration {
+            version: 18,
+            name: "performance_indexes",
+            run: migration_0018_performance_indexes,
+        },
     ]
 }
 
@@ -1617,6 +1627,33 @@ fn migration_0016_rotate_session_tokens(tx: &Transaction) -> Result<()> {
     Ok(())
 }
 
+/// Migration 0017: Adds `request_hash` to `masterplan_operations` to distinguish
+/// identical idempotent retries (same key, identical steps) from conflicting
+/// retries (same key, modified steps) which must fail closed.
+fn migration_0017_masterplan_idempotency_request_hash(tx: &Transaction) -> Result<()> {
+    let table_exists: bool = tx.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'masterplan_operations'",
+        [],
+        |r| r.get(0),
+    )?;
+
+    if table_exists {
+        let mut check_stmt = tx.prepare("PRAGMA table_info(masterplan_operations)")?;
+        let columns: Vec<String> = check_stmt
+            .query_map([], |r| r.get(1))?
+            .collect::<Result<Vec<_>>>()?;
+        drop(check_stmt);
+
+        if !columns.contains(&"request_hash".to_string()) {
+            tx.execute(
+                "ALTER TABLE masterplan_operations ADD COLUMN request_hash TEXT",
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Verifies that all required database tables and columns exist before accepting coordinator traffic
 pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
     // 1. Verify proof_bundles
@@ -1701,5 +1738,16 @@ pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn migration_0018_performance_indexes(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_tasks_proj_mp_state ON tasks(project_id, masterplan_id, state);
+        CREATE INDEX IF NOT EXISTS idx_mp_steps_task ON masterplan_steps(claimed_task_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_stale_sweep ON tasks(state, is_stale, updated_at);
+        ",
+    )?;
     Ok(())
 }

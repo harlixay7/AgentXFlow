@@ -7,6 +7,7 @@ import {
   RotateCcw,
   Copy,
   Check,
+  CheckCircle2,
   FileText,
   AlertCircle,
   Edit3,
@@ -77,6 +78,7 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
 
   const [requireMilestoneApproval, setRequireMilestoneApproval] = useState<boolean>(true);
   const [isUpdatingMode, setIsUpdatingMode] = useState<boolean>(false);
+  const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   const lastSeqRef = useRef<number>(0);
 
@@ -259,7 +261,10 @@ export const MasterplanHubView: React.FC<MasterplanHubViewProps> = ({
           }
         }
       } catch (err) {
-        // Ignored
+        setFeedback({
+          message: `Event poll failed: ${err instanceof Error ? err.message : String(err)}`,
+          type: 'error',
+        });
       }
     };
 
@@ -533,6 +538,26 @@ Deep Specification Requirements:
             </button>
           </div>
         </div>
+
+        {feedback && (
+          <div
+            style={{
+              padding: '10px 14px',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: 12,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+              border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
+              color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+              marginBottom: '1rem',
+            }}
+          >
+            {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+            <span>{feedback.message}</span>
+          </div>
+        )}
 
         {/* Masterplans Grid */}
         {masterplans.length === 0 ? (
@@ -1018,6 +1043,25 @@ Deep Specification Requirements:
           </button>
         </div>
       </div>
+
+      {feedback && (
+        <div
+          style={{
+            padding: '10px 14px',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+            border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
+            color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+          }}
+        >
+          {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
+          <span>{feedback.message}</span>
+        </div>
+      )}
 
       {/* Header Banner */}
       <div

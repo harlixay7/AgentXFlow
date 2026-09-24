@@ -163,11 +163,13 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
         }),
         json!({
             "name": "agent_heartbeat",
-            "description": "Keep agent session and active scope leases alive.",
+            "description": "Keep agent session and active scope leases alive. Can optionally signal waiting-for-permission state.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "agent_id": { "type": "string", "description": "Unique agent identifier" }
+                    "agent_id": { "type": "string", "description": "Unique agent identifier" },
+                    "waiting_for_permission": { "type": "boolean", "description": "When true, signals that agent is waiting for external IDE/user approval, activating bounded 30-minute protection against stale reclamation" },
+                    "task_id": { "type": "string", "description": "Optional active task ID being paused for permission" }
                 },
                 "required": ["agent_id"]
             }
@@ -372,6 +374,64 @@ pub fn get_all_tool_definitions() -> Vec<serde_json::Value> {
                     "agent_id": { "type": "string", "description": "Agent identifier" }
                 },
                 "required": ["agent_id"]
+            }
+        }),
+        json!({
+            "name": "task_workspace_path",
+            "description": "Authoritatively resolve the active worktree path for an assigned task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" },
+                    "agent_id": { "type": "string", "description": "Calling agent identifier" }
+                },
+                "required": ["task_id", "agent_id"]
+            }
+        }),
+        json!({
+            "name": "task_workspace_read",
+            "description": "Read a file from the task's authoritative isolated worktree without path confusion.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" },
+                    "agent_id": { "type": "string", "description": "Calling agent identifier" },
+                    "file_path": { "type": "string", "description": "Relative file path inside the worktree" }
+                },
+                "required": ["task_id", "agent_id", "file_path"]
+            }
+        }),
+        json!({
+            "name": "task_workspace_write",
+            "description": "Write a file into the task's authoritative isolated worktree, verifying write scope leases.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" },
+                    "agent_id": { "type": "string", "description": "Calling agent identifier" },
+                    "file_path": { "type": "string", "description": "Relative file path inside the worktree" },
+                    "content": { "type": "string", "description": "File content to write" }
+                },
+                "required": ["task_id", "agent_id", "file_path", "content"]
+            }
+        }),
+        json!({
+            "name": "task_workspace_exec",
+            "description": "Execute a command strictly inside the task's isolated worktree with timeout protection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task identifier" },
+                    "agent_id": { "type": "string", "description": "Calling agent identifier" },
+                    "command": { "type": "string", "description": "Command line to execute" },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of command arguments"
+                    },
+                    "timeout_seconds": { "type": "integer", "description": "Optional timeout in seconds (default 60, max 300)" }
+                },
+                "required": ["task_id", "agent_id", "command"]
             }
         }),
     ]

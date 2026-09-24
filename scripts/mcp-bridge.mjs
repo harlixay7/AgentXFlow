@@ -10,7 +10,14 @@ import * as readline from 'node:readline';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+
+let DatabaseSync = null;
+try {
+  const sqlite = await import('node:sqlite');
+  DatabaseSync = sqlite.DatabaseSync;
+} catch {
+  // node:sqlite is unavailable on Node.js < 22.5
+}
 
 const MCP_PORT = 7890;
 const MCP_URL = `http://127.0.0.1:${MCP_PORT}/mcp`;
@@ -33,8 +40,12 @@ function getAuthToken() {
 }
 
 function getDirectDb() {
-  if (fs.existsSync(DB_PATH)) {
-    return new DatabaseSync(DB_PATH, { open: true, readOnly: true });
+  if (DatabaseSync && fs.existsSync(DB_PATH)) {
+    try {
+      return new DatabaseSync(DB_PATH, { open: true, readOnly: true });
+    } catch {
+      return null;
+    }
   }
   return null;
 }
@@ -160,11 +171,13 @@ const TOOLS = [
   },
   {
     name: 'agent_heartbeat',
-    description: 'Keep agent session and active scope leases alive.',
+    description: 'Keep agent session and active scope leases alive. Can optionally signal waiting-for-permission state.',
     inputSchema: {
       type: 'object',
       properties: {
         agent_id: { type: 'string', description: 'Unique agent identifier' },
+        waiting_for_permission: { type: 'boolean', description: 'When true, signals that agent is waiting for external IDE/user approval, activating bounded 30-minute protection against stale reclamation' },
+        task_id: { type: 'string', description: 'Optional active task ID being paused for permission' },
       },
       required: ['agent_id'],
     },
@@ -383,6 +396,64 @@ const TOOLS = [
       required: ['agent_id'],
     },
   },
+  {
+    name: 'task_workspace_path',
+    description: 'Authoritatively resolve the active worktree path for an assigned task.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Calling agent identifier' },
+      },
+      required: ['task_id', 'agent_id'],
+    },
+  },
+  {
+    name: 'task_workspace_read',
+    description: 'Read a file from the task\'s authoritative isolated worktree without path confusion.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Calling agent identifier' },
+        file_path: { type: 'string', description: 'Relative file path inside the worktree' },
+      },
+      required: ['task_id', 'agent_id', 'file_path'],
+    },
+  },
+  {
+    name: 'task_workspace_write',
+    description: 'Write a file into the task\'s authoritative isolated worktree, verifying write scope leases.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Calling agent identifier' },
+        file_path: { type: 'string', description: 'Relative file path inside the worktree' },
+        content: { type: 'string', description: 'File content to write' },
+      },
+      required: ['task_id', 'agent_id', 'file_path', 'content'],
+    },
+  },
+  {
+    name: 'task_workspace_exec',
+    description: 'Execute a command strictly inside the task\'s isolated worktree with timeout protection.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task identifier' },
+        agent_id: { type: 'string', description: 'Calling agent identifier' },
+        command: { type: 'string', description: 'Command line to execute' },
+        args: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional array of command arguments',
+        },
+        timeout_seconds: { type: 'integer', description: 'Optional timeout in seconds (default 60, max 300)' },
+      },
+      required: ['task_id', 'agent_id', 'command'],
+    },
+  },
 ];
 
 function getAgentSessionToken(agentId) {
@@ -436,12 +507,12 @@ async function callHttpDaemon(method, params) {
 function handleOfflineRead(toolName, args) {
   const db = getDirectDb();
   if (!db) {
-    throw new Error('AgentXFlow daemon is not running (127.0.0.1:7890) and no local database found. Start AgentXFlow via run.bat.');
+    throw new Error('AgentXFlow daemon is not running (127.0.0.1:7890). Start AgentXFlow via run.bat (or ensure Node.js >= 22.5 is installed for direct offline SQLite access).');
   }
 
   switch (toolName) {
     case 'project_list': {
-      const rows = db.prepare('SELECT id, name, root_path, target_branch, created_at FROM projects').all();
+      const rows = db.prepare('SELECT id, name, path, target_branch, created_at FROM projects').all();
       return rows;
     }
     case 'project_context': {
@@ -452,7 +523,7 @@ function handleOfflineRead(toolName, args) {
       const memory = db.prepare('SELECT content FROM project_memory WHERE project_id = ? ORDER BY created_at DESC').all(args.project_id).map((r) => r.content);
       if (args.task_id) {
         const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(args.task_id);
-        const steps = db.prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY sequence_order ASC').all(args.task_id);
+        const steps = db.prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY order_index ASC').all(args.task_id);
         const criteria = db.prepare('SELECT * FROM acceptance_criteria WHERE task_id = ?').all(args.task_id);
         return {
           project_id: proj.id,
@@ -483,8 +554,12 @@ function handleOfflineRead(toolName, args) {
       return plans;
     }
     case 'masterplan_get': {
-      const plan = db.prepare('SELECT * FROM masterplans WHERE project_id = ?').get(args.project_id);
-      const steps = db.prepare('SELECT * FROM masterplan_steps WHERE project_id = ? ORDER BY step_index ASC').all(args.project_id);
+      const plan = args.masterplan_id
+        ? db.prepare('SELECT * FROM masterplans WHERE id = ?').get(args.masterplan_id)
+        : db.prepare('SELECT * FROM masterplans WHERE project_id = ? ORDER BY updated_at DESC LIMIT 1').get(args.project_id);
+      const steps = plan
+        ? db.prepare('SELECT * FROM masterplan_steps WHERE masterplan_id = ? ORDER BY step_index ASC').all(plan.id)
+        : [];
       return { plan, steps };
     }
     case 'task_list': {
@@ -493,7 +568,7 @@ function handleOfflineRead(toolName, args) {
     }
     case 'task_get': {
       const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(args.task_id);
-      const steps = db.prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY sequence_order ASC').all(args.task_id);
+      const steps = db.prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY order_index ASC').all(args.task_id);
       const criteria = db.prepare('SELECT * FROM acceptance_criteria WHERE task_id = ?').all(args.task_id);
       return { task, steps, criteria };
     }

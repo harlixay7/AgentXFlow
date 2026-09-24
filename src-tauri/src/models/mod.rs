@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskState {
     Backlog,
     Ready,
+    Claiming,
     Running,
     Verifying,
     Verified,
@@ -20,6 +22,7 @@ impl TaskState {
         match self {
             TaskState::Backlog => "BACKLOG",
             TaskState::Ready => "READY",
+            TaskState::Claiming => "CLAIMING",
             TaskState::Running => "RUNNING",
             TaskState::Verifying => "VERIFYING",
             TaskState::Verified => "VERIFIED",
@@ -36,6 +39,7 @@ impl TaskState {
         match s.to_uppercase().as_str() {
             "BACKLOG" => TaskState::Backlog,
             "READY" => TaskState::Ready,
+            "CLAIMING" => TaskState::Claiming,
             "RUNNING" | "WORKING" | "CLAIMED" | "ANALYZING" | "SCOPE_APPROVED" => {
                 TaskState::Running
             }
@@ -54,8 +58,16 @@ impl TaskState {
     pub fn can_transition_to(&self, next: &TaskState) -> bool {
         match (self, next) {
             (TaskState::Backlog, TaskState::Ready) => true,
+            (TaskState::Backlog, TaskState::Claiming) => true,
             (TaskState::Backlog, TaskState::Running) => true, // claim_task accepts BACKLOG tasks directly
+            (TaskState::Ready, TaskState::Claiming) => true,
             (TaskState::Ready, TaskState::Running) => true,
+            (TaskState::Claiming, TaskState::Running) => true,
+            (TaskState::Claiming, TaskState::Ready) => true,
+            (TaskState::Claiming, TaskState::Backlog) => true,
+            (TaskState::Claiming, TaskState::Blocked) => true,
+            (TaskState::Claiming, TaskState::Failed) => true,
+            (TaskState::Claiming, TaskState::Cancelled) => true,
             (TaskState::Running, TaskState::Verifying) => true,
             (TaskState::Verifying, TaskState::Verified) => true,
             (TaskState::Verifying, TaskState::MergeReady) => true, // submit_task auto-enqueues directly from VERIFYING
@@ -83,6 +95,7 @@ impl TaskState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskSubstate {
     Claiming,
     Analyzing,
@@ -90,6 +103,7 @@ pub enum TaskSubstate {
     Implementing,
     Verifying,
     WaitingForInput,
+    Recoverable,
     None,
 }
 
@@ -102,6 +116,7 @@ impl TaskSubstate {
             TaskSubstate::Implementing => "IMPLEMENTING",
             TaskSubstate::Verifying => "VERIFYING",
             TaskSubstate::WaitingForInput => "WAITING_FOR_INPUT",
+            TaskSubstate::Recoverable => "RECOVERABLE",
             TaskSubstate::None => "NONE",
         }
     }
@@ -114,6 +129,7 @@ impl TaskSubstate {
             "IMPLEMENTING" => TaskSubstate::Implementing,
             "VERIFYING" => TaskSubstate::Verifying,
             "WAITING_FOR_INPUT" => TaskSubstate::WaitingForInput,
+            "RECOVERABLE" => TaskSubstate::Recoverable,
             _ => TaskSubstate::None,
         }
     }
@@ -222,7 +238,7 @@ pub struct AcceptanceCriteria {
     pub is_locked: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCapabilitySet {
     pub read_files: bool,
     pub write_files: bool,
@@ -257,7 +273,7 @@ impl Default for AgentCapabilitySet {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
     pub name: String,

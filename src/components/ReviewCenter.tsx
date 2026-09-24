@@ -23,8 +23,11 @@ export const ReviewCenter: React.FC<ReviewCenterProps> = ({ tasks, onRefresh }) 
         try {
           const items = await coordinatorApi.listMergeQueue(pid);
           items.filter((item) => !item.processed_at).forEach((item) => ids.add(item.task_id));
-        } catch {
-          // ignore
+        } catch (e) {
+          setFeedback({
+            message: `Failed to fetch merge queue: ${e instanceof Error ? e.message : String(e)}`,
+            type: 'error',
+          });
         }
       }
       if (isMounted) {

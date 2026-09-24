@@ -45,27 +45,19 @@ impl AcpRuntime {
 
         let mut discovered = Vec::new();
         for (name, bin, agent_type) in candidates {
-            #[cfg(target_os = "windows")]
-            let check_cmd = format!("where {}", bin);
-            #[cfg(not(target_os = "windows"))]
-            let check_cmd = format!("which {}", bin);
-
-            let is_installed = std::process::Command::new(if cfg!(target_os = "windows") {
-                "cmd"
+            let is_installed = if cfg!(target_os = "windows") {
+                std::process::Command::new("where")
+                    .arg(bin)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
             } else {
-                "sh"
-            })
-            .args([
-                if cfg!(target_os = "windows") {
-                    "/c"
-                } else {
-                    "-c"
-                },
-                &check_cmd,
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+                std::process::Command::new("which")
+                    .arg(bin)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            };
 
             discovered.push(AcpAgentDescriptor {
                 name: name.to_string(),

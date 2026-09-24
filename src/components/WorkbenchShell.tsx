@@ -37,6 +37,7 @@ interface WorkbenchShellProps {
   events: EventItem[];
   dependencies: TaskDependency[];
   selectedTask: Task | null;
+  syncError: string | null;
   onSelectProject: (p: Project) => void;
   onSelectTask: (t: Task | null) => void;
   onRefresh: () => void;
@@ -51,6 +52,7 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
   events,
   dependencies,
   selectedTask,
+  syncError,
   onSelectProject,
   onSelectTask,
   onRefresh,
@@ -277,7 +279,7 @@ export const WorkbenchShell: React.FC<WorkbenchShellProps> = ({
           </div>
 
           {/* Bottom Debugger Panel */}
-          <BottomPanel events={events} />
+          <BottomPanel events={events} syncError={syncError} />
         </div>
       </div>
 

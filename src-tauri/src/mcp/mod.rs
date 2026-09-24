@@ -6,15 +6,18 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
+pub mod authorization;
 pub mod registry;
 
 use crate::core::CoordinatorEngine;
 use crate::security::SecurityManager;
+use authorization::{CallerAuthority, McpAuthPolicy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -40,6 +43,159 @@ pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
     pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpError {
+    ParseError,
+    InvalidRequest(String),
+    MethodNotFound(String),
+    InvalidParams(String),
+}
+
+impl McpError {
+    pub fn code(&self) -> i32 {
+        match self {
+            McpError::ParseError => -32700,
+            McpError::InvalidRequest(_) => -32600,
+            McpError::MethodNotFound(_) => -32601,
+            McpError::InvalidParams(_) => -32602,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            McpError::ParseError => "Parse error".to_string(),
+            McpError::InvalidRequest(msg) => msg.clone(),
+            McpError::MethodNotFound(msg) => msg.clone(),
+            McpError::InvalidParams(msg) => msg.clone(),
+        }
+    }
+}
+
+const KNOWN_METHODS: &[&str] = &[
+    "initialize",
+    "notifications/initialized",
+    "notifications/cancelled",
+    "ping",
+    "prompts/list",
+    "resources/list",
+    "resources/templates/list",
+    "logging/setLevel",
+    "tools/list",
+    "tools/call",
+    // Legacy aliases (direct tool method routing)
+    "agentxflow_current_context",
+    "context.current",
+    "project_list",
+    "project.list",
+    "project_context",
+    "project.context",
+    "masterplan_list",
+    "masterplan.list",
+    "task_list",
+    "task.list",
+    "task_get",
+    "task.get",
+    "task_details",
+    "task.details",
+    "dag_dependencies",
+    "dependency_list",
+    "dag.dependencies",
+    "merge_queue_status",
+    "merge.queue_status",
+    "merge_enqueue",
+    "merge.enqueue",
+    "merge_process",
+    "merge.process",
+    "task_reconcile",
+    "task.reconcile",
+    "agent_register",
+    "agent.register",
+    "agent_heartbeat",
+    "agent.heartbeat",
+    "task_claim",
+    "task.claim",
+    "task_complete_step",
+    "task.complete_step",
+    "task_submit",
+    "task.submit",
+    "task_cancel",
+    "task.cancel",
+    "task_requeue",
+    "task.requeue",
+    "scope_acquire",
+    "scope.acquire",
+    "scope.propose",
+    "scope_release",
+    "scope.release",
+    "criteria_satisfy",
+    "criteria.satisfy",
+    "prepare_masterplan",
+    "masterplan.prepare",
+    "masterplan_get",
+    "masterplan.get",
+    "masterplan_status",
+    "masterplan.status",
+    "masterplan_reset",
+    "masterplan.reset",
+    "masterplan_claim_chunk",
+    "masterplan.claim_chunk",
+    "masterplan_decompose",
+    "masterplan.decompose",
+    "unclaim_agent_tasks",
+    "agent.unclaim_tasks",
+    "force_agent_idle",
+    "agent.force_idle",
+    "task_workspace_path",
+    "task.workspace_path",
+    "task_workspace_read",
+    "task.workspace_read",
+    "task_workspace_write",
+    "task.workspace_write",
+    "task_workspace_exec",
+    "task.workspace_exec",
+];
+
+fn get_known_methods() -> HashSet<&'static str> {
+    KNOWN_METHODS.iter().copied().collect()
+}
+
+pub fn admit(req_str: &str) -> Result<JsonRpcRequest, McpError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(req_str).map_err(|_| McpError::ParseError)?;
+
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| McpError::InvalidRequest("Request must be a JSON object".to_string()))?;
+
+    let jsonrpc = obj
+        .get("jsonrpc")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| McpError::InvalidRequest("Missing required field 'jsonrpc'".to_string()))?;
+
+    if jsonrpc != "2.0" {
+        return Err(McpError::InvalidRequest(format!(
+            "Invalid jsonrpc version '{}', expected '2.0'",
+            jsonrpc
+        )));
+    }
+
+    let method = obj
+        .get("method")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| McpError::InvalidRequest("Missing required field 'method'".to_string()))?
+        .to_string();
+
+    let id = obj.get("id").cloned();
+    let params = obj.get("params").cloned();
+
+    Ok(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id,
+        method,
+        params,
+    })
 }
 
 pub struct McpServerState {
@@ -69,7 +225,6 @@ impl McpServer {
 
         let app = Router::new()
             .route("/mcp", post(handle_mcp_streamable_http))
-            .route("/mcp/sse", get(handle_mcp_legacy_sse))
             .route("/health", get(handle_health))
             .layer(cors)
             .with_state(self.state.clone());
@@ -104,20 +259,9 @@ async fn handle_health() -> impl IntoResponse {
             "status": "ok",
             "service": "AgentXFlow Authoritative MCP Gateway (Viducia)",
             "protocol_version": "2024-11-05",
-            "supported_versions": ["2024-11-05", "2026-07-28"],
+            "supported_versions": ["2024-11-05"],
             "transport": "Streamable HTTP"
         })),
-    )
-}
-
-async fn handle_mcp_legacy_sse() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [
-            ("Content-Type", "text/event-stream"),
-            ("Cache-Control", "no-cache"),
-        ],
-        "event: endpoint\ndata: /mcp\n\n",
     )
 }
 
@@ -168,9 +312,27 @@ fn validate_security_headers(headers: &HeaderMap) -> Result<(), (StatusCode, Str
 async fn handle_mcp_streamable_http(
     State(state): State<Arc<McpServerState>>,
     headers: HeaderMap,
-    Json(req): Json<JsonRpcRequest>,
+    body_str: String,
 ) -> impl IntoResponse {
-    // 1. Host / Origin security check
+    // 1. Admit: validate JSON-RPC 2.0 structure
+    let req = match admit(&body_str) {
+        Ok(r) => r,
+        Err(e) => {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: e.code(),
+                    message: e.message(),
+                    data: None,
+                }),
+            };
+            return (StatusCode::OK, HeaderMap::new(), Json(response));
+        }
+    };
+
+    // 2. Host / Origin security check
     if let Err((status, msg)) = validate_security_headers(&headers) {
         return (
             status,
@@ -188,7 +350,7 @@ async fn handle_mcp_streamable_http(
         );
     }
 
-    // 2. Bearer Authentication validation (Master token or Agent Session token)
+    // 3. Bearer Authentication validation (Master token or Agent Session token)
     let (is_authenticated, caller_agent) = if let Some(auth) = headers.get("authorization") {
         if let Ok(token_str) = auth.to_str() {
             let clean_token = token_str.trim_start_matches("Bearer ").trim();
@@ -228,7 +390,7 @@ async fn handle_mcp_streamable_http(
     let method = req.method.as_str();
     let params = req.params.clone().unwrap_or(serde_json::json!({}));
 
-    // Dynamic protocol version negotiation supporting standard 2024-11-05 and 2026-07-28
+    // Protocol version negotiation: always respond with the implemented version
     let requested_version = params
         .get("protocolVersion")
         .and_then(|v| v.as_str())
@@ -240,7 +402,7 @@ async fn handle_mcp_streamable_http(
         .unwrap_or("2024-11-05");
 
     let negotiated_version = match requested_version {
-        "2026-07-28" => "2026-07-28",
+        "2024-11-05" => "2024-11-05",
         _ => "2024-11-05",
     };
 
@@ -250,6 +412,35 @@ async fn handle_mcp_streamable_http(
         HeaderValue::from_str(negotiated_version).unwrap_or(HeaderValue::from_static("2024-11-05")),
     );
 
+    // 4. Method validation: check before dispatch
+    let known = get_known_methods();
+    if !known.contains(method) {
+        let is_notification = req.id.is_none();
+        if is_notification {
+            return (
+                StatusCode::OK,
+                response_headers,
+                Json(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    result: None,
+                    error: None,
+                }),
+            );
+        }
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32601,
+                message: format!("Method not found: '{}'", method),
+                data: None,
+            }),
+        };
+        return (StatusCode::OK, response_headers, Json(response));
+    }
+
     // Standard MCP Protocol Routing
     let response_result = match method {
         // --- 1. Standard MCP Protocol Handlers ---
@@ -257,7 +448,7 @@ async fn handle_mcp_streamable_http(
             "protocolVersion": negotiated_version,
             "serverInfo": {
                 "name": "AgentXFlow Coordinator",
-                "version": "0.1.0"
+                "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {
                 "tools": {
@@ -274,7 +465,22 @@ async fn handle_mcp_streamable_http(
             }
         })),
 
-        "notifications/initialized" | "notifications/cancelled" => Ok(serde_json::json!({})),
+        "notifications/initialized" | "notifications/cancelled" => {
+            // Notifications (no id) should return no response body
+            if req.id.is_none() {
+                return (
+                    StatusCode::OK,
+                    response_headers,
+                    Json(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: None,
+                        result: None,
+                        error: None,
+                    }),
+                );
+            }
+            Ok(serde_json::json!({}))
+        }
 
         "ping" => Ok(serde_json::json!({})),
 
@@ -302,6 +508,7 @@ async fn handle_mcp_streamable_http(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+
             execute_mcp_tool(&state, caller_agent.as_ref(), tool_name, &arguments)
                 .map(|val| serde_json::json!({
                     "content": [{
@@ -327,21 +534,102 @@ async fn handle_mcp_streamable_http(
                 error: None,
             }),
         ),
-        Err(err_msg) => (
-            StatusCode::OK,
-            response_headers,
-            Json(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: req.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32603,
-                    message: err_msg,
-                    data: None,
+        Err(err_msg) => {
+            let error_code = if err_msg.starts_with("Missing required parameter") {
+                -32602
+            } else if err_msg.starts_with("Forbidden")
+                || err_msg.starts_with("Authorization")
+                || err_msg.starts_with("Agent impersonation")
+            {
+                -32003
+            } else {
+                -32603
+            };
+            (
+                StatusCode::OK,
+                response_headers,
+                Json(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: error_code,
+                        message: err_msg,
+                        data: None,
+                    }),
                 }),
-            }),
-        ),
+            )
+        }
     }
+}
+
+/// Canonicalizes any tool alias or method string to its registry canonical tool name
+pub fn canonical_tool_name(tool_name: &str) -> &str {
+    match tool_name {
+        "agentxflow_current_context" | "agentxflow.current_context" | "context.current" => {
+            "agentxflow_current_context"
+        }
+        "project_list" | "project.list" => "project_list",
+        "project_context" | "project.context" => "project_context",
+        "masterplan_list" | "masterplan.list" => "masterplan_list",
+        "masterplan_get" | "masterplan.get" => "masterplan_get",
+        "prepare_masterplan" | "masterplan.prepare" => "prepare_masterplan",
+        "masterplan_status" | "masterplan.status" => "masterplan_status",
+        "masterplan_reset" | "masterplan.reset" => "masterplan_reset",
+        "masterplan_decompose" | "masterplan.decompose" => "masterplan_decompose",
+        "masterplan_claim_chunk" | "masterplan.claim_chunk" => "masterplan_claim_chunk",
+        "agent_register" | "agent.register" => "agent_register",
+        "agent_heartbeat" | "agent.heartbeat" => "agent_heartbeat",
+        "task_list" | "task.list" => "task_list",
+        "task_get" | "task.get" => "task_get",
+        "task_details" | "task.details" => "task_details",
+        "task_claim" | "task.claim" => "task_claim",
+        "scope_acquire" | "scope.acquire" | "scope.propose" => "scope_acquire",
+        "scope_release" | "scope.release" => "scope_release",
+        "task_complete_step" | "task.complete_step" => "task_complete_step",
+        "dag_dependencies" | "dependency_list" | "dag.dependencies" => "dag_dependencies",
+        "task_submit" | "task.submit" => "task_submit",
+        "task_cancel" | "task.cancel" => "task_cancel",
+        "task_requeue" | "task.requeue" => "task_requeue",
+        "task_reconcile" | "task.reconcile" => "task_reconcile",
+        "merge_queue_status" | "merge.queue_status" => "merge_queue_status",
+        "merge_enqueue" | "merge.enqueue" => "merge_enqueue",
+        "merge_process" | "merge.process" => "merge_process",
+        "unclaim_agent_tasks" | "agent.unclaim_tasks" => "unclaim_agent_tasks",
+        "force_agent_idle" | "agent.force_idle" => "force_agent_idle",
+        "criteria_satisfy" | "criteria.satisfy" => "criteria_satisfy",
+        "task_workspace_path" | "task.workspace_path" => "task_workspace_path",
+        "task_workspace_read" | "task.workspace_read" => "task_workspace_read",
+        "task_workspace_write" | "task.workspace_write" => "task_workspace_write",
+        "task_workspace_exec" | "task.workspace_exec" => "task_workspace_exec",
+        other => other,
+    }
+}
+
+/// Validates tool arguments against inputSchema.required definitions in the tool registry
+pub fn validate_tool_arguments(tool_name: &str, params: &serde_json::Value) -> Result<(), String> {
+    let canon = canonical_tool_name(tool_name);
+    let tool_defs = registry::get_all_tool_definitions();
+    if let Some(tool_def) = tool_defs.iter().find(|t| t["name"] == canon) {
+        if let Some(required) = tool_def["inputSchema"]["required"].as_array() {
+            for req_field in required {
+                if let Some(field_name) = req_field.as_str() {
+                    let val = params.get(field_name);
+                    let is_missing = match val {
+                        None => true,
+                        Some(serde_json::Value::Null) => true,
+                        Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+                        Some(serde_json::Value::Array(a)) => a.is_empty() && field_name == "steps",
+                        _ => false,
+                    };
+                    if is_missing {
+                        return Err(format!("Missing required parameter: '{}'", field_name));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Executes individual tool logic with strict ownership and session checking
@@ -351,6 +639,16 @@ fn execute_mcp_tool(
     tool_name: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    validate_tool_arguments(tool_name, params)?;
+
+    let authority = if let Some(agent) = caller_agent {
+        CallerAuthority::Agent(agent.clone())
+    } else {
+        CallerAuthority::Master
+    };
+
+    McpAuthPolicy::authorize(&authority, &state.coordinator, tool_name, params)?;
+
     // Transparent activity heartbeat: refresh liveness for caller whenever an agent is resolved
     if let Some(agent) = caller_agent {
         state.coordinator.touch_agent_activity(&agent.id);
@@ -364,7 +662,11 @@ fn execute_mcp_tool(
 
     let resolve_agent_id = |req_id: &str| -> Result<String, String> {
         if let Some(agent) = caller_agent {
-            if !req_id.is_empty() && req_id != agent.id {
+            let (canon_agent, ..) =
+                crate::core::CoordinatorEngine::canonicalize_ide_identity(&agent.id, "");
+            let (canon_req, ..) =
+                crate::core::CoordinatorEngine::canonicalize_ide_identity(req_id, "");
+            if !req_id.is_empty() && req_id != agent.id && canon_req != canon_agent {
                 return Err(format!(
                     "Agent impersonation rejected: Authenticated session belongs to '{}', cannot act on behalf of '{}'",
                     agent.id, req_id
@@ -521,7 +823,19 @@ fn execute_mcp_tool(
         "agent_heartbeat" | "agent.heartbeat" => {
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id = resolve_agent_id(raw_agent_id)?;
-            state.coordinator.agent_heartbeat(&agent_id).map(|_| serde_json::json!({ "status": "ok" }))
+            let waiting = params.get("waiting_for_permission").and_then(|v| v.as_bool()).unwrap_or(false);
+            let task_id_opt = params.get("task_id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+
+            if waiting {
+                if let Some(task_id) = task_id_opt {
+                    state.coordinator.set_task_waiting_for_permission(task_id, &agent_id)?;
+                }
+            }
+
+            state.coordinator.agent_heartbeat(&agent_id).map(|_| serde_json::json!({
+                "status": "ok",
+                "waiting_for_permission": waiting
+            }))
         }
 
         // Mutation & Task Execution
@@ -611,6 +925,8 @@ fn execute_mcp_tool(
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id_opt = if !raw_agent_id.trim().is_empty() {
                 Some(resolve_agent_id(raw_agent_id)?)
+            } else if caller_agent.is_some() {
+                Some(resolve_agent_id("")?)
             } else {
                 None
             };
@@ -628,6 +944,8 @@ fn execute_mcp_tool(
             let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let agent_id_opt = if !raw_agent_id.trim().is_empty() {
                 Some(resolve_agent_id(raw_agent_id)?)
+            } else if caller_agent.is_some() {
+                Some(resolve_agent_id("")?)
             } else {
                 None
             };
@@ -636,6 +954,53 @@ fn execute_mcp_tool(
                 "task_id": task_id,
                 "message": "Task chunk requeued to masterplan pending steps and scope leases released."
             }))
+        }
+
+        "task_workspace_path" | "task.workspace_path" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.get_task_workspace_path(task_id, &agent_id).map(|p| serde_json::json!({
+                "task_id": task_id,
+                "workspace_path": p.to_string_lossy().to_string()
+            }))
+        }
+
+        "task_workspace_read" | "task.workspace_read" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let file_path = params.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.task_workspace_read(task_id, &agent_id, file_path).map(|content| serde_json::json!({
+                "task_id": task_id,
+                "file_path": file_path,
+                "content": content
+            }))
+        }
+
+        "task_workspace_write" | "task.workspace_write" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let file_path = params.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.task_workspace_write(task_id, &agent_id, file_path, content).map(|_| serde_json::json!({
+                "success": true,
+                "task_id": task_id,
+                "file_path": file_path
+            }))
+        }
+
+        "task_workspace_exec" | "task.workspace_exec" => {
+            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            let command = params.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("args").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
+            });
+            let timeout_secs = params.get("timeout_seconds").and_then(|v| v.as_u64());
+            let agent_id = resolve_agent_id(raw_agent_id)?;
+            state.coordinator.task_workspace_exec(task_id, &agent_id, command, args, timeout_secs).map(|run| serde_json::to_value(run).unwrap())
         }
 
         "scope_acquire" | "scope.acquire" | "scope.propose" => {
@@ -856,7 +1221,15 @@ fn execute_mcp_tool(
                         Ok(decomposed) => {
                             let plan = state.coordinator.get_masterplan(project_id).ok().flatten();
                             let plan_id = plan.as_ref().map(|p| p.id.as_str()).unwrap_or("");
+                            let target_steps = plan.as_ref().map(|p| p.target_step_count).unwrap_or(20);
                             let total_steps = decomposed.len();
+                            let pending_steps = decomposed.iter().filter(|s| s.status == "PENDING").count();
+                            let min_idx = decomposed.iter().map(|s| s.step_index).min().unwrap_or(1);
+                            let max_idx = decomposed.iter().map(|s| s.step_index).max().unwrap_or(total_steps as i32);
+                            let continuation_required = total_steps < target_steps as usize;
+                            let next_expected_start = max_idx + 1;
+                            let next_expected_end = (max_idx + step_count as i32).min(target_steps);
+
                             if compact {
                                 Ok(serde_json::json!({
                                     "status": "RESORTED",
@@ -865,10 +1238,19 @@ fn execute_mcp_tool(
                                     "step_count": step_count,
                                     "batch_step_count": step_count,
                                     "total_steps": total_steps,
-                                    "pending_steps": total_steps,
+                                    "pending_steps": pending_steps,
                                     "is_append": append.unwrap_or(false),
-                                    "next_action": "masterplan_claim_chunk",
-                                    "instruction": format!("Masterplan steps successfully structured (total {} steps in plan). Call 'masterplan_claim_chunk' to claim your assigned chunk.", total_steps)
+                                    "persisted_range": [min_idx, max_idx],
+                                    "total_known": total_steps,
+                                    "target_step_count": target_steps,
+                                    "next_expected_range": if continuation_required { serde_json::json!([next_expected_start, next_expected_end]) } else { serde_json::Value::Null },
+                                    "continuation_required": continuation_required,
+                                    "next_action": if continuation_required { "masterplan_decompose" } else { "masterplan_claim_chunk" },
+                                    "instruction": if continuation_required {
+                                        format!("Chunk committed (steps {}-{}). Plan has {}/{} total steps. Call 'masterplan_decompose' with 'append: true' for next expected range {}-{}.", min_idx, max_idx, total_steps, target_steps, next_expected_start, next_expected_end)
+                                    } else {
+                                        format!("Masterplan fully structured with {} steps. Call 'masterplan_claim_chunk' to claim your assigned chunk.", total_steps)
+                                    }
                                 }))
                             } else {
                                 Ok(serde_json::to_value(decomposed).unwrap())

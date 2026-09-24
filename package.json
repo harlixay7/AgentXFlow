@@ -3,13 +3,14 @@
   "author": "harlixay7",
   "description": "AgentXFlow by Viducia — Authoritative Multi-Agent Engineering Coordinator",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "tsc --noEmit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

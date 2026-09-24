@@ -28,6 +28,46 @@ fn kill_process_tree(child: &std::process::Child) {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConfiguredCheck {
+    pub id: String,
+    pub check_type: String,
+    pub command: String,
+    pub args_json: String,
+    pub timeout_secs: i32,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PostMergeVerificationOutcome {
+    pub passed: bool,
+    pub timed_out: bool,
+    pub runs: Vec<VerificationRun>,
+}
+
+pub fn build_command_with_args(cmd: &str, args_json: &str) -> String {
+    if args_json.trim().is_empty() || args_json == "[]" {
+        return cmd.trim().to_string();
+    }
+    match serde_json::from_str::<Vec<String>>(args_json) {
+        Ok(args) if !args.is_empty() => {
+            let mut full = cmd.trim().to_string();
+            for arg in args {
+                full.push(' ');
+                if arg.contains(' ') || arg.contains('"') {
+                    full.push('"');
+                    full.push_str(&arg.replace('"', "\\\""));
+                    full.push('"');
+                } else {
+                    full.push_str(&arg);
+                }
+            }
+            full
+        }
+        _ => cmd.trim().to_string(),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct VerificationEngine {
     db: DbPool,
 }
@@ -191,9 +231,13 @@ impl VerificationEngine {
             timed_out,
         };
 
-        // Record in SQLite
-        let conn = self.db.lock();
-        conn.execute(
+        // Record in SQLite inside an atomic transaction
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin verification run transaction: {}", e))?;
+
+        tx.execute(
             "INSERT INTO verification_runs (id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, executed_at, timed_out)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
@@ -201,7 +245,7 @@ impl VerificationEngine {
                 run.commit_sha, run.command, run.exit_code, run.stdout, run.stderr,
                 run.duration_ms, run.is_passed, run.is_stale, run.executed_at, timed_out
             ],
-        ).map_err(|e| e.to_string())?;
+        ).map_err(|e| format!("Failed to record verification run: {}", e))?;
 
         // Also record as first-class Coordinator-Observed evidence
         let ev_id = Uuid::new_v4().to_string();
@@ -214,11 +258,15 @@ impl VerificationEngine {
             "commit_sha": commit_sha,
         });
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO evidence_records (id, task_id, step_id, evidence_type, source, payload_json, recorded_at)
              VALUES (?1, ?2, NULL, 'TEST_RESULT', 'COORDINATOR_OBSERVED', ?3, ?4)",
             rusqlite::params![ev_id, task_id, payload.to_string(), now],
-        ).ok();
+        ).map_err(|e| format!("Failed to record verification evidence record: {}", e))?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit verification run transaction: {}", e))?;
+        drop(conn);
 
         Ok(run)
     }
@@ -238,6 +286,219 @@ impl VerificationEngine {
         Ok(())
     }
 
+    /// Returns all configured verification profile checks for a project/task, or builds sensible repository defaults.
+    pub fn get_verification_profiles(
+        &self,
+        project_id: &str,
+        task_id: Option<&str>,
+        worktree_path: &Path,
+    ) -> Result<Vec<ConfiguredCheck>, String> {
+        let mut configured_checks = {
+            let conn = self.db.lock();
+            let target_task = task_id.unwrap_or("");
+            let mut stmt_prof = conn
+                .prepare(
+                    "SELECT id, check_type, command, args_json, timeout_secs, required 
+                     FROM verification_profiles 
+                     WHERE project_id = ?1 AND (task_id IS NULL OR task_id = ?2)",
+                )
+                .map_err(|e| format!("Failed to prepare verification profiles query: {}", e))?;
+
+            let rows = stmt_prof
+                .query_map(rusqlite::params![project_id, target_task], |row| {
+                    Ok(ConfiguredCheck {
+                        id: row.get(0)?,
+                        check_type: row.get(1)?,
+                        command: row.get(2)?,
+                        args_json: row.get(3)?,
+                        timeout_secs: row.get(4)?,
+                        required: row.get(5)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query verification profiles: {}", e))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read verification profile row: {}", e))?
+        };
+
+        // If no custom profile configured, build standard suite from repository markers
+        if configured_checks.is_empty() {
+            if worktree_path.join("Cargo.toml").exists() {
+                configured_checks.push(ConfiguredCheck {
+                    id: "chk_cargo_check".to_string(),
+                    check_type: "TYPECHECK".to_string(),
+                    command: "cargo check".to_string(),
+                    args_json: "[]".to_string(),
+                    timeout_secs: 60,
+                    required: true,
+                });
+                configured_checks.push(ConfiguredCheck {
+                    id: "chk_cargo_test".to_string(),
+                    check_type: "UNIT_TESTS".to_string(),
+                    command: "cargo test".to_string(),
+                    args_json: "[]".to_string(),
+                    timeout_secs: 120,
+                    required: true,
+                });
+            } else if worktree_path.join("package.json").exists() {
+                let pkg_path = worktree_path.join("package.json");
+                let pkg_content = std::fs::read_to_string(&pkg_path)
+                    .map_err(|e| format!("Failed to read package.json at {:?}: {}", pkg_path, e))?;
+                let pkg_json: serde_json::Value =
+                    serde_json::from_str(&pkg_content).map_err(|e| {
+                        format!("Failed to parse package.json at {:?}: {}", pkg_path, e)
+                    })?;
+                let scripts = pkg_json.get("scripts");
+
+                let mut added_npm_check = false;
+
+                if let Some(scripts_obj) = scripts.and_then(|s| s.as_object()) {
+                    // 1. Build check
+                    if scripts_obj.contains_key("build") {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_build".to_string(),
+                            check_type: "BUILD".to_string(),
+                            command: "npm run build".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 120,
+                            required: true,
+                        });
+                        added_npm_check = true;
+                    }
+
+                    // 2. Typecheck check
+                    if scripts_obj.contains_key("typecheck") {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_typecheck".to_string(),
+                            check_type: "TYPECHECK".to_string(),
+                            command: "npm run typecheck".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                        added_npm_check = true;
+                    } else if scripts_obj.contains_key("type-check") {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_typecheck".to_string(),
+                            check_type: "TYPECHECK".to_string(),
+                            command: "npm run type-check".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                        added_npm_check = true;
+                    } else if worktree_path.join("tsconfig.json").exists()
+                        && !scripts_obj.contains_key("build")
+                    {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_tsc_check".to_string(),
+                            check_type: "TYPECHECK".to_string(),
+                            command: "npx tsc --noEmit".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                        added_npm_check = true;
+                    }
+
+                    // 3. Unit test check
+                    if scripts_obj.contains_key("test") {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_test".to_string(),
+                            check_type: "UNIT_TESTS".to_string(),
+                            command: "npm test".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                        added_npm_check = true;
+                    }
+
+                    // 4. Lint check (optional by default)
+                    if scripts_obj.contains_key("lint") {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_lint".to_string(),
+                            check_type: "LINT".to_string(),
+                            command: "npm run lint".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: false,
+                        });
+                    }
+
+                    // 5. Smoke / Runtime check
+                    if scripts_obj.contains_key("smoke") {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_smoke".to_string(),
+                            check_type: "SMOKE_TEST".to_string(),
+                            command: "npm run smoke".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                        added_npm_check = true;
+                    } else if scripts_obj.contains_key("test:smoke") {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_smoke".to_string(),
+                            check_type: "SMOKE_TEST".to_string(),
+                            command: "npm run test:smoke".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                        added_npm_check = true;
+                    }
+                }
+
+                if !added_npm_check {
+                    if worktree_path.join("tsconfig.json").exists() {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_tsc_check".to_string(),
+                            check_type: "TYPECHECK".to_string(),
+                            command: "npx tsc --noEmit".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                    } else {
+                        configured_checks.push(ConfiguredCheck {
+                            id: "chk_npm_test".to_string(),
+                            check_type: "UNIT_TESTS".to_string(),
+                            command: "npm test".to_string(),
+                            args_json: "[]".to_string(),
+                            timeout_secs: 60,
+                            required: true,
+                        });
+                    }
+                }
+            } else if worktree_path.join("pyproject.toml").exists()
+                || worktree_path.join("requirements.txt").exists()
+                || worktree_path.join("setup.py").exists()
+            {
+                configured_checks.push(ConfiguredCheck {
+                    id: "chk_python_test".to_string(),
+                    check_type: "UNIT_TESTS".to_string(),
+                    command: "pytest".to_string(),
+                    args_json: "[]".to_string(),
+                    timeout_secs: 60,
+                    required: true,
+                });
+            } else {
+                // Generic smoke check
+                configured_checks.push(ConfiguredCheck {
+                    id: "chk_git_status".to_string(),
+                    check_type: "BUILD".to_string(),
+                    command: "git status".to_string(),
+                    args_json: "[]".to_string(),
+                    timeout_secs: 30,
+                    required: true,
+                });
+            }
+        }
+
+        Ok(configured_checks)
+    }
+
     /// Executes all configured verification profile checks and machine evaluators for an attempt
     pub fn execute_profile_for_attempt(
         &self,
@@ -252,86 +513,21 @@ impl VerificationEngine {
             task_id, attempt_id, commit_sha
         );
 
-        let conn = self.db.lock();
-
-        // 1. Query custom verification profiles for this project / task
-        let mut stmt_prof = conn
-            .prepare("SELECT id, check_type, command, args_json, timeout_secs, required FROM verification_profiles WHERE project_id = ?1 AND (task_id IS NULL OR task_id = ?2)")
-            .map_err(|e| e.to_string())?;
-
-        let profiles_iter = stmt_prof
-            .query_map(rusqlite::params![project_id, task_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i32>(4)?,
-                    row.get::<_, bool>(5)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-
-        let mut configured_checks = Vec::new();
-        for p in profiles_iter.flatten() {
-            configured_checks.push(p);
-        }
-        drop(stmt_prof);
-        drop(conn);
-
-        // If no custom profile configured, build standard suite from repository markers
-        if configured_checks.is_empty() {
-            if worktree_path.join("Cargo.toml").exists() {
-                configured_checks.push((
-                    "chk_cargo_check".to_string(),
-                    "TYPECHECK".to_string(),
-                    "cargo check".to_string(),
-                    "[]".to_string(),
-                    60,
-                    true,
-                ));
-                configured_checks.push((
-                    "chk_cargo_test".to_string(),
-                    "UNIT_TESTS".to_string(),
-                    "cargo test".to_string(),
-                    "[]".to_string(),
-                    120,
-                    true,
-                ));
-            } else if worktree_path.join("package.json").exists() {
-                configured_checks.push((
-                    "chk_npm_test".to_string(),
-                    "UNIT_TESTS".to_string(),
-                    "npm test --if-present".to_string(),
-                    "[]".to_string(),
-                    60,
-                    true,
-                ));
-            } else {
-                // Generic smoke check
-                configured_checks.push((
-                    "chk_git_status".to_string(),
-                    "BUILD".to_string(),
-                    "git status".to_string(),
-                    "[]".to_string(),
-                    30,
-                    true,
-                ));
-            }
-        }
-
+        let configured_checks =
+            self.get_verification_profiles(project_id, Some(task_id), worktree_path)?;
         let mut results = Vec::new();
         let now_str = Utc::now().to_rfc3339();
 
-        for (chk_id, chk_type, cmd, _args_json, timeout_secs, _required) in configured_checks {
-            let timeout = Duration::from_secs(timeout_secs.max(1) as u64);
+        for check in &configured_checks {
+            let timeout = Duration::from_secs(check.timeout_secs.max(1) as u64);
+            let full_cmd = build_command_with_args(&check.command, &check.args_json);
             let run_res = self.execute_check(
                 task_id,
-                &chk_id,
-                &chk_type,
+                &check.id,
+                &check.check_type,
                 worktree_path,
                 commit_sha,
-                &cmd,
+                &full_cmd,
                 timeout,
             )?;
 
@@ -347,8 +543,8 @@ impl VerificationEngine {
                 task_id: task_id.to_string(),
                 attempt_id: attempt_id.to_string(),
                 criterion_id: None,
-                evaluator_name: chk_type.clone(),
-                evaluator_type: chk_type.clone(),
+                evaluator_name: check.check_type.clone(),
+                evaluator_type: check.check_type.clone(),
                 evaluator_version: "1.0.0".to_string(),
                 commit_sha: commit_sha.to_string(),
                 exit_code: run_res.exit_code,
@@ -376,9 +572,15 @@ impl VerificationEngine {
             results.push(eval_res);
         }
 
-        // Automatic machine criteria satisfaction derived strictly from passing evaluators
-        let all_evaluators_passed = !results.is_empty() && results.iter().all(|r| r.passed);
-        if all_evaluators_passed {
+        // Automatic machine criteria satisfaction derived strictly from passing required evaluators
+        let all_required_passed = !results.is_empty()
+            && configured_checks
+                .iter()
+                .zip(&results)
+                .filter(|(c, _)| c.required)
+                .all(|(_, r)| r.passed);
+
+        if all_required_passed {
             let conn = self.db.lock();
             conn.execute(
                 "UPDATE acceptance_criteria SET is_satisfied = 1 WHERE task_id = ?1",
@@ -388,6 +590,55 @@ impl VerificationEngine {
         }
 
         Ok(results)
+    }
+
+    /// Executes post-merge verification against the exact integration HEAD commit.
+    /// Honors configured verification profiles, args_json, and required/optional semantics.
+    pub fn execute_post_merge_verification(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        worktree_path: &Path,
+        commit_sha: &str,
+        max_timeout: Duration,
+    ) -> Result<PostMergeVerificationOutcome, String> {
+        let configured_checks =
+            self.get_verification_profiles(project_id, Some(task_id), worktree_path)?;
+        let mut runs = Vec::new();
+        let mut required_passed = true;
+        let mut timed_out = false;
+
+        for check in &configured_checks {
+            let configured_timeout = Duration::from_secs(check.timeout_secs.max(1) as u64);
+            let timeout = configured_timeout.min(max_timeout);
+            let full_cmd = build_command_with_args(&check.command, &check.args_json);
+
+            let run = self.execute_check(
+                task_id,
+                &check.id,
+                &check.check_type,
+                worktree_path,
+                commit_sha,
+                &full_cmd,
+                timeout,
+            )?;
+
+            if run.timed_out {
+                timed_out = true;
+            }
+
+            if check.required && !run.is_passed {
+                required_passed = false;
+            }
+
+            runs.push(run);
+        }
+
+        Ok(PostMergeVerificationOutcome {
+            passed: required_passed,
+            timed_out,
+            runs,
+        })
     }
 
     /// Verifies task submission against mandatory checklist, evidence, machine evaluators, and coordinator checks
@@ -415,8 +666,9 @@ impl VerificationEngine {
             .map_err(|e| e.to_string())?;
 
         let mut missing_steps = Vec::new();
-        for step in steps_iter.flatten() {
-            let (_id, title, is_mandatory, status) = step;
+        for step in steps_iter {
+            let (_id, title, is_mandatory, status) =
+                step.map_err(|e| format!("Failed to read task step row: {}", e))?;
             if is_mandatory && status != "COMPLETED" {
                 missing_steps.push(title);
             }
@@ -432,13 +684,19 @@ impl VerificationEngine {
             .map_err(|e| e.to_string())?;
 
         let mut unresolved_violations = Vec::new();
-        for v in violations_iter.flatten() {
-            unresolved_violations.push(v);
+        for v in violations_iter {
+            unresolved_violations
+                .push(v.map_err(|e| format!("Failed to read scope violation row: {}", e))?);
         }
 
         // 3. Coordinator-Executed Verification Runs Gate
         let mut stmt_runs = conn
-            .prepare("SELECT check_name, is_passed, is_stale FROM verification_runs WHERE task_id = ?1 AND commit_sha = ?2")
+            .prepare(
+                "SELECT vr.check_name, vr.is_passed, vr.is_stale, COALESCE(vp.required, 1)
+                 FROM verification_runs vr
+                 LEFT JOIN verification_profiles vp ON vr.check_id = vp.id
+                 WHERE vr.task_id = ?1 AND vr.commit_sha = ?2",
+            )
             .map_err(|e| e.to_string())?;
 
         let runs_iter = stmt_runs
@@ -447,17 +705,54 @@ impl VerificationEngine {
                     row.get::<_, String>(0)?,
                     row.get::<_, bool>(1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
 
         let mut total_runs_count = 0;
-        let mut failed_checks = Vec::new();
-        for r in runs_iter.flatten() {
+        let mut failed_required_checks = Vec::new();
+        for r in runs_iter {
+            let (check_name, is_passed, is_stale, is_required) =
+                r.map_err(|e| format!("Failed to read verification run row: {}", e))?;
             total_runs_count += 1;
-            let (check_name, is_passed, is_stale) = r;
-            if !is_passed || is_stale {
-                failed_checks.push(check_name);
+            if is_required && (!is_passed || is_stale) {
+                failed_required_checks.push(check_name);
+            }
+        }
+
+        // Query configured required verification profiles for this project / task
+        let mut stmt_req_profiles = conn
+            .prepare(
+                "SELECT id, check_type FROM verification_profiles
+                 WHERE (project_id = (SELECT project_id FROM tasks WHERE id = ?1) OR task_id = ?1)
+                   AND (task_id IS NULL OR task_id = ?1)
+                   AND required = 1",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let req_profiles: Vec<(String, String)> = stmt_req_profiles
+            .query_map([task_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read required verification profiles: {}", e))?;
+
+        let mut missing_required_checks = Vec::new();
+        for (prof_id, check_type) in req_profiles {
+            let has_passing_run: bool = conn
+                .query_row(
+                    "SELECT 1 FROM verification_runs
+                     WHERE task_id = ?1 AND commit_sha = ?2 AND check_id = ?3 AND is_passed = 1 AND is_stale = 0
+                     LIMIT 1",
+                    rusqlite::params![task_id, current_head_sha, prof_id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !has_passing_run {
+                missing_required_checks.push(format!(
+                    "Missing required verification check: {} ({})",
+                    prof_id, check_type
+                ));
             }
         }
 
@@ -477,8 +772,9 @@ impl VerificationEngine {
             .map_err(|e| e.to_string())?;
 
         let mut failed_evaluators = Vec::new();
-        for ev in evals_iter.flatten() {
-            let (name, passed, exit_code) = ev;
+        for ev in evals_iter {
+            let (name, passed, exit_code) =
+                ev.map_err(|e| format!("Failed to read evaluator result row: {}", e))?;
             if !passed {
                 failed_evaluators.push(format!(
                     "Machine evaluator '{}' failed (exit code: {})",
@@ -497,11 +793,14 @@ impl VerificationEngine {
         for file in &unresolved_violations {
             rejection_reasons.push(format!("Unresolved out-of-scope modification: {}", file));
         }
-        for check in &failed_checks {
+        for check in &failed_required_checks {
             rejection_reasons.push(format!(
                 "Coordinator verification check '{}' failed or is stale",
                 check
             ));
+        }
+        for missing in &missing_required_checks {
+            rejection_reasons.push(missing.clone());
         }
         for eval_err in &failed_evaluators {
             rejection_reasons.push(eval_err.clone());
@@ -514,7 +813,7 @@ impl VerificationEngine {
             missing_mandatory_steps: missing_steps,
             missing_evidence_step_ids: Vec::new(),
             unresolved_scope_violations: unresolved_violations,
-            failed_coordinator_checks: failed_checks,
+            failed_coordinator_checks: failed_required_checks,
             rejection_reasons,
         })
     }
@@ -560,10 +859,9 @@ impl VerificationEngine {
             })
             .map_err(|e| e.to_string())?;
 
-        let mut verification_runs = Vec::new();
-        for r in runs_iter.flatten() {
-            verification_runs.push(r);
-        }
+        let verification_runs: Vec<VerificationRun> = runs_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read verification run row: {}", e))?;
 
         // Retrieve active attempt ID and attempt number. When no attempt row exists the
         // digest must stay deterministic, so the fallback is a fixed empty identity (the
@@ -582,7 +880,7 @@ impl VerificationEngine {
                 "SELECT id, criterion, is_satisfied FROM acceptance_criteria WHERE task_id = ?1 ORDER BY id ASC",
             )
             .map_err(|e| e.to_string())?;
-        let criteria_json: String = criteria_stmt
+        let criteria_rows: Vec<serde_json::Value> = criteria_stmt
             .query_map([task_id], |r| {
                 Ok(serde_json::json!({
                     "id": r.get::<_, String>(0)?,
@@ -590,15 +888,16 @@ impl VerificationEngine {
                     "is_satisfied": r.get::<_, bool>(2)?,
                 }))
             })
-            .map(|iter| {
-                serde_json::to_string(&iter.flatten().collect::<Vec<_>>())
-                    .unwrap_or("[]".to_string())
-            })
-            .unwrap_or("[]".to_string());
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read criterion row: {}", e))?;
+        let criteria_json = serde_json::to_string(&criteria_rows).map_err(|e| e.to_string())?;
         drop(criteria_stmt);
 
-        let mut steps_stmt = conn.prepare("SELECT id, title, description, is_mandatory, status FROM task_steps WHERE task_id = ?1 ORDER BY id ASC").map_err(|e| e.to_string())?;
-        let steps_json: String = steps_stmt
+        let mut steps_stmt = conn
+            .prepare("SELECT id, title, description, is_mandatory, status FROM task_steps WHERE task_id = ?1 ORDER BY id ASC")
+            .map_err(|e| e.to_string())?;
+        let steps_rows: Vec<serde_json::Value> = steps_stmt
             .query_map([task_id], |r| {
                 Ok(serde_json::json!({
                     "id": r.get::<_, String>(0)?,
@@ -608,22 +907,21 @@ impl VerificationEngine {
                     "status": r.get::<_, String>(4)?,
                 }))
             })
-            .map(|iter| {
-                serde_json::to_string(&iter.flatten().collect::<Vec<_>>())
-                    .unwrap_or("[]".to_string())
-            })
-            .unwrap_or("[]".to_string());
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read task step row: {}", e))?;
+        let steps_json = serde_json::to_string(&steps_rows).map_err(|e| e.to_string())?;
         drop(steps_stmt);
 
         // Fetch machine evaluator results (identity, version and full result payload) for
         // the same commit HEAD the bundle seals, in a deterministic order.
         let mut evals_stmt = conn
             .prepare(
-                "SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 AND commit_sha = ?2 ORDER BY id ASC",
+                "SELECT id, task_id, attempt_id, criterion_id, evaluator_name, evaluator_type, evaluator_version, commit_sha, exit_code, stdout_output, stderr_output, output_sha256, duration_ms, passed, evaluated_at FROM evaluator_results WHERE task_id = ?1 AND commit_sha = ?2 AND attempt_id = ?3 ORDER BY id ASC",
             )
             .map_err(|e| e.to_string())?;
         let evaluator_results: Vec<EvaluatorResult> = evals_stmt
-            .query_map(rusqlite::params![task_id, head_sha], |r| {
+            .query_map(rusqlite::params![task_id, head_sha, attempt_id], |r| {
                 Ok(EvaluatorResult {
                     id: r.get(0)?,
                     task_id: r.get(1)?,
@@ -643,8 +941,8 @@ impl VerificationEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read evaluator result row: {}", e))?;
         drop(evals_stmt);
 
         // Scope violations bound to this attempt, in a deterministic order.
@@ -666,8 +964,8 @@ impl VerificationEngine {
                 })
             })
             .map_err(|e| e.to_string())?
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read scope violation row: {}", e))?;
         drop(violations_stmt);
 
         // Canonical ordering: sort files so the digest is independent of input order and

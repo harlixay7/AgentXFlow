@@ -219,20 +219,6 @@ export const IntegrationsView: React.FC<IntegrationsViewProps> = ({ agents = [],
             </div>
 
             <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
-              <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>LEGACY SSE ENDPOINT</div>
-              <div style={{ color: 'var(--accent-purple)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
-                <span style={{ userSelect: 'text' }}>{mcpInfo.sse_url}</span>
-                <button
-                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
-                  onClick={() => copyText(mcpInfo.sse_url, 'sse')}
-                  title="Copy legacy SSE URL"
-                >
-                  {copiedKey === 'sse' ? <Check size={12} style={{ color: 'var(--accent-green)' }} /> : <Copy size={12} />}
-                </button>
-              </div>
-            </div>
-
-            <div style={{ padding: 10, backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)' }}>
               <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 2 }}>BEARER BOOTSTRAP TOKEN</div>
               <div style={{ color: 'var(--text-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'text' }}>
                 <span style={{ userSelect: 'text' }}>{mcpInfo.token ? mcpInfo.token.substring(0, 16) + '...' : 'SECURE'}</span>

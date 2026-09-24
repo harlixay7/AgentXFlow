@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, Plus, Trash } from 'lucide-react';
+import { X, Plus, Trash, AlertCircle } from 'lucide-react';
 import { coordinatorApi } from '../api/coordinator';
 
 interface NewTaskModalProps {
@@ -21,16 +21,25 @@ export const NewTaskModal: React.FC<NewTaskModalProps> = ({ projectId, onClose, 
     'All tests pass cleanly without errors',
     'No scope violations outside declared write locks',
   ]);
+  const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) return;
 
-    const formattedSteps: Array<[string, string, boolean]> = steps.map((s) => [s.title, s.desc, s.isMandatory]);
-    await coordinatorApi.createTask(projectId, title, description, priority, formattedSteps, criteria);
-    onRefresh();
-    onClose();
+    setFeedback(null);
+    try {
+      const formattedSteps: Array<[string, string, boolean]> = steps.map((s) => [s.title, s.desc, s.isMandatory]);
+      await coordinatorApi.createTask(projectId, title, description, priority, formattedSteps, criteria);
+      onRefresh();
+      onClose();
+    } catch (e) {
+      setFeedback({
+        message: `Failed to create task: ${e instanceof Error ? e.message : String(e)}`,
+        type: 'error',
+      });
+    }
   };
 
   return (
@@ -67,6 +76,24 @@ export const NewTaskModal: React.FC<NewTaskModalProps> = ({ projectId, onClose, 
         </div>
 
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {feedback && (
+            <div
+              style={{
+                padding: '10px 14px',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: 12,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                backgroundColor: feedback.type === 'success' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                border: `1px solid ${feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}`,
+                color: feedback.type === 'success' ? 'var(--accent-green)' : 'var(--accent-red)',
+              }}
+            >
+              <AlertCircle size={14} />
+              <span>{feedback.message}</span>
+            </div>
+          )}
           <div>
             <label className="section-label">Task Title</label>
             <input

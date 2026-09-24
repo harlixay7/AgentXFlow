@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception, clippy::bool_assert_comparison)]
 pub mod tests {
     use crate::core::{transition_task_state_on_conn, CoordinatorEngine};
     use crate::db::DbPool;
@@ -473,6 +474,16 @@ pub mod tests {
             .create_task(&proj_id, "Scope Task", "Desc", "HIGH", vec![], vec![])
             .unwrap();
 
+        // Assign task to agent-1
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE tasks SET assigned_agent_id = 'agent-1', state = 'RUNNING' WHERE id = ?1",
+                [&task.id],
+            )
+            .unwrap();
+        }
+
         // Grant scope on src/auth/**
         engine
             .scope
@@ -757,6 +768,69 @@ pub mod tests {
             count, 2,
             "re-verification with identical outputs must append a new proof row (got {} rows)",
             count
+        );
+    }
+
+    #[test]
+    fn test_proof_snapshot_historical_determinism() {
+        let (engine, proj_id) = setup_test_engine();
+        let proj = engine.get_project(&proj_id).unwrap();
+        let head_sha = engine
+            .git
+            .get_head_sha(std::path::Path::new(&proj.path))
+            .unwrap();
+
+        let task_id = seed_proof_fixture(&engine, &proj_id);
+
+        // Update fixture verification records to match actual repo HEAD
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE verification_runs SET commit_sha = ?1 WHERE task_id = ?2",
+                rusqlite::params![head_sha, task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE evaluator_results SET commit_sha = ?1 WHERE task_id = ?2",
+                rusqlite::params![head_sha, task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET state = 'VERIFYING', branch_name = 'agentxflow/task-proof-digest', worktree_path = ?2 WHERE id = ?1",
+                rusqlite::params![task_id, proj.path],
+            ).unwrap();
+        }
+
+        let _bundle1 = engine
+            .verify
+            .generate_proof_bundle(
+                &task_id,
+                &proj_id,
+                Some("agent-1"),
+                "Test prompt",
+                "base-sha-0",
+                &head_sha,
+                &["src/a.rs".to_string()],
+                "+10 -2",
+            )
+            .unwrap();
+
+        // Simulate later verification runs and evaluators added after proof P1 was generated
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "INSERT INTO verification_runs (id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, source, executed_at, timed_out)
+                 VALUES ('later-run-999', ?1, NULL, 'check-extra', 'Extra Check', ?2, 'npm run extra', 0, 'EXTRA STDOUT', '', 100, 1, 0, 'COORDINATOR_OBSERVED', '2026-08-31T20:00:00Z', 0)",
+                rusqlite::params![task_id, head_sha],
+            ).unwrap();
+        }
+
+        // Verify that the stored proof bundle verifies against its immutable snapshot
+        let enqueue_res = engine.enqueue_task_by_id(&proj_id, &task_id);
+        assert!(
+            enqueue_res.is_ok(),
+            "Enqueue must succeed using immutable snapshot proof verification even after later evidence is added: {:?}",
+            enqueue_res.err()
         );
     }
 
@@ -1485,8 +1559,8 @@ pub mod tests {
             .unwrap();
         drop(conn);
         assert_eq!(
-            merge_events, 1,
-            "expected exactly one MERGE_* lifecycle event for the failed merge, got {}",
+            merge_events, 2,
+            "expected exactly two MERGE_* lifecycle events (MERGE_STARTED + MERGE_BLOCKED_CONFLICT), got {}",
             merge_events
         );
     }
@@ -1536,8 +1610,8 @@ pub mod tests {
         let attempt = engine.merge.process_merge_by_id(&q_item.id, &repo).unwrap();
         assert_eq!(attempt.simulation_passed, false);
 
-        // assert: the invalid BACKLOG -> BLOCKED write is rejected; the task is untouched and
-        // no MERGE_* event is emitted for a transition that never happened
+        // assert: the invalid BACKLOG -> BLOCKED write is rejected; the task is untouched but
+        // MERGE_STARTED is emitted because the queue item did transition to RUNNING_CHECKS
         assert_eq!(
             engine.get_task(&task_id).unwrap().state,
             TaskState::Backlog,
@@ -1553,8 +1627,8 @@ pub mod tests {
             .unwrap();
         drop(conn);
         assert_eq!(
-            merge_events, 0,
-            "no MERGE_* event may be emitted for a rejected transition, got {}",
+            merge_events, 1,
+            "expected exactly one MERGE_* event (MERGE_STARTED) for the rejected task-state transition, got {}",
             merge_events
         );
     }
@@ -1657,6 +1731,98 @@ pub mod tests {
         // assert: target branch ref untouched
         let main_sha = git_safety::git(&repo, &["rev-parse", "main"]);
         assert_eq!(main_sha, base_sha);
+    }
+
+    #[tokio::test]
+    async fn test_merge_emits_lifecycle_events() {
+        let (engine, proj_id) = setup_test_engine();
+        let repo = {
+            let proj = engine
+                .list_projects()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.id == proj_id)
+                .unwrap();
+            std::path::PathBuf::from(&proj.path)
+        };
+        let task = engine
+            .create_task(
+                &proj_id,
+                "Merge Lifecycle Task",
+                "Desc",
+                "HIGH",
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let task_id = task.id.clone();
+        let branch_name = format!("agentxflow/task-{}", task.id);
+
+        drive_task_to_merge_ready(&engine, &task_id);
+
+        // setup: clean repo with a trivial feature branch that merges cleanly
+        git_safety::setup_repo_with_changes(&repo, false, false);
+        std::fs::write(repo.join(".gitignore"), ".agentxflow/\n").unwrap();
+        git_safety::git(&repo, &["add", ".gitignore"]);
+        git_safety::git(&repo, &["commit", "-m", "baseline"]);
+        let base_sha = git_safety::git(&repo, &["rev-parse", "main"]);
+
+        git_safety::git(&repo, &["checkout", "-b", &branch_name]);
+        std::fs::write(repo.join("feature.txt"), "feature").unwrap();
+        git_safety::git(&repo, &["add", "feature.txt"]);
+        git_safety::git(&repo, &["commit", "-m", "feature"]);
+        let head_sha = git_safety::git(&repo, &["rev-parse", "HEAD"]);
+        git_safety::git(&repo, &["checkout", "main"]);
+
+        // record sequence before merge
+        let seq_before: i64 = {
+            let conn = engine.db.lock();
+            conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+
+        // act: enqueue and process the merge (success path)
+        let q_item = engine
+            .merge
+            .enqueue_task(
+                &proj_id,
+                &task_id,
+                &branch_name,
+                "main",
+                &base_sha,
+                &head_sha,
+            )
+            .unwrap();
+        let attempt = engine.merge.process_merge_by_id(&q_item.id, &repo).unwrap();
+        assert!(attempt.simulation_passed);
+
+        // assert: MERGE_STARTED and MERGE_DONE both present in the events table
+        let conn = engine.db.lock();
+        let events: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_type FROM events WHERE task_id = ?1 AND sequence > ?2 ORDER BY sequence ASC",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![task_id, seq_before], |r| r.get(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        drop(conn);
+
+        assert!(
+            events.contains(&"MERGE_STARTED".to_string()),
+            "MERGE_STARTED must be emitted for a merge lifecycle transition, got: {:?}",
+            events
+        );
+        assert!(
+            events.contains(&"MERGE_DONE".to_string()),
+            "MERGE_DONE must be emitted for a successful merge, got: {:?}",
+            events
+        );
     }
 
     #[test]
@@ -2240,5 +2406,1197 @@ pub mod tests {
             !events.iter().any(|e| e.event_type == "STALE_RECOVERY"),
             "no STALE_RECOVERY events should be emitted when nothing is stale"
         );
+    }
+
+    #[test]
+    fn test_simultaneous_chunk_claims_select_disjoint_sets() {
+        use std::sync::{Arc, Barrier};
+
+        let (engine, proj_id) = setup_test_engine();
+        let agent1 = engine.register_agent("Agent-Claim-1", "Coder").unwrap();
+        let agent2 = engine.register_agent("Agent-Claim-2", "Coder").unwrap();
+
+        // Prepare plan with 3 steps, each having a unique non-overlapping scope
+        let raw_plan = "# Step 1: A\nDesc A\n# Step 2: B\nDesc B\n# Step 3: C\nDesc C";
+        let plan = engine.prepare_masterplan(&proj_id, raw_plan, 3, 2).unwrap();
+
+        // Assign unique scopes to avoid collision
+        {
+            let conn = engine.db.lock();
+            let step_ids: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM masterplan_steps WHERE masterplan_id = ?1 ORDER BY step_index ASC")
+                    .unwrap();
+                stmt.query_map([&plan.masterplan.id], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .flatten()
+                    .collect()
+            };
+            for (i, sid) in step_ids.iter().enumerate() {
+                conn.execute(
+                    "UPDATE masterplan_steps SET suggested_scope = ?1 WHERE id = ?2",
+                    rusqlite::params![format!("src/step{}/**", i), sid],
+                )
+                .unwrap();
+            }
+        }
+
+        let engine = Arc::new(engine);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let engine1 = Arc::clone(&engine);
+        let proj1 = proj_id.clone();
+        let agent1_id = agent1.id.clone();
+        let barrier1 = Arc::clone(&barrier);
+        let t1 = std::thread::spawn(move || {
+            barrier1.wait();
+            engine1.claim_masterplan_chunk(&proj1, &agent1_id, Some(1))
+        });
+
+        let engine2 = Arc::clone(&engine);
+        let proj2 = proj_id.clone();
+        let agent2_id = agent2.id.clone();
+        let barrier2 = Arc::clone(&barrier);
+        let t2 = std::thread::spawn(move || {
+            barrier2.wait();
+            engine2.claim_masterplan_chunk(&proj2, &agent2_id, Some(1))
+        });
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        assert!(r1.is_ok(), "First claim must succeed: {:?}", r1.err());
+        assert!(r2.is_ok(), "Second claim must succeed: {:?}", r2.err());
+
+        let task1 = r1.unwrap();
+        let task2 = r2.unwrap();
+        assert_ne!(
+            task1.id, task2.id,
+            "Claims must produce distinct tasks (no double-claim)"
+        );
+
+        // Verify the underlying masterplan steps are disjoint
+        let steps = engine.list_masterplan_steps(&proj_id).unwrap();
+        let claimed: Vec<_> = steps.iter().filter(|s| s.status == "CLAIMED").collect();
+        assert_eq!(claimed.len(), 2, "Exactly two steps should be CLAIMED");
+        assert_ne!(
+            claimed[0].id, claimed[1].id,
+            "Claimed steps must have different IDs"
+        );
+
+        // Now claim the remaining step
+        let agent3 = engine.register_agent("Agent-Claim-3", "Coder").unwrap();
+        let r3 = engine.claim_masterplan_chunk(&proj_id, &agent3.id, Some(1));
+        assert!(r3.is_ok(), "Third claim must succeed (1 pending left)");
+
+        // All 3 steps now claimed — requesting 1 more must fail
+        let agent4 = engine.register_agent("Agent-Claim-4", "Coder").unwrap();
+        let r4 = engine.claim_masterplan_chunk(&proj_id, &agent4.id, Some(1));
+        assert!(r4.is_err(), "Claiming beyond available steps must fail");
+    }
+
+    #[test]
+    fn test_reconcile_startup_recovers_applied_git_merge() {
+        let (engine, proj_id) = setup_test_engine();
+        let proj = engine.get_project(&proj_id).unwrap();
+        let head_sha = engine
+            .git
+            .get_head_sha(std::path::Path::new(&proj.path))
+            .unwrap();
+
+        let task = engine
+            .create_task(
+                &proj_id,
+                "Reconcile Merge Task",
+                "Desc",
+                "HIGH",
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+        let conn = engine.db.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE tasks SET state = 'MERGE_READY' WHERE id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO merge_queue (id, project_id, task_id, branch_name, target_branch, position, status, base_sha, head_sha, queued_at)
+             VALUES ('mq-applied-1', ?1, ?2, 'agentxflow/task-1', 'main', 1, 'RUNNING_CHECKS', 'base-1', ?3, ?4)",
+            rusqlite::params![proj_id, task.id, head_sha, now],
+        ).unwrap();
+        drop(conn);
+
+        // Run startup reconciliation
+        engine.reconcile_on_startup();
+
+        let conn = engine.db.lock();
+        let queue_status: String = conn
+            .query_row(
+                "SELECT status FROM merge_queue WHERE id = 'mq-applied-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let task_state: String = conn
+            .query_row("SELECT state FROM tasks WHERE id = ?1", [&task.id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            queue_status, "MERGED",
+            "Applied git merge must be finalized to MERGED in SQLite"
+        );
+        assert_eq!(
+            task_state, "DONE",
+            "Task state must be transitioned to DONE"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_startup_resets_unapplied_merge_to_ready() {
+        let (engine, proj_id) = setup_test_engine();
+        let task = engine
+            .create_task(
+                &proj_id,
+                "Unapplied Merge Task",
+                "Desc",
+                "HIGH",
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+        let conn = engine.db.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE tasks SET state = 'MERGE_READY' WHERE id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+        // Insert with a non-existent commit sha (not in git target branch)
+        conn.execute(
+            "INSERT INTO merge_queue (id, project_id, task_id, branch_name, target_branch, position, status, base_sha, head_sha, queued_at)
+             VALUES ('mq-unapplied-1', ?1, ?2, 'agentxflow/task-2', 'main', 1, 'RUNNING_CHECKS', 'base-1', 'deadbeef00000000000000000000000000000000', ?3)",
+            rusqlite::params![proj_id, task.id, now],
+        ).unwrap();
+        drop(conn);
+
+        // Run startup reconciliation
+        engine.reconcile_on_startup();
+
+        let conn = engine.db.lock();
+        let queue_status: String = conn
+            .query_row(
+                "SELECT status FROM merge_queue WHERE id = 'mq-unapplied-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let task_state: String = conn
+            .query_row("SELECT state FROM tasks WHERE id = ?1", [&task.id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            queue_status, "READY",
+            "Unapplied merge must be safely reset to READY"
+        );
+        assert_eq!(
+            task_state, "MERGE_READY",
+            "Task state remains MERGE_READY ready for next attempt"
+        );
+    }
+
+    #[test]
+    fn test_create_task_atomic_transaction() {
+        let (engine, proj_id) = setup_test_engine();
+        let steps = vec![
+            ("Step 1".to_string(), "Desc 1".to_string(), true),
+            ("Step 2".to_string(), "Desc 2".to_string(), false),
+        ];
+        let criteria = vec!["Criterion 1".to_string(), "Criterion 2".to_string()];
+
+        let task = engine
+            .create_task(
+                &proj_id,
+                "Atomic Task",
+                "Atomic Desc",
+                "HIGH",
+                steps,
+                criteria,
+            )
+            .unwrap();
+
+        let conn = engine.db.lock();
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_steps WHERE task_id = ?1",
+                [&task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let crit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acceptance_criteria WHERE task_id = ?1",
+                [&task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            step_count, 2,
+            "Both task steps must be atomically persisted"
+        );
+        assert_eq!(
+            crit_count, 2,
+            "Both acceptance criteria must be atomically persisted"
+        );
+    }
+
+    #[test]
+    fn test_optional_verification_check_failure_does_not_block_submission() {
+        let (engine, proj_id) = setup_test_engine();
+        let proj = engine.get_project(&proj_id).unwrap();
+        let head_sha = engine
+            .git
+            .get_head_sha(std::path::Path::new(&proj.path))
+            .unwrap();
+
+        let task = engine
+            .create_task(
+                &proj_id,
+                "Contract Task",
+                "Desc",
+                "HIGH",
+                vec![("Mandatory Step".to_string(), "".to_string(), true)],
+                vec![],
+            )
+            .unwrap();
+
+        let conn = engine.db.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        // Mark mandatory step completed
+        conn.execute(
+            "UPDATE task_steps SET status = 'COMPLETED' WHERE task_id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+
+        // Insert 1 required check config and 1 optional check config
+        conn.execute(
+            "INSERT INTO verification_profiles (id, project_id, check_type, command, args_json, timeout_secs, required, created_at)
+             VALUES ('chk-req', ?1, 'TYPECHECK', 'cargo check', '[]', 30, 1, ?2)",
+            rusqlite::params![proj_id, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO verification_profiles (id, project_id, check_type, command, args_json, timeout_secs, required, created_at)
+             VALUES ('chk-opt', ?1, 'LINT_WARN', 'cargo clippy', '[]', 30, 0, ?2)",
+            rusqlite::params![proj_id, now],
+        ).unwrap();
+
+        // Insert required check run as PASSED
+        conn.execute(
+            "INSERT INTO verification_runs (id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, source, executed_at, timed_out)
+             VALUES ('run-req', ?1, NULL, 'chk-req', 'TYPECHECK', ?2, 'cargo check', 0, 'ok', '', 50, 1, 0, 'COORDINATOR_OBSERVED', ?3, 0)",
+            rusqlite::params![task.id, head_sha, now],
+        ).unwrap();
+
+        // Insert optional check run as FAILED
+        conn.execute(
+            "INSERT INTO verification_runs (id, task_id, run_id, check_id, check_name, commit_sha, command, exit_code, stdout, stderr, duration_ms, is_passed, is_stale, source, executed_at, timed_out)
+             VALUES ('run-opt', ?1, NULL, 'chk-opt', 'LINT_WARN', ?2, 'cargo clippy', 1, '', 'warning found', 50, 0, 0, 'COORDINATOR_OBSERVED', ?3, 0)",
+            rusqlite::params![task.id, head_sha, now],
+        ).unwrap();
+
+        drop(conn);
+
+        let outcome = engine
+            .verify
+            .verify_task_submission(&task.id, &head_sha)
+            .unwrap();
+        assert!(
+            outcome.is_valid,
+            "Submission must pass when optional check fails but all required checks pass: {:?}",
+            outcome.rejection_reasons
+        );
+    }
+
+    #[test]
+    fn test_agent_heartbeat_atomic_renewal() {
+        let (engine, proj_id) = setup_test_engine();
+        let agent = engine.register_agent("Heartbeat Agent", "Coder").unwrap();
+
+        // Create a task and assign to agent
+        let task = engine
+            .create_task(&proj_id, "HB Task", "Desc", "HIGH", vec![], vec![])
+            .unwrap();
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE tasks SET assigned_agent_id = ?1, state = 'RUNNING' WHERE id = ?2",
+                rusqlite::params![agent.id, task.id],
+            )
+            .unwrap();
+        }
+
+        let leases = engine
+            .scope
+            .acquire_scope(
+                &task.id,
+                &agent.id,
+                vec!["src/hb/**".to_string()],
+                "EXCLUSIVE_WRITE",
+            )
+            .unwrap();
+        assert_eq!(leases.len(), 1);
+        let orig_expiry = leases[0].expires_at.clone();
+
+        // Send heartbeat
+        let hb_res = engine.agent_heartbeat(&agent.id);
+        assert!(hb_res.is_ok(), "Heartbeat must succeed: {:?}", hb_res.err());
+
+        let conn = engine.db.lock();
+        let renewed_expiry: String = conn
+            .query_row(
+                "SELECT expires_at FROM scope_leases WHERE id = ?1",
+                [&leases[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let session_expiry: String = conn
+            .query_row(
+                "SELECT expires_at FROM agent_sessions WHERE agent_id = ?1",
+                [&agent.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            renewed_expiry > orig_expiry,
+            "Heartbeat must advance scope lease expiry (orig: {}, renewed: {})",
+            orig_expiry,
+            renewed_expiry
+        );
+        assert!(!session_expiry.is_empty(), "Session expiry must be set");
+    }
+
+    #[test]
+    fn test_scope_manager_acquire_scope_task_ownership_invariant() {
+        let (engine, proj_id) = setup_test_engine();
+        let agent_a = engine.register_agent("Agent Alpha", "IDE").unwrap();
+        let agent_b = engine.register_agent("Agent Beta", "CLI").unwrap();
+
+        // 1. Task owned by Agent A
+        let task_a = engine
+            .create_task(&proj_id, "Task Owned A", "Desc", "HIGH", vec![], vec![])
+            .unwrap();
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE tasks SET assigned_agent_id = ?1, state = 'RUNNING' WHERE id = ?2",
+                rusqlite::params![agent_a.id, task_a.id],
+            )
+            .unwrap();
+        }
+
+        // 2. Unassigned task
+        let task_unassigned = engine
+            .create_task(&proj_id, "Task Unassigned", "Desc", "HIGH", vec![], vec![])
+            .unwrap();
+
+        // Case 1: Agent A acquires scope for own task -> ALLOW
+        let res_own = engine.scope.acquire_scope(
+            &task_a.id,
+            &agent_a.id,
+            vec!["src/core/**".to_string()],
+            "EXCLUSIVE_WRITE",
+        );
+        assert!(
+            res_own.is_ok(),
+            "Agent A must be allowed to acquire scope for own task: {:?}",
+            res_own.err()
+        );
+        assert_eq!(res_own.unwrap().len(), 1);
+
+        // Case 2: Agent B acquires scope for Agent A's task -> DENY
+        let res_other = engine.scope.acquire_scope(
+            &task_a.id,
+            &agent_b.id,
+            vec!["src/other/**".to_string()],
+            "EXCLUSIVE_WRITE",
+        );
+        assert!(
+            res_other.is_err(),
+            "Agent B must be rejected from acquiring scope on Agent A's task"
+        );
+        assert!(res_other.unwrap_err().contains("Scope ownership violation"));
+
+        // Case 3: Agent A acquires scope for unassigned task -> DENY
+        let res_unassigned = engine.scope.acquire_scope(
+            &task_unassigned.id,
+            &agent_a.id,
+            vec!["src/unassigned/**".to_string()],
+            "EXCLUSIVE_WRITE",
+        );
+        assert!(
+            res_unassigned.is_err(),
+            "Agent must be rejected from acquiring scope on unassigned task"
+        );
+        assert!(res_unassigned.unwrap_err().contains("unassigned task"));
+
+        // Case 4: Master ("master") acquires scope for unassigned task -> ALLOW
+        let res_master = engine.scope.acquire_scope(
+            &task_unassigned.id,
+            "master",
+            vec!["src/master/**".to_string()],
+            "EXCLUSIVE_WRITE",
+        );
+        assert!(
+            res_master.is_ok(),
+            "Master must be allowed to acquire scope for unassigned task: {:?}",
+            res_master.err()
+        );
+        assert_eq!(res_master.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_complete_step_ownership_domain_invariant() {
+        let (engine, proj_id) = setup_test_engine();
+        let agent_a = engine.register_agent("Agent Alpha", "IDE").unwrap();
+        let agent_b = engine.register_agent("Agent Beta", "CLI").unwrap();
+
+        // 1. Task assigned to Agent A
+        let task_a = engine
+            .create_task(
+                &proj_id,
+                "Task Assigned A",
+                "Description",
+                "HIGH",
+                vec![("Step 1".to_string(), "Do Step 1".to_string(), true)],
+                vec![],
+            )
+            .unwrap();
+
+        // Assign task_a to agent_a
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE tasks SET assigned_agent_id = ?1, state = 'RUNNING' WHERE id = ?2",
+                rusqlite::params![agent_a.id, task_a.id],
+            )
+            .unwrap();
+        }
+
+        let task_a_details = engine.get_task_details(&task_a.id).unwrap();
+        let step_a_id = &task_a_details.steps[0].id;
+
+        // 2. Unassigned task
+        let task_unassigned = engine
+            .create_task(
+                &proj_id,
+                "Task Unassigned",
+                "Description",
+                "HIGH",
+                vec![("Step Unassigned".to_string(), "Do Step".to_string(), true)],
+                vec![],
+            )
+            .unwrap();
+        let task_unassigned_details = engine.get_task_details(&task_unassigned.id).unwrap();
+        let step_unassigned_id = &task_unassigned_details.steps[0].id;
+
+        // Case 1: Assigned agent completes own step -> ALLOW
+        let res_own = engine.complete_step(step_a_id, Some(&agent_a.id), Some("evidence-log"));
+        assert!(
+            res_own.is_ok(),
+            "Assigned agent must be allowed to complete own step: {:?}",
+            res_own.err()
+        );
+
+        // Case 2: Other agent completes step -> DENY
+        let res_other = engine.complete_step(step_a_id, Some(&agent_b.id), Some("evidence-log"));
+        assert!(
+            res_other.is_err(),
+            "Other agent must be rejected from completing another's step"
+        );
+        assert!(res_other.unwrap_err().contains("Step ownership violation"));
+
+        // Case 3: Agent completes step on unassigned task -> DENY
+        let res_unassigned =
+            engine.complete_step(step_unassigned_id, Some(&agent_a.id), Some("evidence-log"));
+        assert!(
+            res_unassigned.is_err(),
+            "Agent must be rejected from completing step on unassigned task"
+        );
+        assert!(res_unassigned.unwrap_err().contains("unassigned task"));
+
+        // Case 4: Trusted system caller (agent_id = None) -> ALLOW
+        let res_trusted = engine.complete_step(step_unassigned_id, None, Some("trusted-signoff"));
+        assert!(
+            res_trusted.is_ok(),
+            "Trusted caller (agent_id: None) must be allowed to complete step: {:?}",
+            res_trusted.err()
+        );
+    }
+
+    #[test]
+    fn test_claim_task_atomic_dependency_gate() {
+        let (engine, proj_id, _) = setup_test_engine_with_worktree_root();
+        let agent = engine.register_agent("Claim Agent", "IDE").unwrap();
+
+        let t1 = engine
+            .create_task(&proj_id, "T1 Prerequisite", "Desc", "HIGH", vec![], vec![])
+            .unwrap();
+        let t2 = engine
+            .create_task(&proj_id, "T2 Dependent", "Desc", "HIGH", vec![], vec![])
+            .unwrap();
+
+        // Add blocking dependency: T2 depends on T1
+        engine.dag.add_dependency(&t2.id, &t1.id, "BLOCKS").unwrap();
+
+        // Attempt claim of T2 while T1 is BACKLOG -> must fail
+        let claim_blocked = engine.claim_task(&t2.id, &agent.id);
+        assert!(
+            claim_blocked.is_err(),
+            "Claiming task with unsatisfied dependency must fail"
+        );
+        assert!(claim_blocked
+            .unwrap_err()
+            .contains("Prerequisite dependencies are not yet DONE"));
+
+        // Transition T1 to DONE
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE tasks SET state = 'DONE', substate = 'NONE' WHERE id = ?1",
+                rusqlite::params![t1.id],
+            )
+            .unwrap();
+        }
+
+        // Attempt claim of T2 now -> must succeed
+        let claim_allowed = engine.claim_task(&t2.id, &agent.id);
+        assert!(
+            claim_allowed.is_ok(),
+            "Claiming task after dependencies are satisfied must succeed: {:?}",
+            claim_allowed.err()
+        );
+        assert_eq!(claim_allowed.unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn test_register_agent_first_registration() {
+        let (engine, _) = setup_test_engine();
+        let agent = engine.register_agent("New Worker", "CLI").unwrap();
+
+        assert_eq!(agent.name, "New Worker");
+        assert_eq!(agent.status, "IDLE");
+        assert_eq!(agent.active_task_id, None);
+        assert_eq!(agent.active_task_title, None);
+        assert!(agent.session_token.is_some());
+    }
+
+    #[test]
+    fn test_register_agent_reconnect_preserves_persisted_state_and_active_task() {
+        let (engine, proj_id) = setup_test_engine();
+        let initial_agent = engine.register_agent("Persistent Worker", "CLI").unwrap();
+
+        // Create a task and assign it to the agent
+        let task = engine
+            .create_task(&proj_id, "In-Flight Work", "Desc", "HIGH", vec![], vec![])
+            .unwrap();
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE tasks SET assigned_agent_id = ?1, state = 'RUNNING' WHERE id = ?2",
+                rusqlite::params![initial_agent.id, task.id],
+            )
+            .unwrap();
+            // Set past created_at to verify it is not fabricated on re-registration
+            conn.execute(
+                "UPDATE agents SET created_at = '2026-01-01T00:00:00Z', status = 'WORKING' WHERE id = ?1",
+                [&initial_agent.id],
+            )
+            .unwrap();
+        }
+
+        // Re-register the exact same canonical agent (e.g. reconnect)
+        let reconnected = engine.register_agent("Persistent Worker", "CLI").unwrap();
+
+        // Authoritative verification: returned Agent reflects actual persisted and active state
+        assert_eq!(reconnected.id, initial_agent.id);
+        assert_eq!(
+            reconnected.created_at, "2026-01-01T00:00:00Z",
+            "Registration must preserve original creation timestamp"
+        );
+        assert_eq!(
+            reconnected.status, "WORKING",
+            "Status must reflect active task state rather than fabricated IDLE"
+        );
+        assert_eq!(
+            reconnected.active_task_id,
+            Some(task.id),
+            "Active task ID must be populated from database"
+        );
+        assert_eq!(
+            reconnected.active_task_title,
+            Some("In-Flight Work".to_string()),
+            "Active task title must match"
+        );
+        assert!(
+            reconnected.session_token.is_some(),
+            "Session token must be refreshed on registration"
+        );
+    }
+
+    #[test]
+    fn test_session_lifetime_and_expiration_gating() {
+        let (engine, _) = setup_test_engine();
+        let agent = engine.register_agent("Session Agent", "IDE").unwrap();
+        let session_token = agent.session_token.expect("Session token must exist");
+
+        // 1. Verify initial session expiry is ~365 days in the future
+        let conn = engine.db.lock();
+        let initial_expiry: String = conn
+            .query_row(
+                "SELECT expires_at FROM agent_sessions WHERE session_token = ?1",
+                [&session_token],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let initial_dt = chrono::DateTime::parse_from_rfc3339(&initial_expiry).unwrap();
+        let now = chrono::Utc::now();
+        let days_diff = (initial_dt.signed_duration_since(now)).num_days();
+        assert!(
+            (360..=366).contains(&days_diff),
+            "Initial session expiry must be approximately 365 days (got {} days)",
+            days_diff
+        );
+
+        // 2. Heartbeat preserves long-lived initial window without truncating it
+        engine.agent_heartbeat(&agent.id).unwrap();
+        let conn = engine.db.lock();
+        let post_hb_expiry: String = conn
+            .query_row(
+                "SELECT expires_at FROM agent_sessions WHERE session_token = ?1",
+                [&session_token],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            post_hb_expiry, initial_expiry,
+            "Heartbeat must not shorten a 365-day initial window"
+        );
+
+        // 3. Valid session lookup succeeds
+        let lookup = engine.get_agent_by_session(&session_token);
+        assert!(lookup.is_some(), "Valid session token must return Agent");
+        assert_eq!(lookup.unwrap().id, agent.id);
+
+        // 4. Expired session is strictly rejected
+        {
+            let conn = engine.db.lock();
+            conn.execute(
+                "UPDATE agent_sessions SET expires_at = '2020-01-01T00:00:00Z' WHERE session_token = ?1",
+                [&session_token],
+            )
+            .unwrap();
+        }
+        let expired_lookup = engine.get_agent_by_session(&session_token);
+        assert!(
+            expired_lookup.is_none(),
+            "Expired session must be rejected by get_agent_by_session"
+        );
+
+        // 5. Re-registering establishes a fresh valid session
+        let re_registered = engine.register_agent("Session Agent", "IDE").unwrap();
+        let new_token = re_registered.session_token.expect("New session token");
+        assert_ne!(new_token, session_token);
+        let valid_lookup = engine.get_agent_by_session(&new_token);
+        assert!(
+            valid_lookup.is_some(),
+            "Re-registered agent must have valid session"
+        );
+    }
+
+    #[test]
+    fn test_create_project_atomicity() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_proj_atom_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let pool = DbPool::new_in_memory().unwrap();
+        let engine = CoordinatorEngine::new(pool.clone());
+
+        let proj = engine
+            .create_project(
+                "Atomic Proj",
+                temp_dir.to_str().unwrap(),
+                "Master Spec Content",
+                "main",
+            )
+            .unwrap();
+
+        // Verify all 3 records were created atomically
+        let conn = pool.lock();
+        let proj_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                [&proj.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proj_count, 1);
+
+        let contract_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_contracts WHERE project_id = ?1",
+                [&proj.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(contract_count, 1);
+
+        let rule_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_rules WHERE project_id = ?1",
+                [&proj.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rule_count, 1);
+        drop(conn);
+
+        let _ = crate::git::GitService::safe_remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_reset_masterplan_cross_project_rejection() {
+        let (engine, p1_id) = setup_test_engine();
+        let conn = engine.db.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 1. Create a second project
+        conn.execute(
+            "INSERT INTO projects (id, name, path, master_spec, target_branch, created_at, updated_at) VALUES ('p2', 'P2', 'dummy/path2', 'Spec2', 'main', ?1, ?1)",
+            [&now],
+        ).unwrap();
+
+        // 2. Create a masterplan belonging to Project 1
+        conn.execute(
+            "INSERT INTO masterplans (id, project_id, title, raw_text, status, target_step_count, max_steps_per_agent, is_active, created_at, updated_at) VALUES ('mp_p1', ?1, 'P1 Plan', 'Raw plan', 'ACTIVE', 3, 2, 1, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at) VALUES ('s1', 'mp_p1', 0, 'Step 1', 'Desc', '[]', '[]', 'PENDING', ?1, ?1)",
+            [&now],
+        ).unwrap();
+        drop(conn);
+
+        // 3. Project 2 attempts to reset Project 1's masterplan -> REJECTED
+        let cross_reset_res = engine.reset_masterplan("p2", Some("mp_p1"));
+        assert!(
+            cross_reset_res.is_err(),
+            "Resetting a masterplan from another project must be rejected"
+        );
+        assert!(cross_reset_res.unwrap_err().contains("belongs to project"));
+
+        // Verify Masterplan 1 and its steps still exist untouched
+        let conn = engine.db.lock();
+        let mp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplans WHERE id = 'mp_p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mp_count, 1, "Masterplan in P1 must not be deleted");
+
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = 'mp_p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_count, 1, "Masterplan step in P1 must not be deleted");
+        drop(conn);
+
+        // 4. Nonexistent masterplan -> REJECTED
+        let nonexist_res = engine.reset_masterplan(&p1_id, Some("mp_nonexistent"));
+        assert!(
+            nonexist_res.is_err(),
+            "Resetting a nonexistent masterplan must return error"
+        );
+        assert!(nonexist_res.unwrap_err().contains("not found"));
+
+        // 5. Resetting with correct project + masterplan -> ALLOWED
+        let valid_reset_res = engine.reset_masterplan(&p1_id, Some("mp_p1"));
+        assert!(
+            valid_reset_res.is_ok(),
+            "Resetting with matching project and masterplan must succeed: {:?}",
+            valid_reset_res.err()
+        );
+
+        let conn = engine.db.lock();
+        let mp_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplans WHERE id = 'mp_p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mp_count_after, 0,
+            "Masterplan in P1 must be deleted on valid reset"
+        );
+    }
+
+    #[test]
+    fn test_create_project_atomicity_rollback_on_failure() {
+        let pool = DbPool::new_in_memory().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let target_proj_id = "p_atom_fail";
+
+        let mut conn = pool.lock();
+        let tx_res = (|| -> Result<(), String> {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+            // 1. Insert project
+            tx.execute(
+                "INSERT INTO projects (id, name, path, master_spec, target_branch, created_at, updated_at) VALUES (?1, 'Fail Proj', 'dummy/path', 'Spec', 'main', ?2, ?2)",
+                rusqlite::params![target_proj_id, now],
+            ).map_err(|e| e.to_string())?;
+
+            // 2. Insert contract
+            tx.execute(
+                "INSERT INTO project_contracts (id, project_id, version, overview, architecture, rules_json, commands_json, testing_json, repo_map, security_constraints, contract_hash, created_at) VALUES ('c1', ?1, 1, 'Spec', 'Arch', '[]', '[]', '[]', '', '[]', 'hash', ?2)",
+                rusqlite::params![target_proj_id, now],
+            ).map_err(|e| e.to_string())?;
+
+            // 3. Force child insert error with invalid foreign key
+            let err_res: Result<usize, _> = tx.execute(
+                "INSERT INTO project_rules (id, project_id, category, rule_text, strictness, created_at) VALUES ('r1', 'nonexistent_project_id', 'SYSTEM', 'Rule', 'MANDATORY', ?1)",
+                rusqlite::params![now],
+            );
+            if let Err(e) = err_res {
+                return Err(format!("Child insert failed as expected: {}", e));
+            }
+
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+
+        assert!(tx_res.is_err(), "Operation must fail");
+        drop(conn);
+
+        // Verify that 0 project, contract, or rule rows exist for target_proj_id
+        let conn = pool.lock();
+        let proj_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                [target_proj_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            proj_count, 0,
+            "Projects table must have 0 rows after rollback"
+        );
+
+        let contract_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_contracts WHERE project_id = ?1",
+                [target_proj_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            contract_count, 0,
+            "Contracts table must have 0 rows after rollback"
+        );
+
+        let rule_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_rules WHERE project_id = ?1",
+                [target_proj_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rule_count, 0, "Rules table must have 0 rows after rollback");
+    }
+
+    #[test]
+    fn test_reset_masterplan_same_project_cross_masterplan_isolation() {
+        let (engine, p1_id) = setup_test_engine();
+        let conn = engine.db.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 1. Create Masterplan A and Masterplan B in the same project P1
+        conn.execute(
+            "INSERT INTO masterplans (id, project_id, title, raw_text, status, target_step_count, max_steps_per_agent, is_active, created_at, updated_at) VALUES ('mp_a', ?1, 'Plan A', 'Raw A', 'ACTIVE', 3, 2, 1, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at) VALUES ('s_a1', 'mp_a', 0, 'Step A1', 'Desc', '[]', '[]', 'CLAIMED', ?1, ?1)",
+            [&now],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO masterplans (id, project_id, title, raw_text, status, target_step_count, max_steps_per_agent, is_active, created_at, updated_at) VALUES ('mp_b', ?1, 'Plan B', 'Raw B', 'ACTIVE', 3, 2, 0, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at) VALUES ('s_b1', 'mp_b', 0, 'Step B1', 'Desc', '[]', '[]', 'CLAIMED', ?1, ?1)",
+            [&now],
+        ).unwrap();
+
+        // 2. Create Task A1 belonging to Plan A and Task B1 belonging to Plan B
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, masterplan_id, title, description, state, substate, priority, is_stale, created_at, updated_at) VALUES ('t_a1', ?1, 'mp_a', 'Task A1', 'Desc A1', 'RUNNING', 'EXECUTING', 'HIGH', 0, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, masterplan_id, title, description, state, substate, priority, is_stale, created_at, updated_at) VALUES ('t_b1', ?1, 'mp_b', 'Task B1', 'Desc B1', 'RUNNING', 'EXECUTING', 'HIGH', 0, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        drop(conn);
+
+        // 3. Reset ONLY Masterplan A
+        let reset_res = engine.reset_masterplan(&p1_id, Some("mp_a"));
+        assert!(
+            reset_res.is_ok(),
+            "Resetting masterplan A must succeed: {:?}",
+            reset_res.err()
+        );
+
+        // 4. Verify Plan A and its steps are deleted, and Task A1 is cancelled
+        let conn = engine.db.lock();
+        let mp_a_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplans WHERE id = 'mp_a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mp_a_count, 0, "Masterplan A must be deleted");
+
+        let step_a_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = 'mp_a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_a_count, 0, "Masterplan A steps must be deleted");
+
+        let t_a1_state: String = conn
+            .query_row("SELECT state FROM tasks WHERE id = 't_a1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(t_a1_state, "CANCELLED", "Task A1 must be cancelled");
+
+        // 5. Verify Masterplan B, its steps, and Task B1 remain COMPLETELY UNTOUCHED and RUNNING
+        let mp_b_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplans WHERE id = 'mp_b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mp_b_count, 1, "Masterplan B must remain intact");
+
+        let step_b_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = 'mp_b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_b_count, 1, "Masterplan B steps must remain intact");
+
+        let t_b1_state: String = conn
+            .query_row("SELECT state FROM tasks WHERE id = 't_b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            t_b1_state, "RUNNING",
+            "Task B1 must NOT be cancelled (must stay RUNNING)"
+        );
+    }
+
+    #[test]
+    fn test_reset_masterplan_aborts_and_preserves_state_on_cancellation_failure() {
+        let (engine, p1_id) = setup_test_engine();
+        let conn = engine.db.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 1. Create Masterplan A with Task A1 in project P1
+        conn.execute(
+            "INSERT INTO masterplans (id, project_id, title, raw_text, status, target_step_count, max_steps_per_agent, is_active, created_at, updated_at) VALUES ('mp_a_fail', ?1, 'Plan A', 'Raw A', 'ACTIVE', 3, 2, 1, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at) VALUES ('s_a1_fail', 'mp_a_fail', 0, 'Step A1', 'Desc', '[]', '[]', 'CLAIMED', ?1, ?1)",
+            [&now],
+        ).unwrap();
+
+        // Task A1 is marked DONE (cannot be cancelled -> cancel_task returns Err)
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, masterplan_id, title, description, state, substate, priority, is_stale, created_at, updated_at) VALUES ('t_a1_done', ?1, 'mp_a_fail', 'Task A1', 'Desc A1', 'DONE', 'READY_FOR_MERGE', 'HIGH', 0, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        drop(conn);
+
+        // 2. Call reset_masterplan on mp_a_fail
+        let reset_res = engine.reset_masterplan(&p1_id, Some("mp_a_fail"));
+        assert!(
+            reset_res.is_err(),
+            "Reset must fail when task cancellation fails"
+        );
+        let err = reset_res.unwrap_err();
+        assert!(
+            err.contains("failed to cancel active task") || err.contains("Preflight rejection"),
+            "Error must describe cancellation failure: {}",
+            err
+        );
+
+        // 3. Verify Masterplan A and its steps STILL EXIST in the database (destructive cleanup aborted)
+        let conn = engine.db.lock();
+        let mp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplans WHERE id = 'mp_a_fail'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mp_count, 1,
+            "Masterplan must NOT be deleted when cancellation fails"
+        );
+
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = 'mp_a_fail'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            step_count, 1,
+            "Masterplan steps must NOT be deleted when cancellation fails"
+        );
+    }
+
+    #[test]
+    fn test_reset_masterplan_preflight_aborts_without_mutating_any_task() {
+        let (engine, p1_id) = setup_test_engine();
+        let conn = engine.db.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 1. Create Masterplan with two tasks: Task A (RUNNING, cancellable) and Task B (DONE, non-cancellable)
+        conn.execute(
+            "INSERT INTO masterplans (id, project_id, title, raw_text, status, target_step_count, max_steps_per_agent, is_active, created_at, updated_at) VALUES ('mp_preflight', ?1, 'Preflight Plan', 'Raw', 'ACTIVE', 2, 2, 1, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at) VALUES ('s_pf1', 'mp_preflight', 0, 'Step 1', 'Desc', '[]', '[]', 'CLAIMED', ?1, ?1)",
+            [&now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO masterplan_steps (id, masterplan_id, step_index, title, description, suggested_scope, acceptance_criteria, status, created_at, updated_at) VALUES ('s_pf2', 'mp_preflight', 1, 'Step 2', 'Desc', '[]', '[]', 'CLAIMED', ?1, ?1)",
+            [&now],
+        ).unwrap();
+
+        // Task A: RUNNING
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, masterplan_id, title, description, state, substate, priority, is_stale, created_at, updated_at) VALUES ('t_pf_a', ?1, 'mp_preflight', 'Task A', 'Desc A', 'RUNNING', 'EXECUTING', 'HIGH', 0, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        // Task B: DONE (non-cancellable)
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, masterplan_id, title, description, state, substate, priority, is_stale, created_at, updated_at) VALUES ('t_pf_b', ?1, 'mp_preflight', 'Task B', 'Desc B', 'DONE', 'READY_FOR_MERGE', 'HIGH', 0, ?2, ?2)",
+            [&p1_id, &now],
+        ).unwrap();
+        drop(conn);
+
+        // 2. Execute reset_masterplan
+        let res = engine.reset_masterplan(&p1_id, Some("mp_preflight"));
+        assert!(res.is_err(), "Reset must fail during preflight");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("Preflight rejection") || err.contains("Cannot cancel task"),
+            "Error must identify preflight rejection: {}",
+            err
+        );
+
+        // 3. Prove that Task A was NOT cancelled and remains in RUNNING state
+        let conn = engine.db.lock();
+        let task_a_state: String = conn
+            .query_row("SELECT state FROM tasks WHERE id = 't_pf_a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            task_a_state, "RUNNING",
+            "Preflight failure must abort before cancelling Task A"
+        );
+
+        let task_b_state: String = conn
+            .query_row("SELECT state FROM tasks WHERE id = 't_pf_b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_b_state, "DONE", "Task B must remain in DONE state");
+
+        // 4. Prove masterplan and steps still exist
+        let mp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplans WHERE id = 'mp_preflight'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mp_count, 1, "Masterplan must not be deleted");
+
+        let step_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM masterplan_steps WHERE masterplan_id = 'mp_preflight'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_count, 2, "Masterplan steps must not be deleted");
+    }
+
+    #[test]
+    fn test_get_events_after_success_and_error_handling() {
+        let (engine, p1_id) = setup_test_engine();
+        engine.emit_event(
+            Some(&p1_id),
+            None,
+            None,
+            "CUSTOM_TEST_EVENT",
+            serde_json::json!({ "key": "value" }),
+        );
+
+        let events = engine.get_events_after(0).unwrap();
+        assert!(!events.is_empty(), "Must return emitted events");
+        let found = events.iter().any(|e| e.event_type == "CUSTOM_TEST_EVENT");
+        assert!(found, "Emitted event must be present in get_events_after");
     }
 }

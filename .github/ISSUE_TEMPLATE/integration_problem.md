@@ -7,11 +7,16 @@ assignees: ''
 ---
 
 ### AI Client / IDE
-- [ ] OpenCode
+- [ ] Google Antigravity
 - [ ] Claude Code
-- [ ] Antigravity
-- [ ] Codex
 - [ ] Cursor
+- [ ] OpenCode
+- [ ] OpenAI Codex
+- [ ] Google Gemini CLI
+- [ ] GitHub Copilot
+- [ ] Codeium Windsurf
+- [ ] JetBrains Junie
+- [ ] Aider
 - [ ] Other Generic MCP Client (specify below)
 
 ### Client Configuration

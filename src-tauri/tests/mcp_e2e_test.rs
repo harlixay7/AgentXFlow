@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::bool_assert_comparison
+)]
+
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::mcp::McpServer;
@@ -82,17 +87,19 @@ async fn test_full_e2e_mcp_workflow() {
     println!("1. Health Check Response: {:?}", health_json);
     assert_eq!(health_json["status"], "ok");
     assert_eq!(health_json["protocol_version"], "2024-11-05");
+    assert!(
+        health_json.get("sse_url").is_none(),
+        "Health response must not contain 'sse_url' after SSE stub removal"
+    );
 
-    // 4. Legacy SSE Ping (/mcp/sse)
+    // 4. Legacy SSE endpoint removed — GET /mcp/sse -> 404
     let sse_res = client
         .get(format!("{}/mcp/sse", base_url))
         .send()
         .await
         .expect("SSE check failed");
-    assert_eq!(sse_res.status(), reqwest::StatusCode::OK);
-    let sse_text = sse_res.text().await.unwrap();
-    println!("2. SSE Response: {:?}", sse_text);
-    assert!(sse_text.contains("data: /mcp"));
+    assert_eq!(sse_res.status(), reqwest::StatusCode::NOT_FOUND);
+    println!("2. GET /mcp/sse -> 404 (SSE stub removed)");
 
     // Helper for sending authenticated JSON-RPC 2.0 requests
     let send_rpc = |token: &str, method: &str, params: serde_json::Value| {
@@ -142,7 +149,7 @@ async fn test_full_e2e_mcp_workflow() {
         "   MCP initialize (negotiated 2026-07-28) result: {:?}",
         init_res_v2
     );
-    assert_eq!(init_res_v2["protocolVersion"], "2026-07-28");
+    assert_eq!(init_res_v2["protocolVersion"], "2024-11-05");
 
     // Standard lifecycle notifications and probing
     let _ = send_rpc(&auth_token, "notifications/initialized", json!({})).await;
@@ -343,9 +350,9 @@ async fn test_full_e2e_mcp_workflow() {
     .await;
     assert_eq!(step_res["status"], "COMPLETED");
 
-    // 15. Test masterplan_reset via MCP
+    // 15. Test masterplan_reset via MCP (requires Master authority)
     let reset_res = send_rpc(
-        &session_token,
+        &auth_token,
         "masterplan_reset",
         json!({
             "project_id": proj.id
@@ -359,5 +366,458 @@ async fn test_full_e2e_mcp_workflow() {
     assert_eq!(post_reset_steps.len(), 0);
 
     // Cleanup temp dir
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_sse_stub_removed() {
+    let temp_repo = setup_temp_git_repo("sse_stub_removed");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_sse_stub_removed_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7894;
+
+    let server = McpServer::new(coordinator, test_port, security.clone());
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    // GET /mcp/sse -> 404 (stub removed)
+    let sse_res = client
+        .get(format!("{}/mcp/sse", base_url))
+        .send()
+        .await
+        .expect("SSE request failed");
+    assert_eq!(sse_res.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // GET /health -> payload has NO "sse_url" key
+    let health_res = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .expect("Health check failed");
+    assert_eq!(health_res.status(), reqwest::StatusCode::OK);
+    let health_json: serde_json::Value = health_res.json().await.unwrap();
+    assert!(
+        health_json.get("sse_url").is_none(),
+        "Health response must not contain 'sse_url' after SSE stub removal"
+    );
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_health_advertises_only_implemented_versions() {
+    let temp_repo = setup_temp_git_repo("health_version");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_health_version_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7896;
+
+    let server = McpServer::new(coordinator, test_port, security.clone());
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let health_res = client
+        .get(format!("http://127.0.0.1:{}/health", test_port))
+        .send()
+        .await
+        .expect("Health check failed");
+    assert_eq!(health_res.status(), reqwest::StatusCode::OK);
+    let health_json: serde_json::Value = health_res.json().await.unwrap();
+    assert_eq!(health_json["protocol_version"], "2024-11-05");
+    assert_eq!(health_json["supported_versions"], json!(["2024-11-05"]));
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_initialize_with_unsupported_version_negotiates_2024() {
+    let temp_repo = setup_temp_git_repo("negotiate_version");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_negotiate_version_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7897;
+
+    let server = McpServer::new(coordinator, test_port, security.clone());
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let init_res = client
+        .post(format!("http://127.0.0.1:{}/mcp", test_port))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2026-07-28" },
+        }))
+        .send()
+        .await
+        .expect("Failed to send initialize request");
+    assert_eq!(init_res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = init_res.json().await.unwrap();
+    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_reject_malformed_jsonrpc() {
+    let temp_repo = setup_temp_git_repo("reject_malformed");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_malformed_jsonrpc_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7898;
+
+    let server = McpServer::new(coordinator, test_port, security);
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    // Send valid JSON but not JSON-RPC structure
+    let res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .header("Content-Type", "application/json")
+        .body("not json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32700);
+    assert_eq!(body["error"]["message"], "Parse error");
+    println!("   ✔ test_reject_malformed_jsonrpc PASS: -32700 Parse error");
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_reject_missing_version() {
+    let temp_repo = setup_temp_git_repo("reject_missing_version");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_missing_version_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7899;
+
+    let server = McpServer::new(coordinator, test_port, security);
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    // Send JSON-RPC without "jsonrpc" field
+    let res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "method": "ping",
+            "id": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32600);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required field 'jsonrpc'"));
+    println!("   ✔ test_reject_missing_version PASS: -32600 Invalid Request");
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_reject_unknown_method() {
+    let temp_repo = setup_temp_git_repo("reject_unknown_method");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_unknown_method_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7900;
+
+    let server = McpServer::new(coordinator, test_port, security);
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    // Send unknown method
+    let res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "no/such/method",
+            "id": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32601);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Method not found"));
+    println!("   ✔ test_reject_unknown_method PASS: -32601 Method not found");
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_reject_wrong_jsonrpc_version() {
+    let temp_repo = setup_temp_git_repo("reject_wrong_version");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_wrong_version_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7901;
+
+    let server = McpServer::new(coordinator, test_port, security);
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    let res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "1.0",
+            "id": 1,
+            "method": "ping"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32600);
+    println!("   ✔ test_reject_wrong_jsonrpc_version PASS: -32600 Invalid Request");
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_notification_returns_empty_body() {
+    let temp_repo = setup_temp_git_repo("notification_empty");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_notification_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7902;
+
+    let server = McpServer::new(coordinator, test_port, security);
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    let res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body.get("result").is_none(),
+        "Notification response should not contain 'result' field"
+    );
+    assert!(
+        body.get("error").is_none(),
+        "Notification response should not contain 'error' field"
+    );
+    println!("   ✔ test_notification_returns_empty_body PASS: no result/error in response");
+
+    std::fs::remove_dir_all(&temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_reject_missing_required_params() {
+    let temp_repo = setup_temp_git_repo("reject_missing_params");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool);
+    let auth_token = "axf_sec_missing_params_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7903;
+
+    let server = McpServer::new(coordinator, test_port, security);
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    let res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "scope_acquire",
+                "arguments": {}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32602);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required parameter"));
+
+    // 2. Direct legacy route scope.acquire with missing parameters -> -32602
+    let res_direct_scope = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "scope.acquire",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_direct_scope.status(), reqwest::StatusCode::OK);
+    let body_direct_scope: serde_json::Value = res_direct_scope.json().await.unwrap();
+    assert_eq!(body_direct_scope["error"]["code"], -32602);
+    assert!(body_direct_scope["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required parameter"));
+
+    // 3. Direct legacy route agent.register with missing name -> -32602
+    let res_direct_agent = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "agent.register",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_direct_agent.status(), reqwest::StatusCode::OK);
+    let body_direct_agent: serde_json::Value = res_direct_agent.json().await.unwrap();
+    assert_eq!(body_direct_agent["error"]["code"], -32602);
+    assert!(body_direct_agent["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required parameter: 'name'"));
+
+    // 4. tools/call with agent_register missing name -> -32602
+    let res_tools_agent = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "agent_register",
+                "arguments": {}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_tools_agent.status(), reqwest::StatusCode::OK);
+    let body_tools_agent: serde_json::Value = res_tools_agent.json().await.unwrap();
+    assert_eq!(body_tools_agent["error"]["code"], -32602);
+    assert!(body_tools_agent["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required parameter: 'name'"));
+
+    // 5. Direct legacy task.get missing task_id -> -32602
+    let res_direct_task_get = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "task.get",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_direct_task_get.status(), reqwest::StatusCode::OK);
+    let body_direct_task_get: serde_json::Value = res_direct_task_get.json().await.unwrap();
+    assert_eq!(body_direct_task_get["error"]["code"], -32602);
+    assert!(body_direct_task_get["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Missing required parameter: 'task_id'"));
+
+    println!("   ✔ test_reject_missing_required_params PASS: exact parity across tools/call and legacy routes (-32602)");
+
     std::fs::remove_dir_all(&temp_repo).ok();
 }

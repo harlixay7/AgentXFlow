@@ -284,3 +284,230 @@ fn test_timeout_produces_structured_evidence() {
         payload
     );
 }
+
+#[test]
+fn test_post_merge_verification_records_exact_integration_head_sha() {
+    let (engine, pool, worktree, task_id) = setup_engine_and_worktree_with_pool();
+    let project_id = {
+        let conn = pool.lock();
+        conn.query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [&task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    let fake_integration_sha = "integration-head-sha-abc-123";
+    let outcome = engine
+        .execute_post_merge_verification(
+            &project_id,
+            &task_id,
+            &worktree,
+            fake_integration_sha,
+            Duration::from_secs(30),
+        )
+        .expect("execute_post_merge_verification should succeed");
+
+    assert!(!outcome.runs.is_empty(), "must produce verification runs");
+    for run in &outcome.runs {
+        assert_eq!(
+            run.commit_sha, fake_integration_sha,
+            "Invariant 2: VerificationRun must record the exact integration HEAD commit SHA"
+        );
+    }
+}
+
+#[test]
+fn test_post_merge_verification_honors_configured_required_profile() {
+    let (engine, pool, worktree, task_id) = setup_engine_and_worktree_with_pool();
+    let project_id = {
+        let conn = pool.lock();
+        conn.query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [&task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    // Insert custom required profile
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let conn = pool.lock();
+        conn.execute(
+            "INSERT INTO verification_profiles (id, project_id, task_id, check_type, command, args_json, timeout_secs, required, created_at)
+             VALUES ('prof-custom-1', ?1, ?2, 'CUSTOM_UNIT', 'echo custom_test_passed', '[]', 30, 1, ?3)",
+            rusqlite::params![project_id, task_id, now],
+        ).unwrap();
+    }
+
+    let outcome = engine
+        .execute_post_merge_verification(
+            &project_id,
+            &task_id,
+            &worktree,
+            "sha-int-head",
+            Duration::from_secs(30),
+        )
+        .expect("execute_post_merge_verification should run custom profile");
+
+    assert!(
+        outcome.passed,
+        "required custom passing test must pass the merge gate"
+    );
+    assert_eq!(outcome.runs.len(), 1);
+    assert_eq!(outcome.runs[0].check_name, "CUSTOM_UNIT");
+}
+
+#[test]
+fn test_post_merge_verification_optional_check_failure_does_not_block_merge() {
+    let (engine, pool, worktree, task_id) = setup_engine_and_worktree_with_pool();
+    let project_id = {
+        let conn = pool.lock();
+        conn.query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [&task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    // Insert optional profile that exits with non-zero (failure)
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let conn = pool.lock();
+        conn.execute(
+            "INSERT INTO verification_profiles (id, project_id, task_id, check_type, command, args_json, timeout_secs, required, created_at)
+             VALUES ('prof-opt-fail', ?1, ?2, 'OPTIONAL_LINT', 'exit 1', '[]', 30, 0, ?3)",
+            rusqlite::params![project_id, task_id, now],
+        ).unwrap();
+    }
+
+    let outcome = engine
+        .execute_post_merge_verification(
+            &project_id,
+            &task_id,
+            &worktree,
+            "sha-int-head",
+            Duration::from_secs(30),
+        )
+        .expect("execute_post_merge_verification should run");
+
+    assert_eq!(outcome.runs.len(), 1);
+    assert!(!outcome.runs[0].is_passed, "optional check failed");
+    assert!(
+        outcome.passed,
+        "Invariant 3: optional check failure (required = 0) must NOT block the merge"
+    );
+}
+
+#[test]
+fn test_post_merge_verification_required_check_failure_blocks_merge() {
+    let (engine, pool, worktree, task_id) = setup_engine_and_worktree_with_pool();
+    let project_id = {
+        let conn = pool.lock();
+        conn.query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [&task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    // Insert required profile that exits with non-zero (failure)
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let conn = pool.lock();
+        conn.execute(
+            "INSERT INTO verification_profiles (id, project_id, task_id, check_type, command, args_json, timeout_secs, required, created_at)
+             VALUES ('prof-req-fail', ?1, ?2, 'REQUIRED_SUITE', 'exit 1', '[]', 30, 1, ?3)",
+            rusqlite::params![project_id, task_id, now],
+        ).unwrap();
+    }
+
+    let outcome = engine
+        .execute_post_merge_verification(
+            &project_id,
+            &task_id,
+            &worktree,
+            "sha-int-head",
+            Duration::from_secs(30),
+        )
+        .expect("execute_post_merge_verification should run");
+
+    assert_eq!(outcome.runs.len(), 1);
+    assert!(!outcome.runs[0].is_passed, "required check failed");
+    assert!(
+        !outcome.passed,
+        "Invariant 3: required check failure (required = 1) MUST block the merge"
+    );
+}
+
+#[test]
+fn test_post_merge_verification_honors_args_json() {
+    let (engine, pool, worktree, task_id) = setup_engine_and_worktree_with_pool();
+    let project_id = {
+        let conn = pool.lock();
+        conn.query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [&task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let conn = pool.lock();
+        conn.execute(
+            "INSERT INTO verification_profiles (id, project_id, task_id, check_type, command, args_json, timeout_secs, required, created_at)
+             VALUES ('prof-args-1', ?1, ?2, 'ARGS_TEST', 'echo', '[\"alpha\", \"beta\"]', 30, 1, ?3)",
+            rusqlite::params![project_id, task_id, now],
+        ).unwrap();
+    }
+
+    let outcome = engine
+        .execute_post_merge_verification(
+            &project_id,
+            &task_id,
+            &worktree,
+            "sha-int-head",
+            Duration::from_secs(30),
+        )
+        .expect("execute_post_merge_verification should run with args");
+
+    assert!(outcome.passed);
+    assert_eq!(outcome.runs.len(), 1);
+    assert!(
+        outcome.runs[0].command.contains("alpha beta")
+            || outcome.runs[0].stdout.contains("alpha beta")
+            || outcome.runs[0].stdout.contains("alpha"),
+        "command with structured args must execute args, got command: {}, stdout: {}",
+        outcome.runs[0].command,
+        outcome.runs[0].stdout
+    );
+}
+
+#[test]
+fn test_post_merge_verification_fallback_to_repo_markers() {
+    let (engine, worktree, _task_id) = setup_engine_and_worktree();
+    std::fs::write(
+        worktree.join("Cargo.toml"),
+        "[package]\nname = \"dummy\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let profiles = engine
+        .get_verification_profiles("proj-fallback", None, &worktree)
+        .unwrap();
+    assert_eq!(
+        profiles.len(),
+        2,
+        "Cargo repo must fallback to cargo check + cargo test"
+    );
+    assert_eq!(profiles[0].command, "cargo check");
+    assert_eq!(profiles[1].command, "cargo test");
+    assert!(profiles[0].required);
+    assert!(profiles[1].required);
+}

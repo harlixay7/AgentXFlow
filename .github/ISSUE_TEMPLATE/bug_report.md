@@ -20,8 +20,8 @@ A clear and concise description of what you expected to happen.
 
 ### Environment & Versions
 - **OS**: Windows / macOS / Linux
-- **AgentXFlow Version**: 0.1.0
-- **AI Agent / Client**: OpenCode / Claude Code / Antigravity / Codex / Cursor
+- **AgentXFlow Version**: 0.5.0
+- **AI Agent / Client**: Google Antigravity / Claude Code / Cursor / OpenCode / OpenAI Codex / Gemini CLI / GitHub Copilot / Windsurf / Junie / Aider
 - **Git Version**: 
 
 ### Logs & Diagnostics

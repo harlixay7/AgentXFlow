@@ -48,4 +48,5 @@ Thumbs.db
 # Local Scratch & Development Files
 *.scratch.*
 scratch/
+.superpowers/
 [Mm]aster[Pp]lan*.txt

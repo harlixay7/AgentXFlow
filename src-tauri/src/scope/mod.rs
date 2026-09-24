@@ -17,37 +17,60 @@ impl ScopeManager {
     }
 
     /// Layer 1: Atomically checks for collisions and acquires exclusive or shared scope leases
-    pub fn acquire_scope(
+    pub fn acquire_scope_tx(
         &self,
+        tx: &rusqlite::Transaction,
         task_id: &str,
         agent_id: &str,
-        patterns: Vec<String>,
+        raw_patterns: Vec<String>,
         access_type: &str,
     ) -> Result<Vec<ScopeLease>, String> {
-        if patterns.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Normalize and expand all requested patterns (splitting multi-glob strings)
         let mut normalized_patterns = Vec::new();
-        for p in &patterns {
-            let norms = Self::normalize_patterns(p)?;
-            normalized_patterns.extend(norms);
+        for raw in &raw_patterns {
+            let pats = Self::normalize_patterns(raw)?;
+            normalized_patterns.extend(pats);
         }
 
         if normalized_patterns.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut conn = self.db.lock();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let expires_at = (now + Duration::hours(4)).to_rfc3339();
 
-        // Use transaction for atomic check & lease reservation
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Failed to start scope transaction: {}", e))?;
+        // 0. Validate task existence and ownership inside the transaction
+        let assigned_agent: Option<String> = tx
+            .query_row(
+                "SELECT assigned_agent_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Task '{}' not found: {}", task_id, e))?;
+
+        if !agent_id.is_empty()
+            && agent_id != "master"
+            && agent_id != "system"
+            && agent_id != "coordinator"
+        {
+            if let Some(ref assigned) = assigned_agent {
+                let (canon_assigned, ..) =
+                    crate::core::CoordinatorEngine::canonicalize_ide_identity(assigned, "");
+                let (canon_caller, ..) =
+                    crate::core::CoordinatorEngine::canonicalize_ide_identity(agent_id, "");
+                if assigned != agent_id && canon_assigned != canon_caller {
+                    return Err(format!(
+                        "Scope ownership violation: Task '{}' is assigned to agent '{}', caller is '{}'",
+                        task_id, assigned, agent_id
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "Scope ownership violation: Cannot acquire scope lease for unassigned task '{}'",
+                    task_id
+                ));
+            }
+        }
 
         // 1. Clean up expired leases
         tx.execute("DELETE FROM scope_leases WHERE expires_at < ?1", [&now_str])
@@ -73,8 +96,9 @@ impl ScopeManager {
             .map_err(|e| e.to_string())?;
 
         let mut active_leases = Vec::new();
-        for l in active_leases_iter.flatten() {
-            active_leases.push(l);
+        for l in active_leases_iter {
+            let lease = l.map_err(|e| format!("Failed to decode active scope lease row: {}", e))?;
+            active_leases.push(lease);
         }
         drop(stmt);
 
@@ -112,6 +136,23 @@ impl ScopeManager {
                 created_at: now_str.clone(),
             });
         }
+
+        Ok(granted)
+    }
+
+    pub fn acquire_scope(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        raw_patterns: Vec<String>,
+        access_type: &str,
+    ) -> Result<Vec<ScopeLease>, String> {
+        let mut conn = self.db.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start scope transaction: {}", e))?;
+
+        let granted = self.acquire_scope_tx(&tx, task_id, agent_id, raw_patterns, access_type)?;
 
         tx.commit()
             .map_err(|e| format!("Failed to commit scope reservation: {}", e))?;
@@ -162,6 +203,17 @@ impl ScopeManager {
             .ok_or_else(|| "Empty pattern".to_string())
     }
 
+    /// Returns true if a pattern represents a broad glob lease (e.g. `**`, `*`, `src/**`, `app/**`)
+    pub fn is_broad_pattern(pattern: &str) -> bool {
+        let trimmed = pattern.trim().replace('\\', "/");
+        let clean = trimmed.trim_start_matches("./").trim_start_matches('/');
+        clean == "**"
+            || clean == "*"
+            || clean.ends_with("/**")
+            || clean.ends_with("/*")
+            || !clean.contains('/')
+    }
+
     /// Layer 2 (real-time collision analysis) was removed: `check_scope_overlap`
     /// had no callers, and its only logic was a DB query delegating to
     /// `globs_might_overlap` — the exact algorithm `acquire_scope`'s pre-check
@@ -202,14 +254,16 @@ impl ScopeManager {
         let mut builder = GlobSetBuilder::new();
         let mut has_patterns = false;
         for p in patterns_iter.flatten() {
-            if let Ok(glob) = Glob::new(&p) {
-                builder.add(glob);
-                has_patterns = true;
-            }
+            let glob = Glob::new(&p)
+                .map_err(|e| format!("Malformed scope lease glob pattern '{}': {}", p, e))?;
+            builder.add(glob);
+            has_patterns = true;
         }
 
         let globset = if has_patterns {
-            builder.build().unwrap_or_else(|_| GlobSet::empty())
+            builder
+                .build()
+                .map_err(|e| format!("Failed to compile scope lease globset: {}", e))?
         } else {
             GlobSet::empty()
         };

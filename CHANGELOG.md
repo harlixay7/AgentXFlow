@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.2] - 2026-09-03
+
+### Concurrency & Isolation
+- **Multi-Agent Stale Recovery Isolation**: Resolved canonical agent name vs ID discrepancies in orphaned step detection. Stale recovery sweeps now strictly target the candidate agent, guaranteeing that other active agents remain 100% untouched.
+- **Waiting-for-Permission Grace Window**: Added `WAITING_PERMISSION_GRACE = 1800s` (30 minutes) for tasks in `substate = 'WAITING_FOR_INPUT'`, protecting agents awaiting user or IDE input while bounding reclamation.
+- **Atomic Single-Transaction Chunk Claims**: `claim_masterplan_chunk` executes step reservation, task creation, and plan status updates inside a single SQLite transaction with fail-closed rollback.
+- **Migration 17 (`request_hash`)**: Added SHA-256 hash tracking to `masterplan_operations` for idempotent chunk retries, preventing duplicate or corrupt decompositions.
+
+### Workspace Ergonomics & MCP
+- **Task-Aware Workspace Tools**: Added `task_workspace_path`, `task_workspace_read`, `task_workspace_write`, and `task_workspace_exec`. Agents execute commands and edit files directly within their isolated worktree without manually manipulating AppData paths.
+- **Path Traversal & Write Scope Security**: All task workspace tools validate caller ownership, enforce worktree root containment against `..` traversals, and verify write-scope lease coverage before writing files.
+
+### Merge Engine & Target Authority
+- **Pre-Finalization Target SHA Guard**: Right before executing Compare-and-Swap (CAS) `git update-ref`, the merge engine re-reads the authoritative target branch SHA on disk. If another merge landed while post-merge verification was running, the candidate is marked `STALE` and the task is moved to `BLOCKED` for safe rebase/reconciliation.
+- **Post-Merge Verification Profiles**: Added automatic detection for Python projects (`pytest`) and web application runtime smoke testing (`npm run smoke`).
+
+### String Substitution Safety
+- **JavaScript Regex Hazard Hardening**: Verified that template replacements and source-to-source substitutions never corrupt text containing `$`, `$&`, `$'`, `$\``, or `</script>`.
+
+### Testing & Infrastructure
+- **Test Suite Expansion**: Added 20 new tests covering scope collision matrices, task workspace lifecycle and security, target branch authority guards, and string substitution safety. Full test suite now passes 171+ tests with 0 failures and zero warnings.
+
+---
+
+## [0.5.1] - 2026-09-03
+
+### Safety & Integrity
+- **Preflight Masterplan Reset Safety**: `reset_masterplan` validates that all affected candidate tasks are cancellable prior to performing any task state mutations or worktree deletions. If any task cannot be cancelled cleanly, the operation aborts with zero mutations.
+- **Blast Radius Isolation**: Target `masterplan_id` resets strictly isolate cancellation and worktree cleanup to the specified masterplan, preserving concurrent masterplans and their active worktrees within the same project.
+- **Fail-Closed Cleanup & Pruning**: Propagate errors on managed worktree directory removal and `git worktree prune` rather than ignoring failures.
+- **Fail-Closed Repository Initialization**: `init_repo` enforces error propagation on directory creation, Git init, and author identity configuration.
+
+### Merge Queue & Concurrency
+- **Fail-Closed Merge Queue Serialization**: Replaced fail-open defaults with strict error propagation when querying earlier READY queue candidates and active integrations (`RUNNING_CHECKS`), preventing race condition bypasses.
+- **Serialized FIFO Execution**: Guaranteed strict FIFO ordering in merge queue worker processing.
+- **Scheduler Deadlock Prevention**: Explicitly drop coordinator database mutex before invoking asynchronous background sweep tasks.
+
+### Policy Engine
+- **Deterministic Policy Specificity**: Overlapping project policy rules resolve deterministically using most-specific matching pattern precedence (`longest pattern length wins`) with `id ASC` tie-breaking.
+- **Fail-Closed Policy Actions**: Unrecognized policy actions fail closed with explicit errors. Non-negotiable hardcoded guardrails unconditionally deny destructive commands.
+
+### Security & MCP Authorization
+- **Role-Based MCP Authorization**: Separated Master/Coordinator authority from Agent session authority. Administrative tools (`masterplan_reset`, `masterplan_decompose`, `prepare_masterplan`, `merge_process`, `unclaim_agent_tasks`, `force_agent_idle`, `task_reconcile`) require Master authority.
+- **Task Ownership Enforcement**: Strict caller ownership enforced on `scope_acquire`, `scope_release`, `task_complete_step`, `task_submit`, `task_cancel`, `task_requeue`, and `merge_enqueue`.
+- **Anti-Impersonation Protection**: Authenticated agents are blocked from registering or sending heartbeats on behalf of different agent identities.
+- **Explicit Session Lifetimes**: 30-day sliding activity renewal window with an absolute 365-day maximum lifetime.
+
+### Observability & Error Propagation
+- **Event Stream Integrity**: Replaced `rows.flatten()` in `get_events_after` with strict error collection, surfacing malformed event row decoding failures.
+- **Atomic Project Creation**: Single atomic transaction wrapping project insertion, contract generation, and baseline rule seeding with deterministic rollback on child failure.
+
+### Testing & Infrastructure
+- **Headless Runner Identity**: Configured local Git author identity in `init_repo` and test harnesses for headless CI environments.
+- **Test Suite Expansion**: Workspace test suite expanded to 151+ tests passing across unit, hostile adversarial, migration upgrade, and end-to-end pipeline suites with zero warnings.
+
+---
+
+## [0.5.0] - 2026-08-31
+
+### Security
+- Constant-time master token comparison to prevent timing attacks.
+- Unpredictable per-session tokens with automatic rotation on upgrade.
+- Heartbeat-based session expiry sliding (30-day window).
+- Token rotation exposed in the integrations UI.
+- Authenticated MCP sessions with anti-replay protections.
+
+### Safety
+- Masterplan reset never touches the user's primary checkout.
+- Primary checkout is never hard-reset on merge; fast-forward only when clean.
+- Managed-worktree containment enforced before any directory deletion.
+
+### Verification
+- Configured timeout is authoritative; reject invalid timeouts.
+- Drain pipes during execution to prevent pipe-buffer false timeouts.
+- Terminate the whole process tree on timeout.
+- Use the reaped exit status for `exit_code` on all platforms.
+- Durable structured timeout evidence for cross-platform diagnostics.
+- Bound post-merge verification with a timeout and tree kill.
+
+### State Machine
+- Centralized validated task transition primitive for all high-risk state writes.
+- Route all high-risk task state writes through the validated transition primitive.
+- Enforce legal task states at the database layer via CHECK constraints.
+
+### Database
+- Migration v12: timeout evidence, append-only proofs, state CHECK constraints, idempotency, token rotation.
+- Fail closed when another coordinator instance holds the lock.
+- Fresh-install + reopen round-trip and idempotent re-run tests.
+
+### Merge Queue
+- Enqueue state write errors propagate to callers.
+- Integration worktree reset failures propagate.
+
+### Scope Enforcement
+- Audit fails closed on git error instead of passing empty.
+- Violation records are authoritative; persistence failures propagate.
+- Conservative segment-aware glob overlap detection.
+- Prefix-compatible boundary overlap detection.
+
+### Proof Bundles
+- Canonical digest covers all evidence deterministically.
+- Append-only proof records preserve per-attempt history.
+- Merge gate verifies proof hashes before enqueue.
+
+### DAG Scheduling
+- `RELATED_TO` is informational; `BLOCKS` and `PARENT_CHILD` gate scheduling.
+
+### MCP Protocol
+- JSON-RPC 2.0 structural conformance (`-32700`, `-32600`, `-32601`, `-32602`).
+- Advertise and negotiate only the implemented protocol version.
+- Remove non-functional SSE stub and de-advertise `sse_url`.
+- Enforce task ownership for agent callers.
+- Add missing JSON-RPC conformance test cases.
+- Dynamically calculate 4-phase step ranges for any arbitrary target step count.
+
+### Masterplan
+- Enforce decompose idempotency keys end to end.
+- Chunk claims are conditional and atomic.
+
+### Lifecycle
+- Unregister performs complete transactional cleanup.
+- Periodic stale-recovery sweep with safe transitions.
+
+### Frontend
+- Serialize task states as `SCREAMING_SNAKE` to match the UI contract.
+- Guard state loads against races and surface poll errors.
+- Surface previously silent polling and submission errors.
+
+### Observability
+- Emit merge lifecycle events for UI refresh.
+
+### Infrastructure
+- Apply `rustfmt` across the crate (baseline quality gate).
+- Auto-dependency installation and prerequisite checks in `run.bat`.
+- Synchronized version to `0.5.0` across all build artifacts (`package.json`, `Cargo.toml`, `tauri.conf.json`, MCP server info).
+- Replaced hardcoded MCP server version with `env!("CARGO_PKG_VERSION")` for single-source-of-truth versioning.
+- Synchronize claims and tool reference tables with the hardened implementation.
+
+---
+
 ## [0.4.4] - 2026-08-16
 
 ### Added
@@ -17,7 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `append: true` support to `masterplan_decompose` for phased 25-step chunking across 4 distinct phases (Foundation, Domain Logic, UI & Motion, Polish & Release).
   - Rich prompt guidance in `masterplan_get` instructing architects to expand specifications with creative UX ideas, defensive error boundaries, state flows, and non-overlapping scopes.
 - **Clean Repository Reset on Masterplan Reset**:
-  - `reset_masterplan` cleanly resets the local Git repository (`git reset --hard HEAD`, `git clean -fd`, `git worktree prune`), cancels active tasks, wipes `.agentxflow/worktrees`, and clears all step records.
+  - `reset_masterplan` cancels active tasks, wipes worktrees, and clears all step records.
   - Exposed `masterplan_reset` as a native MCP tool (`masterplan_reset(project_id="...", masterplan_id="...")`) with full JSON schema.
 - **Real-Time Primary Workspace Synchronization**:
   - Automatically synchronizes the primary repository working directory on disk (`git reset --hard HEAD` and `git clean -fd`) immediately upon merge queue integration, guaranteeing that all merged files appear in the user's workspace in real time.

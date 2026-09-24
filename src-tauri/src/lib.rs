@@ -52,10 +52,9 @@ fn get_mcp_info(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, St
     let token = state.security.get_token();
     Ok(serde_json::json!({
         "url": format!("http://127.0.0.1:{}/mcp", state.mcp_port),
-        "sse_url": format!("http://127.0.0.1:{}/mcp/sse", state.mcp_port),
         "token": token,
         "protocol_version": "2024-11-05",
-        "supported_versions": ["2024-11-05", "2026-07-28"],
+        "supported_versions": ["2024-11-05"],
     }))
 }
 
@@ -225,6 +224,14 @@ fn get_task_dependencies(
     task_id: String,
 ) -> Result<Vec<TaskDependency>, String> {
     state.coordinator.dag.get_dependencies_for_task(&task_id)
+}
+
+#[tauri::command]
+fn list_task_dependencies(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<Vec<TaskDependency>, String> {
+    state.coordinator.dag.get_dependencies_for_project(&project_id)
 }
 
 #[tauri::command]
@@ -641,6 +648,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             calculate_collision_risk,
             add_task_dependency,
             get_task_dependencies,
+            list_task_dependencies,
             list_merge_queue,
             enqueue_task_by_id,
             process_merge_by_id,

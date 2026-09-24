@@ -1,8 +1,14 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::bool_assert_comparison
+)]
+
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::mcp::McpServer;
-use agent_x_flow_lib::models::TaskState;
+use agent_x_flow_lib::models::{TaskState, TaskSubstate};
 use agent_x_flow_lib::security::SecurityManager;
+use serde::Serialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
@@ -93,10 +99,7 @@ async fn test_entire_pipeline_from_a_to_z() {
         .unwrap();
     assert_eq!(init_res.status(), reqwest::StatusCode::OK);
     let init_json: serde_json::Value = init_res.json().await.unwrap();
-    assert!(
-        init_json["result"]["protocolVersion"] == "2024-11-05"
-            || init_json["result"]["protocolVersion"] == "2026-07-28"
-    );
+    assert_eq!(init_json["result"]["protocolVersion"], "2024-11-05");
     println!(
         " [Step 3] MCP Initialize: Protocol Version {} confirmed",
         init_json["result"]["protocolVersion"]
@@ -382,10 +385,13 @@ async fn test_entire_pipeline_from_a_to_z() {
         .await
         .unwrap();
     let agent_crit_json: serde_json::Value = agent_crit.json().await.unwrap();
-    assert!(agent_crit_json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Autonomous agents cannot self-satisfy criteria"));
+    let crit_err = agent_crit_json["error"]["message"].as_str().unwrap();
+    assert!(
+        crit_err.contains("Autonomous agents cannot self-satisfy criteria")
+            || crit_err.contains("requires Master/Coordinator authority"),
+        "Criteria satisfy must be blocked for autonomous agent: {}",
+        crit_err
+    );
     println!(
         " [Step 15] Autonomous Criteria Satisfaction Blocked (Coordinator Evaluator Protected)"
     );
@@ -637,4 +643,45 @@ async fn test_entire_pipeline_from_a_to_z() {
 
     // Clean up temporary repo
     std::fs::remove_dir_all(&repo_dir).ok();
+}
+
+#[test]
+fn test_task_state_wire_format_is_screaming_snake() {
+    #[derive(Serialize)]
+    struct StateHolder {
+        state: TaskState,
+        substate: TaskSubstate,
+    }
+
+    let holder = StateHolder {
+        state: TaskState::Running,
+        substate: TaskSubstate::Claiming,
+    };
+    let json = serde_json::to_string(&holder).unwrap();
+    assert!(
+        json.contains("\"state\":\"RUNNING\""),
+        "TaskState::Running must serialize as SCREAMING_SNAKE_CASE, got: {}",
+        json
+    );
+    assert!(
+        json.contains("\"substate\":\"CLAIMING\""),
+        "TaskSubstate::Claiming must serialize as SCREAMING_SNAKE_CASE, got: {}",
+        json
+    );
+
+    let holder2 = StateHolder {
+        state: TaskState::MergeReady,
+        substate: TaskSubstate::WaitingForInput,
+    };
+    let json2 = serde_json::to_string(&holder2).unwrap();
+    assert!(
+        json2.contains("\"state\":\"MERGE_READY\""),
+        "TaskState::MergeReady must serialize as MERGE_READY, got: {}",
+        json2
+    );
+    assert!(
+        json2.contains("\"substate\":\"WAITING_FOR_INPUT\""),
+        "TaskSubstate::WaitingForInput must serialize as WAITING_FOR_INPUT, got: {}",
+        json2
+    );
 }

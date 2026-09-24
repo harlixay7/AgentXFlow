@@ -1,6 +1,6 @@
 [package]
 name = "agent-x-flow"
-version = "0.1.0"
+version = "0.5.0"
 description = "AgentXFlow: Cross-Agent Engineering Coordinator by Viducia"
 authors = ["harlixay7"]
 edition = "2021"
@@ -12,7 +12,7 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "agent_x_flow_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

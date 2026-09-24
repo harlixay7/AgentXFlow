@@ -2,6 +2,8 @@ export type TaskState =
   | 'BACKLOG'
   | 'READY'
   | 'RUNNING'
+  | 'VERIFYING'
+  | 'VERIFIED'
   | 'BLOCKED'
   | 'REVIEW'
   | 'MERGE_READY'
@@ -276,7 +278,6 @@ export interface EventLog {
 
 export interface McpInfo {
   url: string;
-  sse_url: string;
   token: string;
   protocol_version: string;
 }
@@ -387,9 +388,11 @@ export interface TaskDetails {
   steps: TaskStep[];
   criteria: AcceptanceCriteria[];
   leases: ScopeLease[];
+  dependencies: TaskDependency[];
   verification_runs: VerificationRun[];
   violations: ScopeViolation[];
   proof_bundle: ProofBundle | null;
+  assigned_agent: Agent | null;
   evidence_records: EvidenceRecord[];
   active_attempt?: TaskAttempt | null;
   evaluator_results?: EvaluatorResult[];

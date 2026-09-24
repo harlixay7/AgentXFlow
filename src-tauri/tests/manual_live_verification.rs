@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::bool_assert_comparison
+)]
+
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::mcp::McpServer;
@@ -80,15 +85,14 @@ async fn test_manual_live_end_to_end_system() {
         &initial_token[initial_token.len() - 8..]
     );
 
-    // 3. Launch live MCP Gateway on port 7892
-    let live_port = 7892;
-    let server = McpServer::new(coordinator.clone(), live_port, security.clone());
+    // 3. Launch live MCP Gateway on ephemeral port
+    let server = McpServer::new(coordinator.clone(), 0, security.clone());
     let bound_addr = server.start().await.expect("Failed to start MCP server");
     println!("3. MCP Gateway live and listening on http://{}", bound_addr);
 
     sleep(Duration::from_millis(150)).await;
     let client = reqwest::Client::new();
-    let base_url = format!("http://127.0.0.1:{}", live_port);
+    let base_url = format!("http://{}", bound_addr);
 
     // 4. Test Health Check endpoint
     let health_resp = client

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_borrows_for_generic_args,
+    clippy::bool_assert_comparison
+)]
+
 use agent_x_flow_lib::core::CoordinatorEngine;
 use agent_x_flow_lib::db::DbPool;
 use agent_x_flow_lib::mcp::McpServer;
@@ -177,11 +182,89 @@ async fn test_adversarial_security_and_mcp_suite() {
         .unwrap();
 
     let crit_json: serde_json::Value = crit_res.json().await.unwrap();
-    assert!(crit_json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Autonomous agents cannot self-satisfy criteria"));
+    let err_msg = crit_json["error"]["message"].as_str().unwrap();
+    assert!(
+        err_msg.contains("Autonomous agents cannot self-satisfy criteria")
+            || err_msg.contains("requires Master/Coordinator authority"),
+        "Criteria satisfy must be restricted from agent: {}",
+        err_msg
+    );
     println!("   ✔ Test 8 PASS: Autonomous agent restricted from self-satisfying criteria");
+
+    // Test 8b: Unknown tool over live MCP dispatch -> fail closed
+    let unknown_res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "future_fake_privileged_tool",
+                "arguments": {}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let unknown_json: serde_json::Value = unknown_res.json().await.unwrap();
+    let unknown_err = unknown_json["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        unknown_err.contains("fail-closed security policy"),
+        "Unknown tool over live MCP dispatch must fail closed: {:?}",
+        unknown_json
+    );
+    println!(
+        "   ✔ Test 8b PASS: Unknown tool rejected by fail-closed policy over live MCP dispatch"
+    );
+
+    // Test 8c: Agent session calling merge.process -> rejected
+    let merge_proc_res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "merge.process",
+            "params": { "project_id": "proj-1" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let merge_proc_json: serde_json::Value = merge_proc_res.json().await.unwrap();
+    assert!(
+        merge_proc_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires Master/Coordinator authority"),
+        "Agent calling merge.process must be rejected: {:?}",
+        merge_proc_json
+    );
+    println!("   ✔ Test 8c PASS: Agent calling merge.process rejected over live MCP dispatch");
+
+    // Test 8d: Agent session trying to register a different agent identity -> rejected
+    let imp_reg_res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "agent.register",
+            "params": { "name": "Claude Code" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let imp_reg_json: serde_json::Value = imp_reg_res.json().await.unwrap();
+    assert!(
+        imp_reg_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot register or impersonate"),
+        "Cross-agent registration by authenticated agent must be rejected: {:?}",
+        imp_reg_json
+    );
+    println!("   ✔ Test 8d PASS: Cross-agent registration rejected over live MCP dispatch");
 
     std::fs::remove_dir_all(temp_repo).ok();
 }
@@ -268,6 +351,21 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     println!("   ✔ Test 9 PASS: True parallel Barrier concurrency race - exactly one agent won");
 
     // Test 10: True parallel concurrency - Two agents request conflicting exclusive scopes -> exactly one wins
+    let task1_claimed = coordinator.get_task(&task1.id).unwrap();
+    let winner_id = task1_claimed
+        .assigned_agent_id
+        .clone()
+        .expect("Task 1 must have an assigned agent");
+    let loser_id = if winner_id == agent_a.id {
+        agent_b.id.clone()
+    } else {
+        agent_a.id.clone()
+    };
+
+    // The other agent claims task2 so both agents hold owned tasks for the scope race
+    let claimed_task2 = coordinator.claim_task(&task2.id, &loser_id).unwrap();
+    assert_eq!(claimed_task2.state, TaskState::Running);
+
     let barrier_scope = Arc::new(tokio::sync::Barrier::new(2));
     let coord_s1 = coordinator.clone();
     let coord_s2 = coordinator.clone();
@@ -275,8 +373,8 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     let sb2 = barrier_scope.clone();
     let st1_id = task1.id.clone();
     let t2_id = task2.id.clone();
-    let a_id = agent_a.id.clone();
-    let b_id = agent_b.id.clone();
+    let a_id = winner_id.clone();
+    let b_id = loser_id.clone();
 
     let sh1 = tokio::spawn(async move {
         sb1.wait().await;
@@ -315,7 +413,7 @@ async fn test_adversarial_coordination_and_concurrency_suite() {
     // Test 11: Non-overlapping scopes -> both succeed
     let non_overlap_res = coordinator.scope.acquire_scope(
         &task2.id,
-        &agent_b.id,
+        &loser_id,
         vec!["src/db/**".into()],
         "EXCLUSIVE_WRITE",
     );
@@ -925,4 +1023,265 @@ async fn test_guessing_another_agents_token_fails() {
         impersonation.map(|a| a.id)
     );
     println!("   ✔ Test B PASS: forged deterministic token rejected");
+}
+
+#[tokio::test]
+async fn test_agent_cannot_cancel_another_agents_task() {
+    println!("\n============================================================");
+    println!("D38 REGRESSION: AGENT CANNOT CANCEL ANOTHER AGENT'S TASK");
+    println!("============================================================\n");
+
+    let temp_repo = setup_temp_git_repo("adv_own_cancel");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool.clone());
+
+    let proj = coordinator
+        .create_project(
+            "Cancel Ownership Project",
+            &temp_repo.to_string_lossy(),
+            "Spec",
+            "main",
+        )
+        .unwrap();
+
+    let auth_token = "adv_secret_own_cancel_token".to_string();
+    let security = SecurityManager::new_with_token(auth_token.clone());
+    let test_port = 7911;
+
+    let server = McpServer::new(coordinator.clone(), test_port, security);
+    server
+        .start()
+        .await
+        .expect("Failed to start test MCP server");
+    sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", test_port);
+
+    // Initialize
+    let _ = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Register agent A via MCP
+    let reg_a = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 2,
+            "method": "agent.register",
+            "params": { "name": "Agent-A-Own", "agent_type": "Antigravity" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let reg_a_json: serde_json::Value = reg_a.json().await.unwrap();
+    let session_a = reg_a_json["result"]["session_token"].as_str().unwrap();
+    let agent_a_id = reg_a_json["result"]["id"].as_str().unwrap();
+
+    // Register agent B via MCP
+    let reg_b = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 3,
+            "method": "agent.register",
+            "params": { "name": "Agent-B-Own", "agent_type": "Claude" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let reg_b_json: serde_json::Value = reg_b.json().await.unwrap();
+    let session_b = reg_b_json["result"]["session_token"].as_str().unwrap();
+
+    // Create a task via coordinator (MCP doesn't expose task.create)
+    let task = coordinator
+        .create_task(
+            &proj.id,
+            "Ownership Test Task",
+            "Task to test ownership",
+            "HIGH",
+            vec![("Step 1".into(), "Do work".into(), true)],
+            vec!["Done".into()],
+        )
+        .unwrap();
+
+    // Claim task as agent A directly (since task creation is coordinator-only)
+    let claimed = coordinator.claim_task(&task.id, agent_a_id).unwrap();
+    assert_eq!(claimed.assigned_agent_id.as_deref(), Some(agent_a_id));
+
+    // Agent B tries to cancel agent A's task without agent_id → must be rejected
+    let cancel_res = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", session_b))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 5,
+            "method": "task.cancel",
+            "params": { "task_id": task.id }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let cancel_json: serde_json::Value = cancel_res.json().await.unwrap();
+    assert!(
+        cancel_json["error"].is_object(),
+        "Agent B must NOT be able to cancel agent A's task without agent_id. Got: {:?}",
+        cancel_json
+    );
+    let err_msg = cancel_json["error"]["message"].as_str().unwrap();
+    assert!(
+        err_msg.contains("not the owner") || err_msg.contains("Authorization error"),
+        "Error must mention ownership/authorization. Got: {}",
+        err_msg
+    );
+    println!("   ✔ D38 PASS: Agent B rejected when cancelling agent A's task (no agent_id)");
+
+    // Verify agent A CAN cancel its own task without agent_id (caller resolved to self)
+    let cancel_own = client
+        .post(format!("{}/mcp", base_url))
+        .header("Authorization", format!("Bearer {}", session_a))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 6,
+            "method": "task.cancel",
+            "params": { "task_id": task.id }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let cancel_own_json: serde_json::Value = cancel_own.json().await.unwrap();
+    assert!(
+        cancel_own_json["result"].is_object(),
+        "Agent A must be able to cancel its own task. Got: {:?}",
+        cancel_own_json
+    );
+    println!("   ✔ D38 PASS: Agent A can cancel its own task (caller resolved to self)");
+
+    std::fs::remove_dir_all(temp_repo).ok();
+}
+
+#[tokio::test]
+async fn test_concurrent_claim_task_with_dependencies_race_barrier() {
+    println!("\n============================================================");
+    println!("⚔️ CONCURRENT TASK CLAIMING & TRANSACTIONAL DEPENDENCY GATE");
+    println!("============================================================\n");
+
+    let temp_repo = setup_temp_git_repo("concurrent_claim_race");
+    let pool = DbPool::new_in_memory().expect("Failed to create SQLite DB");
+    let coordinator = CoordinatorEngine::new(pool.clone());
+
+    let proj = coordinator
+        .create_project(
+            "Race Claim Project",
+            &temp_repo.to_string_lossy(),
+            "Race Spec",
+            "main",
+        )
+        .unwrap();
+
+    let agent_a = coordinator.register_agent("Agent-Claim-A", "IDE").unwrap();
+    let agent_b = coordinator.register_agent("Agent-Claim-B", "CLI").unwrap();
+
+    let p1 = coordinator
+        .create_task(
+            &proj.id,
+            "Prerequisite P1",
+            "Prereq work",
+            "HIGH",
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+    let t_dep = coordinator
+        .create_task(
+            &proj.id,
+            "Dependent Task T",
+            "Dependent work",
+            "HIGH",
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+    // Add blocking dependency: T_dep depends on P1
+    coordinator
+        .dag
+        .add_dependency(&t_dep.id, &p1.id, "BLOCKS")
+        .unwrap();
+
+    // 1. Attempt claim while P1 is BACKLOG -> must fail
+    let early_claim_a = coordinator.claim_task(&t_dep.id, &agent_a.id);
+    assert!(
+        early_claim_a.is_err(),
+        "Claim must be blocked when prerequisite is not DONE"
+    );
+    assert!(early_claim_a
+        .unwrap_err()
+        .contains("Prerequisite dependencies are not yet DONE"));
+
+    // 2. Mark P1 as DONE
+    {
+        let conn = pool.lock();
+        conn.execute(
+            "UPDATE tasks SET state = 'DONE', substate = 'NONE' WHERE id = ?1",
+            rusqlite::params![p1.id],
+        )
+        .unwrap();
+    }
+
+    // 3. True parallel race with Barrier: Agent A and Agent B claim T_dep simultaneously
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let coord_1 = coordinator.clone();
+    let coord_2 = coordinator.clone();
+    let b1 = barrier.clone();
+    let b2 = barrier.clone();
+    let task_id_1 = t_dep.id.clone();
+    let task_id_2 = t_dep.id.clone();
+    let agent_id_1 = agent_a.id.clone();
+    let agent_id_2 = agent_b.id.clone();
+
+    let handle_1 = tokio::spawn(async move {
+        b1.wait().await;
+        coord_1.claim_task(&task_id_1, &agent_id_1)
+    });
+    let handle_2 = tokio::spawn(async move {
+        b2.wait().await;
+        coord_2.claim_task(&task_id_2, &agent_id_2)
+    });
+
+    let (res_1, res_2) = tokio::join!(handle_1, handle_2);
+    let r1 = res_1.unwrap();
+    let r2 = res_2.unwrap();
+
+    let r1_ok = r1.is_ok();
+    let r2_ok = r2.is_ok();
+
+    assert!(
+        (r1_ok && !r2_ok) || (!r1_ok && r2_ok),
+        "Exactly one concurrent claim must succeed, one must fail cleanly. (R1 ok: {}, R2 ok: {})",
+        r1_ok,
+        r2_ok
+    );
+
+    // 4. Verify durable single owner in database
+    let final_task = coordinator.get_task(&t_dep.id).unwrap();
+    assert_eq!(final_task.state, TaskState::Running);
+    let assigned = final_task
+        .assigned_agent_id
+        .expect("Task must be assigned to the winner");
+    assert!(
+        assigned == agent_a.id || assigned == agent_b.id,
+        "Assigned agent must be either A or B, got: {}",
+        assigned
+    );
+    println!(
+        "   ✔ PASS: Concurrent claim barrier race resolved cleanly with single durable owner: {}",
+        assigned
+    );
+
+    std::fs::remove_dir_all(temp_repo).ok();
 }

@@ -4,9 +4,10 @@ import { EventItem } from '../types';
 
 interface BottomPanelProps {
   events: EventItem[];
+  syncError: string | null;
 }
 
-export const BottomPanel: React.FC<BottomPanelProps> = ({ events }) => {
+export const BottomPanel: React.FC<BottomPanelProps> = ({ events, syncError }) => {
   const [activeTab, setActiveTab] = useState<'output' | 'problems' | 'verification' | 'git'>('output');
   const [isCollapsed, setIsCollapsed] = useState(false);
 
@@ -25,7 +26,7 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({ events }) => {
             className={`bottom-panel-tab ${activeTab === 'problems' ? 'active' : ''}`}
             onClick={() => { setActiveTab('problems'); setIsCollapsed(false); }}
           >
-            <AlertCircle size={12} /> Problems (0)
+            <AlertCircle size={12} /> Problems ({syncError ? 1 : 0})
           </div>
           <div
             className={`bottom-panel-tab ${activeTab === 'verification' ? 'active' : ''}`}
@@ -72,7 +73,11 @@ export const BottomPanel: React.FC<BottomPanelProps> = ({ events }) => {
           )}
 
           {activeTab === 'problems' && (
-            <div style={{ color: 'var(--text-muted)' }}>No active scope violations or compiler errors detected.</div>
+            <div style={{ color: syncError ? 'var(--accent-red, #f44)' : 'var(--text-muted)' }}>
+              {syncError
+                ? `Sync error: ${syncError}`
+                : 'No active scope violations or compiler errors detected.'}
+            </div>
           )}
 
           {activeTab === 'verification' && (
