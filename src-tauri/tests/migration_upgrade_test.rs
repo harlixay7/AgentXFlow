@@ -834,7 +834,7 @@ fn test_fresh_install_reopen_round_trip() {
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |r| r.get(0))
             .unwrap();
         assert!(
-            applied_count >= 17,
+            applied_count >= 18,
             "Fresh install must apply all migrations, got {}",
             applied_count
         );
@@ -855,7 +855,7 @@ fn test_fresh_install_reopen_round_trip() {
             .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            applied_count_after, 17,
+            applied_count_after, 18,
             "Re-running migrations must not add new rows to _schema_migrations"
         );
 

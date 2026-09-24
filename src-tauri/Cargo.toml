@@ -1,6 +1,6 @@
 [package]
 name = "agent-x-flow"
-version = "0.5.0"
+version = "0.6.0"
 description = "AgentXFlow: Cross-Agent Engineering Coordinator by Viducia"
 authors = ["harlixay7"]
 edition = "2021"
@@ -32,7 +32,6 @@ tower-http = { version = "0.5", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs-next = "2.0"
-rfd = "0.15"
 sha2 = "0.10"
 hex = "0.4"
 parking_lot = "0.12"

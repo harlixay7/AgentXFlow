@@ -172,7 +172,11 @@ impl GitService {
             .map(|handle| std::thread::spawn(move || read_bounded(handle, MAX_GIT_OUTPUT_BYTES)));
 
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(15);
+        let timeout_secs = std::env::var("AGENTXFLOW_GIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
+        let timeout = std::time::Duration::from_secs(timeout_secs);
         let mut timed_out = false;
         let mut exit_status: Option<std::process::ExitStatus> = None;
 
@@ -617,7 +621,10 @@ impl GitService {
             if trimmed.len() > 3 {
                 let rest = trimmed[3..].trim();
                 if rest.contains("->") {
-                    let parts: Vec<&str> = rest.split("->").map(|s| s.trim().trim_matches('"')).collect();
+                    let parts: Vec<&str> = rest
+                        .split("->")
+                        .map(|s| s.trim().trim_matches('"'))
+                        .collect();
                     for part in parts {
                         if !part.is_empty() {
                             changed_set.insert(part.to_string());

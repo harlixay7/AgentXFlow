@@ -386,7 +386,7 @@ impl CoordinatorEngine {
                 match transition_task_state_on_conn(
                     &conn,
                     &t_id,
-                    &[TaskState::Backlog],
+                    &[TaskState::Claiming, TaskState::Backlog],
                     TaskState::Blocked,
                 ) {
                     Ok(()) => {
@@ -1595,8 +1595,13 @@ impl CoordinatorEngine {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to start finalize transaction: {}", e))?;
-        transition_task_state_on_conn(&tx, task_id, &[TaskState::Backlog], TaskState::Running)
-            .map_err(|e| format!("Failed to mark task as RUNNING: {}", e))?;
+        transition_task_state_on_conn(
+            &tx,
+            task_id,
+            &[TaskState::Claiming, TaskState::Backlog],
+            TaskState::Running,
+        )
+        .map_err(|e| format!("Failed to mark task as RUNNING: {}", e))?;
         tx.execute(
             "UPDATE tasks SET substate = 'ANALYZING' WHERE id = ?1",
             [task_id],
@@ -4453,7 +4458,7 @@ impl CoordinatorEngine {
             if is_explicit {
                 let trimmed = masterplan_id.unwrap().trim();
                 let mut stmt = conn
-                    .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND masterplan_id = ?2 AND state NOT IN ('CANCELLED', 'DONE')")
+                    .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND masterplan_id = ?2 AND state != 'CANCELLED'")
                     .map_err(|e| e.to_string())?;
                 let ids: Result<Vec<String>, _> = stmt
                     .query_map(params![project_id, trimmed], |r| r.get::<_, String>(0))
@@ -4462,7 +4467,7 @@ impl CoordinatorEngine {
                 ids.map_err(|e| e.to_string())?
             } else {
                 let mut stmt = conn
-                    .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND state NOT IN ('CANCELLED', 'DONE')")
+                    .prepare("SELECT id FROM tasks WHERE project_id = ?1 AND state != 'CANCELLED'")
                     .map_err(|e| e.to_string())?;
                 let ids: Result<Vec<String>, _> = stmt
                     .query_map([project_id], |r| r.get::<_, String>(0))
@@ -5460,7 +5465,9 @@ impl CoordinatorEngine {
         };
 
         // Policy engine guardrail evaluation
-        let (action, reason) = self.policy.evaluate_hook(&project_id, "pre-mutation", &clean_path)?;
+        let (action, reason) =
+            self.policy
+                .evaluate_hook(&project_id, "pre-mutation", &clean_path)?;
         if action == "DENY" {
             return Err(format!(
                 "Policy violation: file write to '{}' denied: {}",
@@ -5516,7 +5523,9 @@ impl CoordinatorEngine {
         };
 
         // Policy engine guardrail evaluation
-        let (action, reason) = self.policy.evaluate_hook(&project_id, "pre-command", &full_cmd)?;
+        let (action, reason) = self
+            .policy
+            .evaluate_hook(&project_id, "pre-command", &full_cmd)?;
         if action == "DENY" {
             return Err(format!(
                 "Policy violation: command execution '{}' denied: {}",

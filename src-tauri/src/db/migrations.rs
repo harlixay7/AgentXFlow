@@ -1742,12 +1742,59 @@ pub fn verify_schema_integrity(conn: &Connection) -> Result<(), String> {
 }
 
 fn migration_0018_performance_indexes(tx: &Transaction) -> Result<()> {
-    tx.execute_batch(
-        "
-        CREATE INDEX IF NOT EXISTS idx_tasks_proj_mp_state ON tasks(project_id, masterplan_id, state);
-        CREATE INDEX IF NOT EXISTS idx_mp_steps_task ON masterplan_steps(claimed_task_id);
-        CREATE INDEX IF NOT EXISTS idx_tasks_stale_sweep ON tasks(state, is_stale, updated_at);
-        ",
-    )?;
+    // Check if tasks table has masterplan_id column before creating composite index
+    let has_mp_id: bool = tx
+        .prepare("PRAGMA table_info(tasks)")
+        .and_then(|mut stmt| {
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(cols.contains(&"masterplan_id".to_string()))
+        })
+        .unwrap_or(false);
+
+    if has_mp_id {
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_proj_mp_state ON tasks(project_id, masterplan_id, state);",
+            [],
+        )?;
+    }
+
+    // Check if masterplan_steps table exists before creating index on it
+    let has_mp_steps: bool = tx
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'masterplan_steps'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    if has_mp_steps {
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mp_steps_task ON masterplan_steps(claimed_task_id);",
+            [],
+        )?;
+    }
+
+    // Check if tasks table has is_stale column before creating index on it
+    let has_is_stale: bool = tx
+        .prepare("PRAGMA table_info(tasks)")
+        .and_then(|mut stmt| {
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(cols.contains(&"is_stale".to_string()))
+        })
+        .unwrap_or(false);
+
+    if has_is_stale {
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_stale_sweep ON tasks(state, is_stale, updated_at);",
+            [],
+        )?;
+    }
+
     Ok(())
 }

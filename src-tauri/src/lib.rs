@@ -36,10 +36,27 @@ pub struct AppState {
 
 #[tauri::command]
 fn pick_folder() -> Option<String> {
-    rfd::FileDialog::new()
-        .set_title("Select Project / Git Repository Directory")
-        .pick_folder()
-        .map(|p| p.to_string_lossy().to_string())
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select Project / Git Repository Directory'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }",
+            ])
+            .output()
+            .ok()?;
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path)
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
 }
 
 #[tauri::command]
@@ -231,7 +248,10 @@ fn list_task_dependencies(
     state: State<'_, Arc<AppState>>,
     project_id: String,
 ) -> Result<Vec<TaskDependency>, String> {
-    state.coordinator.dag.get_dependencies_for_project(&project_id)
+    state
+        .coordinator
+        .dag
+        .get_dependencies_for_project(&project_id)
 }
 
 #[tauri::command]

@@ -93,13 +93,18 @@ impl DagEngine {
         Ok(res)
     }
 
-    pub fn get_dependencies_for_project(&self, project_id: &str) -> Result<Vec<TaskDependency>, String> {
+    pub fn get_dependencies_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<TaskDependency>, String> {
         let conn = self.db.lock();
         let mut stmt = conn
-            .prepare("SELECT d.id, d.task_id, d.depends_on_task_id, d.dependency_type, d.created_at
+            .prepare(
+                "SELECT d.id, d.task_id, d.depends_on_task_id, d.dependency_type, d.created_at
                       FROM task_dependencies d
                       JOIN tasks t ON d.task_id = t.id
-                      WHERE t.project_id = ?1")
+                      WHERE t.project_id = ?1",
+            )
             .map_err(|e| e.to_string())?;
 
         let rows = stmt

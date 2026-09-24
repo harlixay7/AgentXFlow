@@ -51,6 +51,8 @@ jobs:
 
       - name: Rust Coordinator Unit & Integration Tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+        env:
+          AGENTXFLOW_GIT_TIMEOUT_SECS: 120
 
       - name: TypeScript & Vite Production Build
         run: npm run build
